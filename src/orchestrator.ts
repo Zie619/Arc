@@ -964,23 +964,36 @@ async function reviewLoop(o: RunOptions, task: PlanTask, wt: G.Worktree): Promis
     ``, `## The diff`, '```diff', diff, '```',
   ].join('\n')
 
-  const rvAttempt = store.startAttempt({
-    arcId, taskId: task.id, attemptNo: 1, role: 'review', cli: role.cli, requestedModel: role.model,
-  })
-  const rv = await dispatch({ role, cwd: wt.path, prompt: reviewBrief, schema: ReviewVerdict, signal: o.signal })
-  const rvModel = modelStatus(o, role, rv, rvAttempt, task.id)
-  store.finishAttempt(arcId, rvAttempt, {
-    terminalReason: rvModel === 'drift' ? 'model-drift' : rv.terminalReason, exitCode: rv.exitCode,
-    observedModel: rv.observedModels.join(',') || null,
-    transcriptArtifactId: store.putArtifact(arcId, 'transcript', rv.transcript, rvAttempt),
-    usage: rv.usage,
-  })
+  // The clock is infrastructure; the task is green. A review that dies on
+  // TIME (timeout/stall) gets ONE fresh try before the task is buried — a
+  // real 26-minute Opus review of a large schema diff was about to hard-fail
+  // a task whose gates and criteria had all passed.
+  let rv!: DispatchResult
+  let rvAttempt = ''
+  for (let round = 1; round <= 2; round++) {
+    rvAttempt = store.startAttempt({
+      arcId, taskId: task.id, attemptNo: round, role: 'review', cli: role.cli, requestedModel: role.model,
+    })
+    rv = await dispatch({ role, cwd: wt.path, prompt: reviewBrief, schema: ReviewVerdict, signal: o.signal })
+    const rvModel = modelStatus(o, role, rv, rvAttempt, task.id)
+    store.finishAttempt(arcId, rvAttempt, {
+      terminalReason: rvModel === 'drift' ? 'model-drift' : rv.terminalReason, exitCode: rv.exitCode,
+      observedModel: rv.observedModels.join(',') || null,
+      transcriptArtifactId: store.putArtifact(arcId, 'transcript', rv.transcript, rvAttempt),
+      usage: rv.usage,
+    })
 
-  if (rvModel === 'drift') {
-    log(`  ✗ MODEL DRIFT in review: asked for ${role.model}, ran on ${rv.observedModels.join(', ')}`)
-    store.addFinding({ arcId, taskId: task.id, attemptId: rvAttempt, kind: 'risk', severity: 'high',
-      text: `review model drift: requested ${role.model}, observed ${rv.observedModels.join(', ')}` })
-    return false
+    if (rvModel === 'drift') {
+      log(`  ✗ MODEL DRIFT in review: asked for ${role.model}, ran on ${rv.observedModels.join(', ')}`)
+      store.addFinding({ arcId, taskId: task.id, attemptId: rvAttempt, kind: 'risk', severity: 'high',
+        text: `review model drift: requested ${role.model}, observed ${rv.observedModels.join(', ')}` })
+      return false
+    }
+    if ((rv.terminalReason === 'hard-timeout' || rv.terminalReason === 'stall-kill') && round === 1) {
+      log(`  ! ${task.id}: review ${rv.terminalReason} — the task is green, so the review gets one more try`)
+      continue
+    }
+    break
   }
 
   if (rv.terminalReason !== 'ok' || !rv.parsed) {

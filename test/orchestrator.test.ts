@@ -507,6 +507,40 @@ describe('the orchestrator, end to end', () => {
   }, 60_000)
 })
 
+describe('a slow review does not bury a green task', () => {
+  it('retries the review once after a hard timeout, then lands', async () => {
+    const queue = join(home, 'queue-slow-review')
+    mkdirSync(queue)
+    const payloads = [
+      {
+        status: 'done', noop: false,
+        shipped: [{ path: 'generated.ts', whatChanged: 'created' }],
+        criteria: [{ id: 'c1', claimedTier: 'checked', evidence: 'fixture ran' }],
+      },
+      { risks: [{ id: 'r1', text: 'risk', howToCheck: 'run a command' }] },
+      { __hang: 8 },   // the review itself dies on the clock…
+      { verdict: 'PASS', findings: [], criteriaAssessment: [], seamRisks: [] },   // …and the retry answers
+    ]
+    payloads.forEach((payload, index) => writeFileSync(join(queue, `${index}.json`), JSON.stringify(payload)))
+    process.env.ARC_FAKE_QUEUE = queue
+    process.env.ARC_FAKE_WRITE_AT = '0'
+    delete process.env.ARC_FAKE_PAYLOAD
+
+    const roles = {
+      implement: { cli: 'codex', model: 'gpt-5.6-sol', sandbox: 'workspace-write', timeoutMs: 20000, stallMs: 15000 },
+      review: { cli: 'claude', model: 'opus', sandbox: 'read-only', timeoutMs: 2500, stallMs: 2500 },
+    }
+    const store = new Store(home)
+    await runArc({ store, plan: plan([task('slow-review')]), config: config({ landStrategy: 'none', roles }), log })
+
+    expect(logs.join('\n')).toContain('review gets one more try')
+    expect(store.allTasks('e2e')[0]!.state).toBe('landed')
+    const reviews = store.attemptsFor('e2e', 'slow-review').filter((a) => a.role === 'review' && a.attempt_no >= 1)
+    expect(reviews.map((a) => a.terminal_reason)).toEqual(['hard-timeout', 'ok'])
+    store.close()
+  }, 60_000)
+})
+
 describe('the retry loop refuses to burn attempts on a failure that never changes', () => {
   it('stops when a failure repeats — even interleaved with a flake and with noise reordered', async () => {
     // The exact anatomy of a real run: lint failure → transient 502 →
