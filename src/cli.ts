@@ -159,6 +159,7 @@ Options:
   --danger        no approval stops: take every recommendation, run the plan
   --config <p>    use a specific config instead of auto-detection
   --id <name>     name the arc (default: derived from your brief)
+  --version, -V   print the installed arc version
 `
 
 const SUBCOMMANDS = new Set([
@@ -171,6 +172,10 @@ const SUBCOMMANDS = new Set([
 async function main(): Promise<void> {
   const argv = process.argv.slice(2)
   if (argv.includes('-h') || argv.includes('--help')) { console.log(USAGE); return }
+  if (argv.includes('-V') || argv.includes('--version')) {
+    console.log(JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8')).version)
+    return
+  }
   const first = argv.find((a) => !a.startsWith('-'))
   // Bare `arc` opens the app and you type there — same as `claude`. Anything
   // that is not a known subcommand is a brief.
