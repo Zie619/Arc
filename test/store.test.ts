@@ -225,3 +225,39 @@ describe('blocking pending ops keep an arc from claiming done', () => {
     expect(open[0]!.kind).toBe('db-push')
   })
 })
+
+describe('the token bill', () => {
+  it('sums receipts per role and counts the attempts that reported nothing', () => {
+    const withReceipt = store.startAttempt({
+      arcId: 'arc1', taskId: 't1', attemptNo: 1, role: 'implement',
+      cli: 'codex', requestedModel: 'gpt-5.6-sol',
+    })
+    store.finishAttempt('arc1', withReceipt, {
+      terminalReason: 'ok', exitCode: 0, observedModel: 'gpt-5.6-sol',
+      usage: [{
+        provider: 'codex', inputTokens: 1000, cachedInputTokens: 600,
+        outputTokens: 50, raw: {},
+      }],
+    })
+    const silent = store.startAttempt({
+      arcId: 'arc1', taskId: 't1', attemptNo: 2, role: 'implement',
+      cli: 'codex', requestedModel: 'gpt-5.6-sol',
+    })
+    store.finishAttempt('arc1', silent, {
+      terminalReason: 'ok', exitCode: 0, observedModel: 'gpt-5.6-sol',
+    })
+    const review = store.startAttempt({
+      arcId: 'arc1', taskId: 't1', attemptNo: 1, role: 'review',
+      cli: 'claude', requestedModel: 'opus',
+    })
+    store.finishAttempt('arc1', review, { terminalReason: 'ok', exitCode: 0, observedModel: 'opus' })
+
+    const rows = store.costSummary('arc1')
+    const impl = rows.find((r) => r.role === 'implement')!
+    expect(impl.attempts).toBe(2)
+    expect(impl.receipted).toBe(1)         // the silent attempt makes totals a floor
+    expect(impl.input_tokens).toBe(1000)
+    expect(impl.cached_input_tokens).toBe(600)
+    expect(rows.find((r) => r.role === 'review')!.receipted).toBe(0)
+  })
+})

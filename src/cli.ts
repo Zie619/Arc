@@ -141,6 +141,7 @@ ${C.bold('When something needs a closer look:')}
   arc status                        where everything stands
   arc criteria                      every promise + whether it is actually proven
   arc findings                      what the reviewer caught
+  arc cost                          the token bill per role — and what went unmeasured
   arc resume <plan.yaml>            continue after a crash
   arc clean                         reset so it can run again
   arc show <artifactId>             the exact prompt or transcript of one step
@@ -164,7 +165,7 @@ Options:
 
 const SUBCOMMANDS = new Set([
   'interview', 'scout', 'plan', 'validate', 'run', 'resume', 'clean', 'status',
-  'ui', 'watch', 'criteria', 'findings', 'show', 'init', 'go',
+  'ui', 'watch', 'criteria', 'findings', 'show', 'init', 'go', 'cost',
   'setup-terminal', 'keys',
   'doctor',
 ])
@@ -439,6 +440,30 @@ async function main(): Promise<void> {
           console.log(C.yellow(`  ${ops.length} blocking pending op(s) — the arc cannot be done until these run`))
           for (const p of ops) console.log(`    [${p.kind}] ${p.description}`)
         }
+        break
+      }
+      case 'cost': {
+        const arcId = positional[0] ?? store.latestArcId()
+        if (!arcId) die('no arcs yet')
+        const rows = store.costSummary(arcId)
+        if (rows.length === 0) { console.log('no attempts recorded for this arc'); break }
+        console.log(C.bold(`token bill — arc ${arcId}`))
+        console.log('')
+        const fmt = (n: number | null) => n == null || n === 0 ? '—' : n >= 1_000_000 ? `${(n / 1_000_000).toFixed(2)}M` : n >= 1_000 ? `${Math.round(n / 1_000)}K` : String(n)
+        let missing = 0
+        for (const r of rows) {
+          const mins = Math.round(Number(r.wall_ms) / 60_000)
+          missing += Number(r.attempts) - Number(r.receipted)
+          console.log(`  ${String(r.role).padEnd(10)} ${String(r.cli).padEnd(7)} ${String(r.attempts).padStart(2)} attempt(s)  ${String(mins).padStart(4)}min  ` +
+            `in ${fmt(r.input_tokens).padStart(7)} (${fmt(r.cached_input_tokens)} cached)  out ${fmt(r.output_tokens).padStart(6)}  reasoning ${fmt(r.reasoning_tokens)}` +
+            (r.cost_usd ? `  $${Number(r.cost_usd).toFixed(2)}` : ''))
+        }
+        if (missing > 0) {
+          console.log('')
+          console.log(C.yellow(`  ! ${missing} attempt(s) reported no usage receipt — every number above is a FLOOR.`))
+        }
+        console.log(C.dim(`  Not counted here: design-phase runs in other stores, and any Claude session`))
+        console.log(C.dim(`  driving arc from outside — that session's own tokens never pass through arc.`))
         break
       }
       case 'watch': {

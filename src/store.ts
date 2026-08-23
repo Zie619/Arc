@@ -946,6 +946,33 @@ export class Store {
       .all(arcId, taskId) as any
   }
 
+  /**
+   * The token bill, grouped by role and CLI — with the honest gap stated:
+   * attempts that reported no receipt make every total a FLOOR, not a fact.
+   * A real operator burned most of two subscriptions in a day and had no way
+   * to see where; this is the query that answers that question.
+   */
+  costSummary(arcId: string): Array<Record<string, any>> {
+    return this.db.prepare(
+      `SELECT a.role, a.cli,
+              COUNT(*) attempts,
+              SUM(COALESCE(a.ended_at, ?) - a.started_at) wall_ms,
+              SUM(CASE WHEN u.attempt_id IS NOT NULL THEN 1 ELSE 0 END) receipted,
+              SUM(COALESCE(u.inp, 0)) input_tokens,
+              SUM(COALESCE(u.cin, 0)) cached_input_tokens,
+              SUM(COALESCE(u.out, 0)) output_tokens,
+              SUM(COALESCE(u.rsn, 0)) reasoning_tokens,
+              SUM(u.cost) cost_usd
+       FROM attempt a
+       LEFT JOIN (SELECT attempt_id, SUM(input_tokens) inp, SUM(cached_input_tokens) cin,
+                         SUM(output_tokens) out, SUM(reasoning_output_tokens) rsn, SUM(cost_usd) cost
+                  FROM attempt_usage GROUP BY attempt_id) u ON u.attempt_id = a.id
+       WHERE a.arc_id = ?
+       GROUP BY a.role, a.cli
+       ORDER BY wall_ms DESC`,
+    ).all(Date.now(), arcId) as any
+  }
+
   /** Exact provider receipts for an arc. Null means the CLI did not report it. */
   usageFor(arcId: string): Array<Record<string, any>> {
     return this.db.prepare(
