@@ -51,7 +51,13 @@ type Pane = 'events' | 'findings' | 'criteria'
 export function Dashboard({ store, width, interactive, compact = false }: { store: Store; width: number; interactive: boolean; compact?: boolean }) {
   const { exit } = useApp()
   const [tick, setTick] = useState(0)
-  const [arcIdx, setArcIdx] = useState(0)
+  // Open on the arc that is RUNNING, not merely the newest — a dead run
+  // sitting on screen while a live one builds sent a real operator chasing
+  // failures that were already history.
+  const [arcIdx, setArcIdx] = useState(() => {
+    const idx = store.allArcs().findIndex((a) => String(a.status) === 'running')
+    return idx >= 0 ? idx : 0
+  })
   const [taskIdx, setTaskIdx] = useState(0)
   const [pane, setPane] = useState<Pane>('events')
 
@@ -118,6 +124,15 @@ export function Dashboard({ store, width, interactive, compact = false }: { stor
         <Box>
           <Text bold color="cyan">{arcId}</Text>
           <Text color="gray">{'  '}{String(arc.status)}</Text>
+          {String(arc.status) !== 'running' && (() => {
+            const at = Number(arc.closed_at ?? arc.created_at)
+            const m = Math.max(1, Math.round((Date.now() - at) / 60_000))
+            const ago = m < 60 ? `${m}m ago` : `${Math.round(m / 60)}h ago`
+            return <Text color="gray">{'  '}{arc.closed_at ? `ended ${ago}` : `started ${ago}`} — kept as the run's evidence record</Text>
+          })()}
+          {String(arc.status) !== 'running' && arcs.some((a) => a.id !== arc.id && String(a.status) === 'running') && (
+            <Text color="yellow" bold>{'  '}a newer run is LIVE — ←→ to switch</Text>
+          )}
           <Text color="gray">{'  '}{arcs.length > 1 ? `[${arcIdx + 1}/${arcs.length}] ←→ to switch` : ''}</Text>
         </Box>
         {goalLines.map((l, i) => <Text key={i} color="white">{l.slice(0, width - 2)}</Text>)}
