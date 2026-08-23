@@ -704,8 +704,13 @@ async function gradeCriteria(
     // it PASSED; a modest claim ("unproven — my sandbox couldn't run it")
     // must not cap a grant the evidence itself earns. (Observed live: a
     // green 334-test proof discarded because the writer claimed 'unproven'.)
-    const effectiveTier = crit.proofKind === 'command' && artifactId ? 'checked' : claim.claimedTier
-    const granted = o.store.promoteCriterion(arcId, task.id, claim.id, effectiveTier, claim.evidence, artifactId)
+    const harnessProved = crit.proofKind === 'command' && artifactId
+    const effectiveTier = harnessProved ? 'checked' : claim.claimedTier
+    // A sandboxed author often CANNOT run the proof ("Docker denied") while
+    // the harness just did — stored verbatim, that claim text sits beside a
+    // 'checked' grant looking like a contradiction. Say who proved it.
+    const evidence = harnessProved ? `harness ran the proof: PASSED. Author's account: ${claim.evidence}` : claim.evidence
+    const granted = o.store.promoteCriterion(arcId, task.id, claim.id, effectiveTier, evidence, artifactId)
     if (granted !== effectiveTier) {
       o.log(`    criterion ${claim.id}: graded ${effectiveTier}, granted ${granted} (evidence did not support the claim)`)
     }
