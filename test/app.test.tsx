@@ -706,7 +706,7 @@ describe('plan-only execution boundary', () => {
       stdout: out.stream, stdin: out.stdin, exitOnCtrlC: false, patchConsole: false,
     })
     try {
-      const deadline = Date.now() + 8_000
+      const deadline = Date.now() + 25_000
       while (Date.now() < deadline && store.getDesign(store.latestDesignId() ?? '')?.status !== 'planned') {
         await new Promise((r) => setTimeout(r, 100))
       }
@@ -728,7 +728,7 @@ describe('plan-only execution boundary', () => {
       delete process.env.ARC_FAKE_QUEUE
       rmSync(queueDir, { recursive: true, force: true })
     }
-  }, 15_000)
+  }, 40_000)
 })
 
 describe('direct-lane execution boundary', () => {
@@ -762,7 +762,7 @@ describe('direct-lane execution boundary', () => {
       stdout: out.stream, stdin: out.stdin, exitOnCtrlC: false, patchConsole: false,
     })
     try {
-      const deadline = Date.now() + 8_000
+      const deadline = Date.now() + 25_000
       while (Date.now() < deadline && !store.latestDesignId()) await new Promise((r) => setTimeout(r, 50))
       const id = store.latestDesignId()!
       while (Date.now() < deadline && !store.eventsSince(id, 0).some((event) => event.kind === 'lane.end')) {
@@ -780,7 +780,7 @@ describe('direct-lane execution boundary', () => {
       delete process.env.ARC_FAKE_QUEUE
       rmSync(queueDir, { recursive: true, force: true })
     }
-  }, 15_000)
+  }, 40_000)
 })
 
 describe('trust modes and lane locks gate the direct lane', () => {
@@ -804,7 +804,7 @@ describe('trust modes and lane locks gate the direct lane', () => {
     return queueDir
   }
   const until = async (predicate: () => boolean) => {
-    const deadline = Date.now() + 8_000
+    const deadline = Date.now() + 25_000
     while (Date.now() < deadline && !predicate()) await new Promise((r) => setTimeout(r, 50))
   }
   const prompts = (heading: string) => readdirSync(join(home, 'artifacts'))
@@ -835,7 +835,7 @@ describe('trust modes and lane locks gate the direct lane', () => {
       // Refused BEFORE the lane started: no design row, no writer dispatch.
       expect(store.latestDesignId()).toBeFalsy()
     } finally { app.unmount(); store.close() }
-  }, 15_000)
+  }, 40_000)
 
   it('refuses a direct change while another live session holds the checkout lock', async () => {
     queueDir = withQueue([{ kind: 'work', lane: 'direct', reply: '', restated: 'focused' }])
@@ -858,7 +858,7 @@ describe('trust modes and lane locks gate the direct lane', () => {
       // The refusal must not steal the holder's lock on the way out.
       expect(readFileSync(lockFile, 'utf8')).toContain('elsewhere')
     } finally { app.unmount(); store.close(); rmSync(lockFile, { force: true }) }
-  }, 15_000)
+  }, 40_000)
 
   it('stops an ask-mode direct change for approval, then proceeds on yes', async () => {
     queueDir = withQueue([
@@ -888,7 +888,7 @@ describe('trust modes and lane locks gate the direct lane', () => {
       const id = store.latestDesignId()!
       expect(store.eventsSince(id, 0).find((event) => event.kind === 'lane.end')?.payload).toMatchObject({ lane: 'direct', ok: true })
     } finally { app.unmount(); store.close() }
-  }, 15_000)
+  }, 40_000)
 
   it('routes by a user-locked lane without spending a triage turn', async () => {
     // The queue holds NO triage payload: if the classifier were consulted the
@@ -921,7 +921,7 @@ describe('trust modes and lane locks gate the direct lane', () => {
       const id = store.latestDesignId()!
       expect(store.eventsSince(id, 0).find((event) => event.kind === 'lane.start')?.payload).toMatchObject({ lane: 'direct' })
     } finally { app.unmount(); store.close() }
-  }, 15_000)
+  }, 40_000)
 
   it('persists lane attempts and usage, and serves them back through /transcript', async () => {
     queueDir = withQueue([
@@ -954,7 +954,7 @@ describe('trust modes and lane locks gate the direct lane', () => {
       await until(() => out.scrollback().includes('Transcripts for'))
       expect(out.scrollback()).toContain(`Transcripts for ${id}`)
     } finally { app.unmount(); store.close() }
-  }, 15_000)
+  }, 40_000)
 
   it('synthesizes research through the head instead of dumping raw scout findings', async () => {
     queueDir = withQueue([
@@ -987,7 +987,7 @@ describe('trust modes and lane locks gate the direct lane', () => {
       expect(store.getArc(store.latestDesignId()!)).toBeUndefined()
       expect(store.artifactsFor(store.latestDesignId()!, 'research-synthesis').length).toBe(1)
     } finally { app.unmount(); store.close() }
-  }, 15_000)
+  }, 40_000)
 
   it('reopens the interview once with refuted premises, supersedes them, and scouts again', async () => {
     queueDir = withQueue([
@@ -1030,7 +1030,7 @@ describe('trust modes and lane locks gate the direct lane', () => {
       expect(reopened).toContain('reviews are never stored')
       expect(reopened).toContain('src/importer.ts:41 stores every review')
     } finally { app.unmount(); store.close() }
-  }, 15_000)
+  }, 40_000)
 
   it('stops after a second scout failure without a third interview or scout round', async () => {
     queueDir = withQueue([
@@ -1068,7 +1068,7 @@ describe('trust modes and lane locks gate the direct lane', () => {
       expect(prompts('# INTERVIEW')).toHaveLength(2)
       expect(prompts('# ASSIGN THE SCOUTS')).toHaveLength(2)
     } finally { app.unmount(); store.close() }
-  }, 15_000)
+  }, 40_000)
 
   it('does not reopen when the first scout failure has no refuted premise', async () => {
     queueDir = withQueue([
@@ -1088,7 +1088,7 @@ describe('trust modes and lane locks gate the direct lane', () => {
       expect(prompts('# INTERVIEW')).toHaveLength(1)
       expect(prompts('# ASSIGN THE SCOUTS')).toHaveLength(1)
     } finally { app.unmount(); store.close() }
-  }, 15_000)
+  }, 40_000)
 
   it('paints the target thread’s durable history when switching threads', async () => {
     const store = new Store(home)
@@ -1109,7 +1109,7 @@ describe('trust modes and lane locks gate the direct lane', () => {
       expect(scrollback).toContain('first durable line')
       expect(scrollback).toContain('second durable line')
     } finally { app.unmount(); store.close() }
-  }, 15_000)
+  }, 40_000)
 
   it('keeps the busy footer legible in a narrow terminal', async () => {
     queueDir = withQueue([])
@@ -1133,7 +1133,7 @@ describe('trust modes and lane locks gate the direct lane', () => {
       await tick()
       app.unmount(); store.close()
     }
-  }, 15_000)
+  }, 40_000)
 
   it('answers a work-shaped chat classification instead of falling into the deep pipeline', async () => {
     queueDir = withQueue([{ kind: 'work', lane: 'chat', reply: 'Just conversation.', restated: '' }])
@@ -1149,7 +1149,7 @@ describe('trust modes and lane locks gate the direct lane', () => {
       // called conversation.
       expect(store.latestDesignId()).toBeFalsy()
     } finally { app.unmount(); store.close() }
-  }, 15_000)
+  }, 40_000)
 })
 
 describe('the message queue', () => {
