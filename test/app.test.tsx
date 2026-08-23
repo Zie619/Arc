@@ -882,8 +882,13 @@ describe('trust modes and lane locks gate the direct lane', () => {
       expect(store.latestDesignId()).toBeFalsy()
       out.send('y')
       await until(() => {
+        // The panel's key listener attaches in an effect AFTER the paint that
+        // showed 'Proceed?', so on a loaded runner a single keystroke can lose
+        // the race and the flow hangs forever. Keep pressing until the
+        // approval durably lands (the design row appears right after it).
         const id = store.latestDesignId()
-        return Boolean(id && store.eventsSince(id, 0).some((event) => event.kind === 'lane.end'))
+        if (!id) { out.send('y'); return false }
+        return store.eventsSince(id, 0).some((event) => event.kind === 'lane.end')
       })
       const id = store.latestDesignId()!
       expect(store.eventsSince(id, 0).find((event) => event.kind === 'lane.end')?.payload).toMatchObject({ lane: 'direct', ok: true })
