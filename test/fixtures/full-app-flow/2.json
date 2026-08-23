@@ -1,0 +1,8 @@
+{
+  "scouts": [{
+    "id": "repo",
+    "area": "repository baseline",
+    "brief": "Confirm the base branch and identify where the generated module belongs.",
+    "engine": "codex"
+  }]
+}

@@ -1,0 +1,18 @@
+{
+  "proposedGoal": "Add a generated module through the complete interactive arc flow",
+  "objectives": ["Create generated.ts and prove it exists"],
+  "nonGoals": ["Do not edit the base README"],
+  "questions": [{
+    "id": "shape",
+    "text": "Should the generated module export a constant?",
+    "why": "This determines the public shape of the file.",
+    "options": ["Export a constant", "Export a function"],
+    "recommendation": "Export a constant because the fixture is deliberately small.",
+    "blocking": true
+  }],
+  "premises": [{
+    "id": "repo-exists",
+    "statement": "The repository has a committed base branch.",
+    "howToVerify": "Run git rev-parse main."
+  }]
+}

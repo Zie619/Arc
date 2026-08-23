@@ -1,0 +1,146 @@
+import { spawn } from 'node:child_process'
+import { realpathSync } from 'node:fs'
+import { join, isAbsolute } from 'node:path'
+import { normalizeFailureSignature } from './classify.ts'
+import { buildGateChildEnv } from './provider-runtime.ts'
+import type { GateDef } from './types.ts'
+
+/**
+ * A gate is DATA: a command, the property it proves, and an expected baseline.
+ *
+ * Rules encoded here, each of which is a documented failure from the source
+ * material:
+ *   - capture the exit code DIRECTLY; never end a pipeline in `tail`, which
+ *     returns tail's own exit code and reports a red build as green
+ *   - a check that TIMES OUT or CRASHES is FAILED, never passing
+ *   - a gate result carries the base sha it was computed against, and is
+ *     invalid the moment the integration target moves past it
+ *   - grep CLASSIFIES failures; it never DETECTS them
+ */
+
+export interface GateResult {
+  name: string
+  command: string
+  proves: string
+  exitCode: number | null
+  pass: boolean
+  timedOut: boolean
+  output: string
+  signature: string
+  baseSha: string
+  durationMs: number
+}
+
+// Deny-write profile for reviewer-authored commands. Temp dirs and /dev stay
+// writable so ordinary read-only tooling (node, grep pipelines) still runs —
+// but the tree being checked gets a FINAL deny (seatbelt: last match wins),
+// because a repo or worktree can itself live under a temp path.
+const READ_ONLY_PROFILE =
+  '(version 1)(allow default)(deny file-write*)' +
+  '(allow file-write* (subpath "/private/tmp") (subpath "/private/var/folders") (subpath "/dev"))'
+
+function gateArgv(gate: GateDef, dir: string): { bin: string; args: string[] } {
+  if (gate.readOnly && process.platform === 'darwin') {
+    const target = JSON.stringify(realpathSync(dir))
+    const profile = `${READ_ONLY_PROFILE}(deny file-write* (subpath ${target}))`
+    return { bin: '/usr/bin/sandbox-exec', args: ['-p', profile, 'bash', '-c', gate.command] }
+  }
+  return { bin: 'bash', args: ['-c', gate.command] }
+}
+
+export async function runGate(
+  gate: GateDef,
+  cwd: string,
+  baseSha: string,
+  signal?: AbortSignal,
+): Promise<GateResult> {
+  const started = Date.now()
+  const dir = isAbsolute(gate.cwd) ? gate.cwd : join(cwd, gate.cwd)
+  const { bin, args } = gateArgv(gate, dir)
+  return await new Promise<GateResult>((resolve) => {
+    let output = ''
+    let timedOut = false
+    let settled = false
+    const child = spawn(bin, args, {
+      cwd: dir,
+      env: buildGateChildEnv(process.env, gate.envAllowlist ?? []),
+      stdio: ['ignore', 'pipe', 'pipe'],
+      detached: true,
+    })
+    const append = (chunk: Buffer): void => {
+      output = `${output}${chunk.toString()}`.slice(-64 * 1024 * 1024)
+    }
+    child.stdout.on('data', append)
+    child.stderr.on('data', append)
+    const kill = (): void => {
+      if (child.pid !== undefined) {
+        try { process.kill(-child.pid, 'SIGKILL') } catch { /* already gone */ }
+      }
+      try { child.kill('SIGKILL') } catch { /* already gone */ }
+    }
+    const finish = (code: number | null): void => {
+      if (settled) return
+      settled = true
+      clearTimeout(timer)
+      signal?.removeEventListener('abort', abort)
+      const trimmed = output.trim()
+      const exitCode = timedOut || signal?.aborted ? null : code
+      const pass = !timedOut && !signal?.aborted && exitCode === 0
+      resolve({
+        name: gate.name, command: gate.command, proves: gate.proves,
+        exitCode, pass, timedOut,
+        output: trimmed.slice(-20_000),
+        signature: normalizeFailureSignature(trimmed),
+        baseSha, durationMs: Date.now() - started,
+      })
+    }
+    const abort = (): void => { kill() }
+    const timer = setTimeout(() => { timedOut = true; kill() }, gate.timeoutMs)
+    if (signal?.aborted) abort()
+    else signal?.addEventListener('abort', abort, { once: true })
+    child.on('error', () => finish(null))
+    child.on('close', (code) => finish(code))
+  })
+}
+
+/**
+ * Compare a result against a baseline measured on the SAME base sha in the
+ * SAME run.
+ *
+ * Requiring equality turns ordinary flake into a false red — the baseline of a
+ * real suite drifts by a few files between runs. So the rule is SUBSET: the
+ * task may not introduce a failure the baseline did not already have.
+ */
+export function isSubsetOfBaseline(result: GateResult, baseline: GateResult): boolean {
+  if (result.pass) return true
+  if (baseline.pass) return false // baseline was green, we are red: genuinely ours
+
+  const baseLines = new Set(failureLines(baseline.signature))
+  const newLines = failureLines(result.signature)
+  return newLines.every((l) => baseLines.has(l))
+}
+
+function failureLines(signature: string): string[] {
+  return signature
+    .split('\n')
+    .filter((l) => /\b(fail|error|✗|✕|FAIL|ERR!)\b/i.test(l))
+    .map((l) => l.trim())
+}
+
+export function selectGates(all: GateDef[], names: string[]): GateDef[] {
+  if (names.length === 0) return all.filter((g) => !g.heavy)
+  const byName = new Map(all.map((g) => [g.name, g]))
+  const out: GateDef[] = []
+  for (const n of names) {
+    const g = byName.get(n)
+    if (!g) throw new Error(`unknown gate "${n}" — declared gates are: ${[...byName.keys()].join(', ')}`)
+    out.push(g)
+  }
+  return out
+}
+
+/** A one-line human summary. Says what it PROVED, not just that it passed. */
+export function describe(r: GateResult): string {
+  if (r.timedOut) return `${r.name}: TIMED OUT after ${Math.round(r.durationMs / 1000)}s → FAILED (a check that hangs is a broken check)`
+  return `${r.name}: ${r.pass ? 'pass' : `FAIL (exit ${r.exitCode})`} — proves: ${r.proves}`
+}

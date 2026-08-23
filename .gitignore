@@ -1,0 +1,5 @@
+node_modules/
+dist/
+*.tsbuildinfo
+.arc/
+test/.tmp/

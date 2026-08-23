@@ -1,0 +1,3 @@
+{
+  "risks": [{"id": "missing-export", "text": "The module may not export the promised constant.", "howToCheck": "Inspect generated.ts."}]
+}

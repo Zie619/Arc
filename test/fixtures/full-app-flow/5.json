@@ -1,0 +1,10 @@
+{
+  "status": "done",
+  "shipped": [{"path": "generated.ts", "whatChanged": "created a module exporting the fixture constant"}],
+  "deviations": [],
+  "discoveries": [],
+  "criteria": [{"id": "file-exists", "claimedTier": "checked", "evidence": "test -f generated.ts"}],
+  "pendingOps": [],
+  "noop": false,
+  "noopReason": null
+}

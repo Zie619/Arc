@@ -1,0 +1,10 @@
+{
+  "area": "repository baseline",
+  "findings": [{"file": "README.md", "line": 1, "what": "The repository has a committed base file.", "why": "It proves the worktree has a real base."}],
+  "filesToTouch": ["generated.ts"],
+  "contractsMutated": ["generatedConstant"],
+  "contractsRead": [],
+  "risks": [],
+  "premiseVerdicts": [{"id": "repo-exists", "verdict": "confirmed", "evidence": "git rev-parse main"}],
+  "proposedWork": [{"title": "Create generated module", "rationale": "It is the requested observable output."}]
+}

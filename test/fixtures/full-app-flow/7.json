@@ -1,0 +1,6 @@
+{
+  "verdict": "PASS",
+  "findings": [],
+  "criteriaAssessment": [{"id": "file-exists", "met": true, "evidence": "The committed diff contains generated.ts."}],
+  "seamRisks": []
+}

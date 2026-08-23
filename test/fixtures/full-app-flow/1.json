@@ -1,0 +1,6 @@
+{
+  "goal": "Add a generated module through the complete interactive arc flow",
+  "objectives": ["Create generated.ts and prove it exists"],
+  "nonGoals": ["Do not edit the base README"],
+  "constraints": [{"text": "Keep the change isolated on an arc branch", "hardness": "MUST"}]
+}

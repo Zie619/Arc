@@ -1,0 +1,95 @@
+# Everything Riverio-specific lives here. Never in code.
+#
+# M1 is Riverio-only by decision, but the seam exists from day one because
+# retrofitting configuration onto hardcoded paths is the expensive direction.
+
+name: riverio
+repo: /Users/eliadshahar/gambit/openflow
+mainBranch: main
+
+# `main` is protected with required checks, so work lands via PR. Probed at arc
+# start rather than assumed — five session-master scripts died the day the
+# branch became protected.
+landStrategy: pr
+
+# Two independent limits. Same number, unrelated reasons:
+#   agentConcurrency — token / rate budget
+#   heavyGateLimit   — CPU and RAM; concurrent next-builds wedge the machine
+agentConcurrency: 3
+heavyGateLimit: 1
+
+maxAttempts: 4
+maxTaskMinutes: 90
+
+roles:
+  # Sol writes the code.
+  implement:
+    cli: codex
+    model: gpt-5.6-sol
+    effort: high
+    sandbox: workspace-write
+    timeoutMs: 2700000
+    stallMs: 420000
+
+  # Opus reviews it — and writes its risk checklist BEFORE seeing the diff.
+  # `opus` is an alias for the latest Opus, so a new model ships and is live
+  # here with zero action. Pinning an id would freeze us.
+  review:
+    cli: claude
+    model: opus
+    effort: high
+    sandbox: read-only
+    tools: "Read,Grep,Glob,Bash(git *)"
+    timeoutMs: 1800000
+    stallMs: 300000
+
+  # Read-only by CAPABILITY, not by instruction. A scout that CAN write will
+  # start fixing things instead of reporting.
+  scout:
+    cli: codex
+    model: gpt-5.6-sol
+    effort: medium
+    sandbox: read-only
+    timeoutMs: 900000
+    stallMs: 240000
+
+  # The whole-integration pass at the seams.
+  integrate:
+    cli: claude
+    model: opus
+    effort: high
+    sandbox: read-only
+    tools: "Read,Grep,Glob,Bash(git *)"
+    timeoutMs: 2400000
+    stallMs: 300000
+
+gates:
+  # THE GATE IS TWO COMMANDS. `next build` typechecks nothing —
+  # next.config.ts sets typescript.ignoreBuildErrors on purpose, so a green
+  # build proves the app BUNDLES and says nothing whatsoever about types.
+  - name: typecheck
+    # The repo's OWN canonical script (root `pnpm typecheck` -> `pnpm -r typecheck`),
+    # which is what CI runs as a separate required check. Do not hand-roll a
+    # tsc invocation here — it drifts from what actually gates a merge.
+    command: NODE_OPTIONS=--max-old-space-size=8192 pnpm typecheck
+    cwd: .
+    proves: types are sound across the webapp
+    timeoutMs: 900000
+    heavy: false
+    # Node 26 locally produces a handful of phantom TS2769 errors that do not
+    # reproduce in CI. baselineSubset measures them on the base sha IN THIS RUN
+    # and requires only that we add none — rather than hardcoding a magic
+    # expected-failure count that silently rots.
+    baselineSubset: true
+
+  - name: build
+    # The project's OWN canonical script. It fires the real prebuild chain,
+    # which drifts. Never hand-list the generators, and never `npx` — npx
+    # resolves a stale global copy and dies before the build even starts,
+    # which reads like a build failure but is a bad invocation.
+    command: pnpm --filter riverio-webapp build
+    cwd: .
+    proves: the app bundles exactly as CI and Railway build it
+    timeoutMs: 2400000
+    heavy: true
+    baselineSubset: false

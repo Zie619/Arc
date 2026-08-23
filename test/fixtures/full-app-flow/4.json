@@ -1,0 +1,19 @@
+{
+  "tasks": [{
+    "id": "generated-module",
+    "title": "Create the generated module",
+    "spec": "Create generated.ts exporting a constant and commit it by explicit path.",
+    "dependsOn": [],
+    "footprint": ["generated.ts"],
+    "contractsMutated": ["generatedConstant"],
+    "contractsRead": [],
+    "gates": [],
+    "acceptance": [{
+      "id": "file-exists",
+      "text": "generated.ts exists in the task worktree",
+      "proofKind": "command",
+      "proofCommand": "test -f generated.ts",
+      "requiredTier": "checked"
+    }]
+  }]
+}

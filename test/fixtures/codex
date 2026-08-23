@@ -1,0 +1,48 @@
+#!/usr/bin/env bash
+# Fake `codex exec`. Mimics the JSONL shape probed from codex-cli 0.149.0.
+if [ "$1" = "--help" ] || { [ "$1" = "exec" ] && [ "$2" = "--help" ]; }; then
+  [ -n "$ARC_FAKE_HELP_FAIL" ] && exit 1
+  OMIT=" ${ARC_FAKE_HELP_OMIT//,/ } "
+  for FLAG in exec --json --skip-git-repo-check --cd --sandbox -m -c -o --output-schema; do
+    [[ "$OMIT" = *" $FLAG "* ]] || printf '%s\n' "$FLAG"
+  done
+  exit 0
+fi
+OUT=""; while [ $# -gt 0 ]; do case "$1" in -o) OUT="$2"; shift 2;; *) shift;; esac; done
+cat > /dev/null  # consume the prompt on stdin
+PAYLOAD="$ARC_FAKE_PAYLOAD"
+CALL_INDEX=""
+[ -z "$PAYLOAD" ] && PAYLOAD='{"status":"done","noop":true,"noopReason":"fixture"}'
+# ARC_FAKE_QUEUE=<dir>: serve one payload per call, in order. The design phase
+# makes several different calls (extract -> charter -> scout plan -> report ->
+# plan), so a single fixed payload cannot exercise it.
+if [ -n "$ARC_FAKE_QUEUE" ]; then
+  # Claim a slot ATOMICALLY (mv on one filesystem): concurrent dispatches used
+  # to double-serve one slot through the read-increment counter.
+  N=0
+  while [ "$N" -lt 64 ]; do
+    if mv "$ARC_FAKE_QUEUE/$N.json" "$ARC_FAKE_QUEUE/$N.taken.$$" 2>/dev/null; then
+      PAYLOAD=$(cat "$ARC_FAKE_QUEUE/$N.taken.$$")
+      break
+    fi
+    N=$((N + 1))
+  done
+  CALL_INDEX="$N"
+fi
+echo '{"type":"thread.started","thread_id":"t1"}'
+echo '{"type":"turn.started"}'
+echo '{"type":"item.completed","item":{"text":"working"}}'
+[ -n "$ARC_FAKE_HANG" ] && case "$ARC_FAKE_HANG" in ''|1) sleep 300;; *) sleep "$ARC_FAKE_HANG";; esac
+# ARC_FAKE_WRITE=<file>: actually create and commit a file, so a full
+# orchestrator run can be exercised end to end without spending a token.
+if [ -n "$ARC_FAKE_WRITE" ] && { [ -z "$ARC_FAKE_WRITE_AT" ] || [ "$CALL_INDEX" = "$ARC_FAKE_WRITE_AT" ]; }; then
+  TARGET="$ARC_FAKE_WRITE"
+  # "auto" -> a filename unique to this worktree, so parallel fixtures touch
+  # disjoint files exactly as two real independent tasks would.
+  [ "$TARGET" = auto ] && TARGET="$(basename "$PWD")-generated.ts"
+  printf 'export const x = 1\n' > "$TARGET"
+  git add -- "$TARGET" >/dev/null 2>&1
+  git -c user.email=f@f.f -c user.name=fake commit -q -m "fake: $TARGET" >/dev/null 2>&1
+fi
+echo '{"type":"turn.completed","usage":{"input_tokens":101,"cached_input_tokens":51,"cache_write_input_tokens":7,"output_tokens":13,"reasoning_output_tokens":3}}'
+[ -n "$OUT" ] && printf '%s' "$PAYLOAD" > "$OUT"
