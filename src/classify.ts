@@ -37,6 +37,25 @@ export function signaturesMatch(a: string, b: string): boolean {
   return a.length > 0 && a === b
 }
 
+/**
+ * Order-insensitive similarity of two normalized signatures, 0..1.
+ *
+ * Byte equality misses real repeats: a live run showed Supabase printing its
+ * env-var warnings in a different ORDER each time, so two identical lint
+ * failures never compared equal and the writer burned every attempt on a
+ * failure it could not fix. Line-set Jaccard ignores ordering while still
+ * dropping when the CONTENT moves — "5 tests failed" → "3 tests failed"
+ * changes the line, so convergence still reads as change.
+ */
+export function signatureSimilarity(a: string, b: string): number {
+  if (a.length === 0 || b.length === 0) return 0
+  const setA = new Set(a.split('\n'))
+  const setB = new Set(b.split('\n'))
+  let common = 0
+  for (const line of setA) if (setB.has(line)) common++
+  return common / Math.max(setA.size, setB.size)
+}
+
 export interface ExitFacts {
   exitCode: number | null
   signal: string | null

@@ -5,7 +5,7 @@ import { compileBrief, BriefTooLarge } from './brief.ts'
 import { dispatch, checkModel, auxiliaryModels, modelCheckMode, type DispatchResult } from './harness.ts'
 import { computeFrontier } from './scheduler.ts'
 import { runGate, selectGates, isSubsetOfBaseline, describe, type GateResult } from './gates.ts'
-import { signaturesMatch } from './classify.ts'
+import { signaturesMatch, signatureSimilarity } from './classify.ts'
 import * as G from './git.ts'
 import {
   TaskResult, ReviewVerdict, RiskChecklist, ProjectConfig,
@@ -463,7 +463,7 @@ async function implementLoop(
   if (!role) throw new Error('project.yaml defines no "implement" role')
 
   const deadline = Date.now() + config.maxTaskMinutes * 60_000
-  let lastSignature = ''
+  const priorSignatures: string[] = []
   let feedback = ''
 
   for (let attempt = 1; attempt <= config.maxAttempts; attempt++) {
@@ -593,14 +593,20 @@ async function implementLoop(
       return 'ok'
     }
 
+    // Compared against EVERY prior failure, not just the last one — a live
+    // run interleaved two identical lint failures with a transient 502 and
+    // the consecutive-only check never fired. Similarity, not equality,
+    // because provider tooling reorders its own noise lines between runs.
     const signature = failed.map((f) => f.result.signature).join('\n--\n')
-    if (signaturesMatch(signature, lastSignature)) {
-      log(`  ✗ ${task.id}: identical failure twice — not converging, stopping`)
+    const repeat = priorSignatures.findIndex((s) => signaturesMatch(signature, s) || signatureSimilarity(signature, s) >= 0.95)
+    if (repeat >= 0) {
+      log(`  ✗ ${task.id}: this failure is ≥95% identical to attempt ${repeat + 1}'s — the code is changing but the failure is not.`)
+      log(`      That usually means the GATE or its environment is the problem, not the writer. Stopping instead of burning attempts.`)
       store.addFinding({ arcId, taskId: task.id, kind: 'risk', severity: 'high',
-        text: `loop not converging; same failure signature twice on ${failed.map((f) => f.result.name).join(', ')}` })
+        text: `loop not converging: failure signature matches attempt ${repeat + 1} on ${failed.map((f) => f.result.name).join(', ')} — suspect the gate or environment, not the code` })
       return 'failed'
     }
-    lastSignature = signature
+    priorSignatures.push(signature)
 
     feedback = [
       `These checks FAILED. Fix ONLY what they report; do not restyle unrelated code.`,

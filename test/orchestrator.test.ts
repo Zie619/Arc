@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest'
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs'
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync, readFileSync } from 'node:fs'
 import { execFileSync } from 'node:child_process'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
@@ -503,6 +503,38 @@ describe('the orchestrator, end to end', () => {
     expect(store.getArc('e2e')?.status).toBe('incomplete')
     expect(logs.join('\n')).toContain('INTEGRATION REVIEW DID NOT PASS')
     expect(logs.join('\n')).not.toContain('COMPLETE — every criterion')
+    store.close()
+  }, 60_000)
+})
+
+describe('the retry loop refuses to burn attempts on a failure that never changes', () => {
+  it('stops when a failure repeats — even interleaved with a flake and with noise reordered', async () => {
+    // The exact anatomy of a real run: lint failure → transient 502 →
+    // the SAME lint failure with the provider's warning lines in a
+    // different order. Consecutive byte-comparison never fires on that.
+    const counter = join(home, 'gate-count')
+    const gate = [
+      `C=${counter}; n=$(cat $C 2>/dev/null || echo 0); echo $((n+1)) > $C;`,
+      `if [ "$n" = "1" ]; then echo "Error status 502: invalid response from upstream";`,
+      `elif [ "$n" = "0" ]; then printf "WARN: unset GOOGLE\\nWARN: unset APPLE\\nlint error: operator does not exist\\nfail-on error\\n";`,
+      `else printf "WARN: unset APPLE\\nWARN: unset GOOGLE\\nlint error: operator does not exist\\nfail-on error\\n"; fi; exit 1`,
+    ].join(' ')
+    const store = new Store(home)
+    await runArc({
+      store,
+      plan: plan([task('t-lint', { gates: ['flaky-lint'] })]),
+      config: config({
+        maxAttempts: 4, landStrategy: 'none',
+        gates: [{ name: 'flaky-lint', command: gate, proves: 'a fixture failure that never changes' }],
+      }),
+      log,
+    })
+    const out = logs.join('\n')
+    expect(out).toContain("identical to attempt 1's")
+    expect(out).toContain('GATE or its environment')
+    expect(store.allTasks('e2e')[0]!.state).toBe('failed')
+    // Three gate runs, not four: the fourth attempt was refused as waste.
+    expect(readFileSync(counter, 'utf8').trim()).toBe('3')
     store.close()
   }, 60_000)
 })
