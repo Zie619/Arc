@@ -25,6 +25,8 @@ function main(): void {
     process.exit(1)
   }
 
+  if (process.stdout.isTTY) process.stdout.write('\x1b[2J\x1b[H')
+
   const launch = (config: ProjectConfig) => {
     const root = process.env.ARC_HOME ?? join(process.env.HOME ?? '.', '.arc', config.name)
     const store = new Store(root)
