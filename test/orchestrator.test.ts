@@ -507,6 +507,60 @@ describe('the orchestrator, end to end', () => {
   }, 60_000)
 })
 
+describe('CHANGES_REQUIRED buys a repair round, not a burial', () => {
+  it('feeds the findings back to the writer once, re-reviews, and lands', async () => {
+    // A real overnight run died with a PERFECT review naming exactly what to
+    // fix (a missing INSERT policy) — and a writer who never got to see it.
+    const queue = join(home, 'queue-repair-round')
+    mkdirSync(queue)
+    const payloads = [
+      {
+        status: 'done', noop: false,
+        shipped: [{ path: 'generated.ts', whatChanged: 'created' }],
+        criteria: [{ id: 'c1', claimedTier: 'checked', evidence: 'fixture ran' }],
+      },
+      { risks: [{ id: 'r1', text: 'risk', howToCheck: 'look' }] },
+      {
+        verdict: 'CHANGES_REQUIRED',
+        findings: [{
+          severity: 'critical', file: 'generated.ts', line: 1,
+          claim: 'no INSERT policy on the new table', failureScenario: 'users cannot write',
+          suggestedFix: 'add the policy',
+        }],
+        criteriaAssessment: [], seamRisks: [],
+      },
+      {
+        status: 'done', noop: false,
+        shipped: [{ path: 'generated.ts', whatChanged: 'added the policy' }],
+        criteria: [{ id: 'c1', claimedTier: 'checked', evidence: 'fixture ran again' }],
+      },
+      { risks: [{ id: 'r1', text: 'risk', howToCheck: 'look' }] },
+      { verdict: 'PASS', findings: [], criteriaAssessment: [], seamRisks: [] },
+    ]
+    payloads.forEach((payload, index) => writeFileSync(join(queue, `${index}.json`), JSON.stringify(payload)))
+    process.env.ARC_FAKE_QUEUE = queue
+    process.env.ARC_FAKE_WRITE_AT = '0'
+    delete process.env.ARC_FAKE_PAYLOAD
+
+    const roles = {
+      implement: { cli: 'codex', model: 'gpt-5.6-sol', sandbox: 'workspace-write', timeoutMs: 20000, stallMs: 15000 },
+      review: { cli: 'claude', model: 'opus', sandbox: 'read-only', timeoutMs: 20000, stallMs: 15000 },
+    }
+    const store = new Store(home)
+    await runArc({ store, plan: plan([task('fix-me')]), config: config({ landStrategy: 'none', roles }), log })
+
+    const out = logs.join('\n')
+    expect(out).toContain('review requires changes — one repair round with 1 finding(s)')
+    expect(store.allTasks('e2e')[0]!.state).toBe('landed')
+    // The repair brief carried the reviewer's finding verbatim.
+    const briefs = store.artifactsFor('e2e', 'brief')
+    const { readFileSync: rf } = await import('node:fs')
+    const texts = briefs.map((b) => rf(String(store.artifactPath(String(b.id))), 'utf8'))
+    expect(texts.some((t) => t.includes('no INSERT policy on the new table'))).toBe(true)
+    store.close()
+  }, 60_000)
+})
+
 describe('a slow review does not bury a green task', () => {
   it('retries the review once after a hard timeout, then lands', async () => {
     const queue = join(home, 'queue-slow-review')

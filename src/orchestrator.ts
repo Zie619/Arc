@@ -396,8 +396,29 @@ async function runTask(
     }
 
     store.setTaskState(arcId, task.id, 'reviewing', LEASE_MS)
-    const passed = await reviewLoop(o, task, wt)
-    if (!passed) { store.setTaskState(arcId, task.id, 'failed'); return }
+    let review = await reviewLoop(o, task, wt)
+    if (review === 'repair') {
+      // CHANGES_REQUIRED used to be a death sentence — a real overnight run
+      // died with a perfect review naming exactly what to fix and a writer
+      // who never got to see it. The findings are on record; the writer gets
+      // ONE repair round with them before the task is failed.
+      const reviewFindings = store.findingsFor(arcId)
+        .filter((f) => f.task_id === task.id && f.kind === 'review')
+        .slice(-12)
+        .map((f) => `- [${f.severity}] ${f.text}`)
+      log(`  · ${task.id}: review requires changes — one repair round with ${reviewFindings.length} finding(s)`)
+      store.setTaskState(arcId, task.id, 'running', LEASE_MS)
+      const repaired = await implementLoop(o, task, wt, baselines, heavy,
+        `The reviewer requires changes. Fix ALL of these findings in your existing branch:\n${reviewFindings.join('\n')}`)
+      if (repaired === 'ok') {
+        store.setTaskState(arcId, task.id, 'reviewing', LEASE_MS)
+        review = await reviewLoop(o, task, wt)
+        if (review === 'repair') log(`  ✗ ${task.id}: changes still required after the repair round — stopping`)
+      } else {
+        review = 'fail'
+      }
+    }
+    if (review !== 'pass') { store.setTaskState(arcId, task.id, 'failed'); return }
 
     const unmet = store.unmetCriteria(arcId, task.id)
     if (unmet.length > 0) {
@@ -456,6 +477,7 @@ function modelStatus(
 
 async function implementLoop(
   o: RunOptions, task: PlanTask, wt: G.Worktree, baselines: Map<string, GateResult>, heavy: Semaphore,
+  initialFeedback = '',
 ): Promise<ImplementOutcome> {
   const { store, plan, config, log } = o
   const arcId = plan.arcId
@@ -464,7 +486,7 @@ async function implementLoop(
 
   const deadline = Date.now() + config.maxTaskMinutes * 60_000
   const priorSignatures: string[] = []
-  let feedback = ''
+  let feedback = initialFeedback
 
   for (let attempt = 1; attempt <= config.maxAttempts; attempt++) {
     // Wall clock is checked BETWEEN attempts so nothing is abandoned half-done.
@@ -888,11 +910,12 @@ async function runReviewFindingCheck(
  * SPEC and BASE TREE first, before it is allowed to see the implementation.
  * Otherwise review degenerates into rationalising whatever was written.
  */
-async function reviewLoop(o: RunOptions, task: PlanTask, wt: G.Worktree): Promise<boolean> {
+/** 'repair': the review found CONTENT problems the writer can fix; 'fail': infrastructure or a rejection. */
+async function reviewLoop(o: RunOptions, task: PlanTask, wt: G.Worktree): Promise<'pass' | 'repair' | 'fail'> {
   const { store, plan, config, log } = o
   const arcId = plan.arcId
   const role = config.roles.review
-  if (!role) { log('  (no review role configured — skipping)'); return true }
+  if (!role) { log('  (no review role configured — skipping)'); return 'pass' }
 
   const checklistBrief = [
     `# PREDICT THE RISKS — you have NOT seen the implementation`,
@@ -927,11 +950,11 @@ async function reviewLoop(o: RunOptions, task: PlanTask, wt: G.Worktree): Promis
     log(`  ✗ MODEL DRIFT in risk prediction: asked for ${role.model}, ran on ${cl.observedModels.join(', ')}`)
     store.addFinding({ arcId, taskId: task.id, attemptId: clAttempt, kind: 'risk', severity: 'high',
       text: `review model drift: requested ${role.model}, observed ${cl.observedModels.join(', ')}` })
-    return false
+    return 'fail'
   }
   if (cl.terminalReason !== 'ok' || !cl.parsed) {
     log(`  ✗ ${task.id}: risk prediction ended "${cl.terminalReason}" — treating as not-reviewed`)
-    return false
+    return 'fail'
   }
   const checklist = (cl.parsed as z.infer<typeof RiskChecklist> | undefined)?.risks ?? []
   log(`  · ${task.id} review: ${checklist.length} risk(s) predicted before seeing the diff`)
@@ -987,7 +1010,7 @@ async function reviewLoop(o: RunOptions, task: PlanTask, wt: G.Worktree): Promis
       log(`  ✗ MODEL DRIFT in review: asked for ${role.model}, ran on ${rv.observedModels.join(', ')}`)
       store.addFinding({ arcId, taskId: task.id, attemptId: rvAttempt, kind: 'risk', severity: 'high',
         text: `review model drift: requested ${role.model}, observed ${rv.observedModels.join(', ')}` })
-      return false
+      return 'fail'
     }
     if ((rv.terminalReason === 'hard-timeout' || rv.terminalReason === 'stall-kill') && round === 1) {
       log(`  ! ${task.id}: review ${rv.terminalReason} — the task is green, so the review gets one more try`)
@@ -998,7 +1021,7 @@ async function reviewLoop(o: RunOptions, task: PlanTask, wt: G.Worktree): Promis
 
   if (rv.terminalReason !== 'ok' || !rv.parsed) {
     log(`  ✗ ${task.id}: review ended "${rv.terminalReason}" — treating as not-reviewed`)
-    return false
+    return 'fail'
   }
 
   const verdict = rv.parsed as z.infer<typeof ReviewVerdict>
@@ -1041,17 +1064,18 @@ async function reviewLoop(o: RunOptions, task: PlanTask, wt: G.Worktree): Promis
   if (verdict.verdict === 'PASS' || verdict.verdict === 'PASS_WITH_NOTES') {
     if (criticals.length > 0) {
       log(`  ✗ ${task.id}: verdict says pass but carries ${criticals.length} critical finding(s) — gate wins`)
-      return false
+      return 'repair'
     }
     for (const a of verdict.criteriaAssessment.filter((c) => !c.met)) {
       log(`  ! reviewer says criterion ${a.id} NOT met: ${a.evidence}`)
       store.addFinding({ arcId, taskId: task.id, attemptId: rvAttempt, kind: 'risk', severity: 'medium',
         text: `reviewer: criterion ${a.id} not met — ${a.evidence}` })
     }
-    return verdict.criteriaAssessment.every((c) => c.met !== false) || verdict.verdict === 'PASS'
+    return (verdict.criteriaAssessment.every((c) => c.met !== false) || verdict.verdict === 'PASS') ? 'pass' : 'repair'
   }
 
-  return false
+  // REJECT means "this approach is wrong" — a repair round cannot save it.
+  return verdict.verdict === 'CHANGES_REQUIRED' ? 'repair' : 'fail'
 }
 
 async function landTask(
