@@ -490,6 +490,13 @@ function elapsed(ms: number): string {
   return `${Math.floor(s / 60)}m ${String(s % 60).padStart(2, '0')}s`
 }
 
+/** A long path wraps the header into porridge; keep the ends, drop the middle. */
+function middleTruncate(text: string, max: number): string {
+  if (text.length <= max) return text
+  const keep = Math.max(4, Math.floor((max - 1) / 2))
+  return `${text.slice(0, keep)}…${text.slice(-keep)}`
+}
+
 function tilde(p: string): string {
   const h = homedir()
   return p.startsWith(h) ? `~${p.slice(h.length)}` : p
@@ -1336,7 +1343,7 @@ export function App({ store, config, danger, initialBrief, version = '0.2.0' }: 
         <Text color="gray">
           <Text color={theme.sol}>Sol</Text> writes · <Text color={theme.opus}>Opus</Text> reviews
         </Text>
-        <Text color="gray">{tilde(config.repo)}{branch ? ` · ${branch}` : ''}</Text>
+        <Text color="gray">{middleTruncate(tilde(config.repo), Math.max(20, width - 24))}{branch ? ` · ${branch}` : ''}</Text>
         <ThreadStatus title={thread?.title ?? threadId} lane={thread?.lane ?? 'chat'} stages={workflowStages} />
         {config.gates.length === 0
           ? <Text color="yellow">⚠ nothing here can check the work — no test or build script</Text>
