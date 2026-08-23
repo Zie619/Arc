@@ -353,11 +353,13 @@ describe('escape actually stops the work', () => {
     expect(r.terminalReason).toBe('cancelled')
 
     const { execSync } = await import('node:child_process')
-    // SIGKILL delivery is immediate; /proc visibility on a loaded CI runner
-    // is not. Give the reaper a bounded moment before calling it a survivor.
+    // The probe runs through `sh -c`, whose OWN command line contains the
+    // pattern — on Linux pgrep -f happily matched the probe's wrapper and
+    // reported the kill as failed forever. The character class breaks the
+    // self-match while still matching a real surviving sleep.
     let strays = ''
     for (let i = 0; i < 10; i++) {
-      strays = execSync('pgrep -f "sleep 287" || true', { encoding: 'utf8' }).trim()
+      strays = execSync('pgrep -f "sleep [2]87" || true', { encoding: 'utf8' }).trim()
       if (strays === '') break
       await new Promise((r) => setTimeout(r, 250))
     }
