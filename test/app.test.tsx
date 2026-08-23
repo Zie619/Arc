@@ -837,6 +837,29 @@ describe('trust modes and lane locks gate the direct lane', () => {
     } finally { app.unmount(); store.close() }
   }, 15_000)
 
+  it('refuses a direct change while another live session holds the checkout lock', async () => {
+    queueDir = withQueue([{ kind: 'work', lane: 'direct', reply: '', restated: 'focused' }])
+    // The vitest parent process is a real, live, foreign pid — exactly what
+    // another arc session looks like from here.
+    const lockFile = join(repo, '.git', 'arc-checkout.lock')
+    writeFileSync(lockFile, JSON.stringify({
+      pid: process.ppid, processStartHint: 0, hostname: 'elsewhere', acquiredAt: Date.now() - 5_000,
+    }))
+    const store = new Store(home)
+    const out = fakeStdout(110)
+    const app = render(<App store={store} config={directConfig()} danger initialBrief="fix it" />, {
+      stdout: out.stream, stdin: out.stdin, exitOnCtrlC: false, patchConsole: false,
+    })
+    try {
+      await until(() => out.scrollback().includes('Another session is editing this checkout'))
+      expect(out.scrollback()).toContain(`pid ${process.ppid}`)
+      // Refused BEFORE the lane started: no design row, no writer dispatch.
+      expect(store.latestDesignId()).toBeFalsy()
+      // The refusal must not steal the holder's lock on the way out.
+      expect(readFileSync(lockFile, 'utf8')).toContain('elsewhere')
+    } finally { app.unmount(); store.close(); rmSync(lockFile, { force: true }) }
+  }, 15_000)
+
   it('stops an ask-mode direct change for approval, then proceeds on yes', async () => {
     queueDir = withQueue([
       { kind: 'work', lane: 'direct', reply: '', restated: 'focused no-op' },
