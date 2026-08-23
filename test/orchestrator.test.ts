@@ -295,6 +295,24 @@ describe('the orchestrator, end to end', () => {
     store.close()
   }, 60_000)
 
+  it('a passing harness-executed proof outranks a modest claim', async () => {
+    // A sandboxed writer that cannot run the proof honestly claims
+    // 'unproven' — but the harness DID run it and it passed. The evidence
+    // decides, not the humility. (Observed live: a green 334-test proof
+    // discarded because the claim was 'unproven'.)
+    delete process.env.ARC_FAKE_PAYLOAD
+    process.env.ARC_FAKE_PAYLOAD = JSON.stringify({
+      status: 'done', noop: false,
+      shipped: [{ path: 'generated.ts', whatChanged: 'created' }],
+      criteria: [{ id: 'c1', claimedTier: 'unproven', evidence: 'my sandbox could not execute the proof' }],
+    })
+    const store = new Store(home)
+    await runArc({ store, plan: plan([task('modest')]), config: config(), log })
+    expect(store.allTasks('e2e')[0]!.state).toBe('landed')
+    expect(store.allCriteria('e2e').find((row: any) => row.id === 'c1')?.tier).toBe('checked')
+    store.close()
+  }, 60_000)
+
   it('proves an unclaimed command criterion by running it, instead of leaving it unproven', async () => {
     // The fixture claims only c1; c2 goes unclaimed — as a sandboxed writer
     // that cannot run the proof itself honestly does. Arc runs it anyway.

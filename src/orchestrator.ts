@@ -682,9 +682,15 @@ async function gradeCriteria(
       }
     }
 
-    const granted = o.store.promoteCriterion(arcId, task.id, claim.id, claim.claimedTier, claim.evidence, artifactId)
-    if (granted !== claim.claimedTier) {
-      o.log(`    criterion ${claim.id}: claimed ${claim.claimedTier}, granted ${granted} (evidence did not support the claim)`)
+    // The harness grades, never the agent — in EITHER direction. Reaching
+    // here with a command criterion means the harness EXECUTED the proof and
+    // it PASSED; a modest claim ("unproven — my sandbox couldn't run it")
+    // must not cap a grant the evidence itself earns. (Observed live: a
+    // green 334-test proof discarded because the writer claimed 'unproven'.)
+    const effectiveTier = crit.proofKind === 'command' && artifactId ? 'checked' : claim.claimedTier
+    const granted = o.store.promoteCriterion(arcId, task.id, claim.id, effectiveTier, claim.evidence, artifactId)
+    if (granted !== effectiveTier) {
+      o.log(`    criterion ${claim.id}: graded ${effectiveTier}, granted ${granted} (evidence did not support the claim)`)
     }
   }
 
