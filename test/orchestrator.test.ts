@@ -506,3 +506,69 @@ describe('the orchestrator, end to end', () => {
     store.close()
   }, 60_000)
 })
+
+describe('delivery leaves ZERO local residue', () => {
+  // A completed arc must not cost the operator gigabytes of worktrees and
+  // branches — the work lives in the PR (or main), or it is not delivered.
+  let bare: string
+  let ghDir: string
+
+  beforeEach(() => {
+    bare = mkdtempSync(join(tmpdir(), 'arcorch-bare-'))
+    sh(bare, 'init', '-q', '--bare', '-b', 'main')
+    sh(repo, 'remote', 'add', 'origin', bare)
+    ghDir = mkdtempSync(join(tmpdir(), 'arcorch-gh-'))
+    process.env.PATH = `${ghDir}:${process.env.PATH}`
+  })
+  afterEach(() => {
+    rmSync(bare, { recursive: true, force: true })
+    rmSync(ghDir, { recursive: true, force: true })
+  })
+  const fakeGh = (script: string) => {
+    writeFileSync(join(ghDir, 'gh'), `#!/bin/sh\n${script}\n`, { mode: 0o755 })
+  }
+
+  it('pr: pushes the branch, prints the PR URL, and removes every local arc ref', async () => {
+    fakeGh('echo https://example.test/pr/1')
+    const store = new Store(home)
+    await runArc({ store, plan: plan([task('shipit')]), config: config({ landStrategy: 'pr' }), log })
+
+    expect(logs.join('\n')).toContain('https://example.test/pr/1')
+    expect(logs.join('\n')).toContain('zero local residue')
+    // The remote holds the work; the local checkout holds NOTHING arc-shaped.
+    expect(sh(bare, 'for-each-ref', '--format=%(refname:short)', 'refs/heads/arc/')).toBe('arc/e2e-integration')
+    expect(sh(repo, 'for-each-ref', '--format=%(refname:short)', 'refs/heads/arc/')).toBe('')
+    expect(sh(repo, 'worktree', 'list').trim().split('\n')).toHaveLength(1)
+    store.close()
+  }, 60_000)
+
+  it('pr: when gh fails, the branch survives locally and the failure is loud', async () => {
+    fakeGh('echo "gh exploded" >&2; exit 1')
+    const store = new Store(home)
+    await runArc({ store, plan: plan([task('shipit')]), config: config({ landStrategy: 'pr' }), log })
+
+    expect(logs.join('\n')).toContain('gh pr create failed')
+    // No PR exists, so deleting the local branch would orphan the work.
+    expect(sh(repo, 'for-each-ref', '--format=%(refname:short)', 'refs/heads/arc/')).toBe('arc/e2e-integration')
+    store.close()
+  }, 60_000)
+
+  it('push: after landing on main and pushing, the integration branch is gone', async () => {
+    const store = new Store(home)
+    await runArc({ store, plan: plan([task('shipit')]), config: config({ landStrategy: 'push' }), log })
+
+    expect(logs.join('\n')).toContain('zero local residue')
+    expect(sh(repo, 'for-each-ref', '--format=%(refname:short)', 'refs/heads/arc/')).toBe('')
+    expect(sh(bare, 'rev-parse', 'main')).toBe(sh(repo, 'rev-parse', 'main'))
+    store.close()
+  }, 60_000)
+
+  it('builds the GitHub compare URL as the fallback when gh cannot open the PR', () => {
+    sh(repo, 'remote', 'set-url', 'origin', 'git@github.com:Zie619/Arc.git')
+    expect(G.compareUrl(repo, 'arc/x-integration', 'main'))
+      .toBe('https://github.com/Zie619/Arc/compare/main...arc/x-integration?expand=1')
+    sh(repo, 'remote', 'set-url', 'origin', 'https://github.com/Zie619/Arc.git')
+    expect(G.compareUrl(repo, 'arc/x-integration', 'main'))
+      .toBe('https://github.com/Zie619/Arc/compare/main...arc/x-integration?expand=1')
+  })
+})

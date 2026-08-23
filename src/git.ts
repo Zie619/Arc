@@ -156,7 +156,7 @@ export function openPullRequest(
   }
   try {
     const url = execFileSync('gh',
-      ['pr', 'create', '--repo-root', repo, '--base', base, '--head', branch, '--title', title, '--body', body],
+      ['pr', 'create', '--base', base, '--head', branch, '--title', title, '--body', body],
       { cwd: repo, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim()
     return { ok: true, url, message: '' }
   } catch (e) {
@@ -167,8 +167,18 @@ export function openPullRequest(
       const existing = detail.match(/https:\/\/\S+/)?.[0] ?? ''
       return { ok: true, url: existing, message: 'PR already existed' }
     }
-    return { ok: false, url: '', message: `gh pr create failed: ${detail.slice(0, 300)}` }
+    // The branch IS pushed — hand the operator the one-click URL gh could not.
+    return { ok: false, url: compareUrl(repo, branch, base), message: `gh pr create failed: ${detail.slice(0, 300)}` }
   }
+}
+
+/** GitHub compare URL for origin, or '' when origin is not a GitHub remote. */
+export function compareUrl(repo: string, branch: string, base: string): string {
+  let origin = ''
+  try { origin = git(repo, 'remote', 'get-url', 'origin') } catch { return '' }
+  const m = origin.match(/github\.com[:/]([^/]+)\/(.+?)(?:\.git)?$/)
+  if (!m) return ''
+  return `https://github.com/${m[1]}/${m[2]}/compare/${base}...${branch}?expand=1`
 }
 
 /** Files the task ACTUALLY touched. Compared against the declared footprint;

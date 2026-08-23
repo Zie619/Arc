@@ -271,8 +271,17 @@ async function finalize(
     log(`opening a pull request: ${integrationBranch} → ${config.mainBranch}`)
     const r = G.openPullRequest(config.repo, integrationBranch, config.mainBranch, title, body)
     store.appendEvent(plan.arcId, 'pr', r)
-    if (r.ok) log(`  ✓ ${r.url || '(created)'}${r.message ? ` — ${r.message}` : ''}`)
-    else log(`  ✗ ${r.message}\n  Work is safe on "${integrationBranch}" — open the PR by hand.`)
+    if (r.ok) {
+      log(`  ✓ ${r.url || '(created)'}${r.message ? ` — ${r.message}` : ''}`)
+      // The PR holds the work now; a lingering local copy is the residue that
+      // piles up gigabytes across arcs. Remove it — loudly if we cannot.
+      if (G.gitOk(config.repo, 'branch', '-D', integrationBranch)) log(`  ✓ local "${integrationBranch}" removed — zero local residue`)
+      else log(`  local "${integrationBranch}" could not be removed (checked out?) — delete it yourself`)
+    } else if (r.url) {
+      log(`  ✗ ${r.message}\n  The branch IS pushed — open the PR yourself: ${r.url}`)
+    } else {
+      log(`  ✗ ${r.message}\n  Work is safe on "${integrationBranch}" — open the PR by hand.`)
+    }
     return
   }
 
@@ -286,6 +295,8 @@ async function finalize(
   try {
     G.git(config.repo, 'push', 'origin', config.mainBranch)
     log(`  ✓ ${config.mainBranch} ${lr.before.slice(0, 8)} → ${lr.after.slice(0, 8)}`)
+    // Merged and pushed: the integration branch is fully contained in main.
+    if (G.gitOk(config.repo, 'branch', '-d', integrationBranch)) log(`  ✓ local "${integrationBranch}" removed — zero local residue`)
   } catch (e) {
     log(`  ✗ push rejected: ${(e as Error).message.slice(0, 200)}`)
     log(`  The merge is local only. If "${config.mainBranch}" is protected, set landStrategy: pr.`)
