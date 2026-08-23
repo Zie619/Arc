@@ -1209,9 +1209,20 @@ export function App({ store, config, danger, initialBrief, version = '0.2.0' }: 
         })
         closeSteps()
         const arc = store.getArc(id)
-        say('arc', arc?.status === 'done'
-          ? `Work completed with the required evidence. Delivery was attempted using the configured ${runtimeConfig.landStrategy} strategy; see the run output for the exact branch or pull request result.`
-          : `Stopped short — not everything could be proved. Work may remain on an integration branch, but no completed delivery was claimed. Run \`arc criteria\` to see what is missing.`)
+        if (arc?.status === 'done') {
+          // The pr/push event holds what ACTUALLY happened — the operator
+          // should never have to dig in the run output for their own URL.
+          const delivered = store.eventsSince(id, 0).filter((ev) => ev.kind === 'pr' || ev.kind === 'push').at(-1)
+          const d = delivered?.payload as { ok?: boolean; url?: string; message?: string } | undefined
+          const outcome =
+            !d ? `The work stayed local (landStrategy: ${runtimeConfig.landStrategy}).` :
+            d.ok ? (delivered!.kind === 'pr' ? `Pull request: ${d.url || 'created'}` : `Pushed to ${runtimeConfig.mainBranch}.`) :
+            d.url ? `The branch is pushed, but the PR could not be opened (${d.message}). Open it yourself: ${d.url}` :
+            `Delivery failed: ${d.message}`
+          say('arc', `Work completed with the required evidence. ${outcome}`)
+        } else {
+          say('arc', `Stopped short — not everything could be proved. Work may remain on an integration branch, but no completed delivery was claimed. Run \`arc criteria\` to see what is missing.`)
+        }
       } catch (e) {
         closeSteps()
         if (e instanceof Cancelled || ctrl.signal.aborted) say('arc', 'Stopped. Agents were cancelled. Worktree or branch commits may remain; no completed delivery was claimed.')
