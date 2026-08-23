@@ -217,6 +217,68 @@ describe('scouts verify premises against real code', () => {
     store.close()
   }, 60_000)
 
+  it('a CORRECTED premise never stops the plan — the true fact flows to the planner', async () => {
+    // A real operator lost hours to premise-stops over "21 screens vs 22
+    // labels". A detail being off is a correction the plan absorbs, not a
+    // reason to interrupt anyone.
+    enqueue(EXTRACT); enqueue(CHARTER)
+    const store = new Store(home)
+    await runInterview({ store, config: config(), arcId: 'a1', log }, briefPath, async () => '')
+
+    enqueue({ scouts: [{ id: 's1', area: 'memory layer', brief: 'look', engine: 'codex' }] })
+    enqueue({
+      area: 'memory layer', findings: [], filesToTouch: [], contractsMutated: [], contractsRead: [],
+      risks: [], proposedWork: [],
+      premiseVerdicts: [{
+        id: 'p1', verdict: 'corrected', evidence: 'lib/ has 22 collections, not 21',
+        correctedStatement: 'there are 22 collections',
+      }],
+    })
+    expect(await runScouts({ store, config: config(), arcId: 'a1', log })).toBe(true)
+    expect(store.refutedPremises('a1')).toHaveLength(0)
+
+    enqueue({ tasks: [{
+      id: 't1', title: 'add a writer', spec: 'write rows',
+      dependsOn: [], footprint: ['lib/memory layer.ts'], contractsMutated: [], contractsRead: [],
+      gates: ['cheap'],
+      acceptance: [{ id: 'c1', text: 'rows appear', proofKind: 'command', proofCommand: 'true', requiredTier: 'checked' }],
+    }] })
+    expect(await runPlanner({ store, config: config(), arcId: 'a1', log })).not.toBeNull()
+    const planPrompt = prompts('# PLAN')[0]!
+    expect(planPrompt).toContain('Corrections to the brief')
+    expect(planPrompt).toContain('there are 22 collections')
+    expect(planPrompt).toContain('do not flag the discrepancy again')
+    store.close()
+  }, 60_000)
+
+  it('never premise-stops twice — the second round becomes corrections and planning continues', async () => {
+    enqueue(EXTRACT); enqueue(CHARTER)
+    const store = new Store(home)
+    await runInterview({ store, config: config(), arcId: 'a1', log }, briefPath, async () => '')
+
+    // Round one: a genuine stop. This is the check doing its job.
+    enqueue({ scouts: [{ id: 's1', area: 'memory layer', brief: 'look', engine: 'codex' }] })
+    enqueue({
+      area: 'memory layer', findings: [], filesToTouch: [], contractsMutated: [], contractsRead: [],
+      risks: [], proposedWork: [],
+      premiseVerdicts: [{ id: 'p1', verdict: 'refuted', evidence: 'lib/memory layer.ts:41 writes on every run' }],
+    })
+    expect(await runScouts({ store, config: config(), arcId: 'a1', log })).toBe(false)
+
+    // Round two, after the operator reconsidered: the scout does NOT get to
+    // stop the same design again. Contested premises carry as corrections.
+    enqueue({ scouts: [{ id: 's1', area: 'memory layer', brief: 'look again', engine: 'codex' }] })
+    enqueue({
+      area: 'memory layer', findings: [], filesToTouch: [], contractsMutated: [], contractsRead: [],
+      risks: [], proposedWork: [], premiseVerdicts: [],
+    })
+    expect(await runScouts({ store, config: config(), arcId: 'a1', log })).toBe(true)
+    expect(logs.join('\n')).toContain('already reconsidered the brief once')
+    expect(store.refutedPremises('a1')).toHaveLength(0)
+    expect(store.premises('a1').find((p) => p.id === 'p1')?.status).toBe('corrected')
+    store.close()
+  }, 60_000)
+
   it('asks scouts to verify only assumed and unclear premises', async () => {
     enqueue(EXTRACT); enqueue(CHARTER)
     const store = new Store(home)

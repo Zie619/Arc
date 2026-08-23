@@ -1037,7 +1037,10 @@ describe('trust modes and lane locks gate the direct lane', () => {
     } finally { app.unmount(); store.close() }
   }, 40_000)
 
-  it('stops after a second scout failure without a third interview or scout round', async () => {
+  it('a second scout refutation becomes a correction — no third round, no second stop', async () => {
+    // The reopen already made the operator's case once. A real operator lost
+    // hours to repeated premise-stops, so round two proceeds on the corrected
+    // facts instead of stopping again.
     queueDir = withQueue([
       { kind: 'work', lane: 'research', reply: '', restated: 'study the importer' },
       {
@@ -1060,6 +1063,11 @@ describe('trust modes and lane locks gate the direct lane', () => {
         area: 'reads', findings: [], filesToTouch: [], contractsMutated: [], contractsRead: [], risks: [], proposedWork: [],
         premiseVerdicts: [{ id: 'p-two', verdict: 'refuted', evidence: 'src/importer.ts:72 reads reviews' }],
       },
+      {
+        answer: 'The importer both stores and reads reviews.',
+        keyFindings: [{ file: 'src/importer.ts', line: 72, what: 'reads reviews', why: 'contradicts the brief' }],
+        contradictions: [], missingFromPrompt: 'nothing',
+      },
     ])
     const store = new Store(home)
     const out = fakeStdout(110)
@@ -1067,11 +1075,12 @@ describe('trust modes and lane locks gate the direct lane', () => {
       stdout: out.stream, stdin: out.stdin, exitOnCtrlC: false, patchConsole: false,
     })
     try {
-      await until(() => out.scrollback().includes('I stopped after reading the code'))
-      expect(out.scrollback()).toContain('Correct the assumption (or drop it from the request) and send it again.')
-      expect(out.scrollback()).toContain('stored rows are never read')
+      await until(() => out.scrollback().includes('The importer both stores and reads reviews.'))
+      // Bounded: exactly two interview and two scout rounds, never a third.
       expect(prompts('# INTERVIEW')).toHaveLength(2)
       expect(prompts('# ASSIGN THE SCOUTS')).toHaveLength(2)
+      // And never a second stop.
+      expect(out.scrollback()).not.toContain('I stopped after reading the code')
     } finally { app.unmount(); store.close() }
   }, 40_000)
 

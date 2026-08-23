@@ -145,7 +145,7 @@ ${C.bold('When something needs a closer look:')}
   arc clean                         reset so it can run again
   arc show <artifactId>             the exact prompt or transcript of one step
 
-${C.bold('If you want the steps separately:')}
+${C.bold('Plumbing — arc "..." already runs all of these for you:')}
 
   arc interview <brief.md> --id X   arc scout --id X    arc plan --id X
   arc validate <plan.yaml>          arc run <plan.yaml> arc watch

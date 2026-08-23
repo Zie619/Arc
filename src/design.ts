@@ -467,14 +467,24 @@ export async function runScouts(o: DesignOptions): Promise<boolean> {
       ``, `## What to find out`, s.brief,
       ``,
       `## Also: verify these premises against the actual code`,
-      `The brief assumed these. Say confirmed / refuted / unclear for each, with`,
-      `evidence. Being WRONG here is expensive — a refuted premise stops the`,
-      `whole plan, which is exactly what it is for. Do not confirm something you`,
-      `did not actually look at.`,
-      `REFUTED requires positive evidence the claim is FALSE. If your sandbox`,
-      `blocks the command that would verify it (permission denied, tool`,
-      `unavailable), that is UNCLEAR, with the blockage as evidence — an`,
-      `unrunnable check proves nothing about the claim either way.`,
+      `The brief assumed these. For each, answer with evidence:`,
+      `- confirmed: you looked, and it is true. Never confirm what you did not check.`,
+      `- corrected: the substance holds but a detail is off — a count, a name, a`,
+      `  path, a version. Put the TRUE fact in correctedStatement. Planning`,
+      `  proceeds on your correction; the operator is not interrupted.`,
+      `- refuted: the premise is positively FALSE in a way that changes WHAT`,
+      `  SHOULD BE BUILT — the thing already exists, the API it depends on is`,
+      `  not there, the goal is moot. Refuting stops the whole plan and sends`,
+      `  the operator back to the interview. That interruption costs them real`,
+      `  time, so an off-by-one or a naming drift is ALWAYS a correction, never`,
+      `  a refutation.`,
+      `- unclear: you could not verify it. If your sandbox blocks the command`,
+      `  that would check it (permission denied, tool unavailable), that is`,
+      `  UNCLEAR with the blockage as evidence — an unrunnable check proves`,
+      `  nothing about the claim either way.`,
+      `The brief may describe things that do not exist YET. The absence of`,
+      `something the brief intends to CREATE confirms the need for the work —`,
+      `it never refutes the premise.`,
       premiseList || '  (none)',
       ``,
       `## Report`,
@@ -504,7 +514,9 @@ export async function runScouts(o: DesignOptions): Promise<boolean> {
       const current = store.premises(arcId).find((p) => p.id === v.id)
       if (!current) continue
       if (current.status === 'refuted') continue
-      store.setPremise(arcId, v.id, v.verdict, v.evidence)
+      const evidence = v.verdict === 'corrected' && v.correctedStatement
+        ? `${v.evidence} — corrected: ${v.correctedStatement}` : v.evidence
+      store.setPremise(arcId, v.id, v.verdict, evidence)
     }
     for (const f of rep.findings) {
       store.addFinding({
@@ -517,18 +529,34 @@ export async function runScouts(o: DesignOptions): Promise<boolean> {
   const refuted = store.refutedPremises(arcId)
   log('')
   for (const p of store.premises(arcId)) {
-    const mark = p.status === 'confirmed' ? '✓' : p.status === 'refuted' ? '✗' : '?'
+    const mark = p.status === 'confirmed' ? '✓' : p.status === 'refuted' ? '✗' : p.status === 'corrected' ? '±' : '?'
     log(`  ${mark} ${p.id}: ${String(p.statement).slice(0, 80)}`)
     if (p.evidence) log(`      ${String(p.evidence).replace(/\s+/g, ' ').slice(0, 110)}`)
   }
 
   if (refuted.length > 0) {
-    log('')
-    log(`✗ ${refuted.length} PREMISE(S) REFUTED — the brief rests on something untrue.`)
-    log(`  Planning stops here. Re-run \`arc interview\` with this in hand:`)
-    for (const p of refuted) log(`    ${p.id}: ${p.statement}\n      evidence: ${p.evidence}`)
-    store.setCharter(arcId, charter, 'premises-refuted')
-    return false
+    // ONE stop, ever. The first refutation sends the operator back to the
+    // interview — that is the check working. A second round of refutations on
+    // the reconsidered brief is the scout arguing with wording, and a real
+    // operator lost hours to five such rounds before this cap existed.
+    const stoppedBefore = store.eventsSince(arcId, 0).some((e) => e.kind === 'design.premise-stop')
+    if (stoppedBefore) {
+      log('')
+      log(`! ${refuted.length} premise(s) still contested — but you already reconsidered the brief once.`)
+      log(`  Carrying them as corrections and continuing; the plan gets the evidence, not another stop:`)
+      for (const p of refuted) {
+        log(`    ± ${p.id}: ${p.statement}\n      evidence: ${p.evidence}`)
+        store.setPremise(arcId, String(p.id), 'corrected', String(p.evidence ?? ''))
+      }
+    } else {
+      log('')
+      log(`✗ ${refuted.length} PREMISE(S) REFUTED — the brief rests on something untrue.`)
+      log(`  Planning stops here. Re-run \`arc interview\` with this in hand:`)
+      for (const p of refuted) log(`    ${p.id}: ${p.statement}\n      evidence: ${p.evidence}`)
+      store.appendEvent(arcId, 'design.premise-stop', { premises: refuted.map((p) => String(p.id)) })
+      store.setCharter(arcId, charter, 'premises-refuted')
+      return false
+    }
   }
 
   store.setCharter(arcId, charter, 'planning')
@@ -574,7 +602,8 @@ export async function runResearchSynthesis(o: DesignOptions): Promise<ResearchSy
       ``, `### ${report.area}`,
       ...report.findings.map((f) => `- ${f.file}:${f.line} — ${f.what} (${f.why})`),
       ...report.risks.map((risk) => `  ! risk: ${risk}`),
-      ...report.premiseVerdicts.map((v) => `  premise ${v.id}: ${v.verdict} — ${v.evidence}`),
+      ...report.premiseVerdicts.map((v) =>
+        `  premise ${v.id}: ${v.verdict}${v.correctedStatement ? ` → ${v.correctedStatement}` : ''} — ${v.evidence}`),
     ]),
   ].join('\n')
 
@@ -672,6 +701,14 @@ export async function runPlanner(o: DesignOptions): Promise<Plan | null> {
     ...charter.constraints.map((c) => `- [${c.hardness}] ${c.text}`),
     ``, `## Decisions already settled with the user — honour these, do not reopen`,
     ...decisions.map((d) => `- ${d.question} → ${d.chosen}`),
+    ...(() => {
+      const corrected = store.premises(arcId).filter((p) => p.status === 'corrected')
+      return corrected.length === 0 ? [] : [
+        ``, `## Corrections to the brief — verified against the code. Plan on THESE facts,`,
+        `## and do not flag the discrepancy again.`,
+        ...corrected.map((p) => `- the brief said: ${p.statement}\n  the code says: ${p.evidence}`),
+      ]
+    })(),
     ``, `## What the scouts actually found in the code`,
     ...reports.flatMap((r) => [
       ``, `### ${r.area}`,

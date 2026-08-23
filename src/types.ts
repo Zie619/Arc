@@ -274,8 +274,11 @@ export const ScoutReport = z.object({
   risks: z.array(z.string()).default([]),
   premiseVerdicts: z.array(z.object({
     id: z.string(),
-    verdict: z.enum(['confirmed', 'refuted', 'unclear']),
+    /** 'corrected': the substance holds but a detail is off — the plan
+     *  proceeds on the corrected fact instead of stopping the operator. */
+    verdict: z.enum(['confirmed', 'corrected', 'refuted', 'unclear']),
     evidence: z.string().describe('file:line, or the command you ran'),
+    correctedStatement: z.string().nullish().describe('the true fact, when verdict is corrected'),
   })).default([]),
   /** Work the scout believes is needed. Input to the planner, not a plan. */
   proposedWork: z.array(z.object({

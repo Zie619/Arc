@@ -748,7 +748,7 @@ export class Store {
       .run(id, arcId, statement, howToVerify)
   }
 
-  setPremise(arcId: string, id: string, status: 'confirmed' | 'refuted' | 'unclear' | 'superseded', evidence: string): void {
+  setPremise(arcId: string, id: string, status: 'confirmed' | 'corrected' | 'refuted' | 'unclear' | 'superseded', evidence: string): void {
     this.db
       .prepare(`UPDATE premise SET status = ?, evidence = ?, checked_at = ? WHERE arc_id = ? AND id = ?`)
       .run(status, evidence, Date.now(), arcId, id)

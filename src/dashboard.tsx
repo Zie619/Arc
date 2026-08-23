@@ -76,10 +76,27 @@ export function Dashboard({ store, width, interactive, compact = false }: { stor
   }, { isActive: interactive })
 
   if (!arc) {
+    // An empty build table does NOT mean nothing is happening — the design
+    // phase (interview, scouts, planning) runs before any arc row exists, and
+    // a real operator watched "no arcs yet" for hours while it worked.
+    const designId = store.latestDesignId()
+    const design = designId ? store.getDesign(designId) : undefined
+    const live = designId ? store.liveAttempts(designId) : []
+    const worker = live[live.length - 1]
+    const mins = worker ? Math.max(0, Math.round((Date.now() - Number(worker.started_at)) / 60_000)) : 0
     return (
       <Box flexDirection="column" padding={1}>
         <Text bold>arc</Text>
-        <Text color="gray">No arcs in this store yet. Run one with: node src/cli.ts run plan.yaml</Text>
+        {design ? (
+          <>
+            <Text color="magenta">Designing ({design.status})
+              {worker ? ` — ${worker.role} agent (${worker.model}) working, ${mins}m` : ''}</Text>
+            <Text color="gray">Interview, scouting, and planning happen before any build task exists.</Text>
+            <Text color="gray">This table fills in the moment the build starts.</Text>
+          </>
+        ) : (
+          <Text color="gray">Nothing here yet. Start with: arc "what you want done"</Text>
+        )}
         <Text color="gray">q to quit</Text>
       </Box>
     )
