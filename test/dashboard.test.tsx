@@ -41,6 +41,35 @@ describe('the dashboard picks the arc that matters', () => {
     app.unmount(); store.close()
   })
 
+  it('enter opens the selected task: attempts, transcript tail, and a way back', async () => {
+    const store = new Store(home)
+    store.createArc(plan('alive'), '/r', 'a'.repeat(40), 'arc/alive-integration')
+    const attemptId = store.startAttempt({
+      arcId: 'alive', taskId: 't1', attemptNo: 1, role: 'implement', cli: 'codex', requestedModel: 'gpt-5.6-sol',
+    })
+    const transcriptId = store.putArtifact('alive', 'transcript',
+      'line one\nthe agent wrote migrations\nfinal line of the session', attemptId)
+    store.finishAttempt('alive', attemptId, {
+      terminalReason: 'ok', exitCode: 0, observedModel: 'gpt-5.6-sol', transcriptArtifactId: transcriptId,
+    })
+
+    const out = fakeTerminal(140)
+    const app = render(<Dashboard store={store} width={140} interactive />, {
+      stdout: out.stream, stdin: out.stdin, exitOnCtrlC: false, patchConsole: false,
+    })
+    await tick()
+    out.send('\r')   // enter: open the selected task
+    await tick()
+    expect(out.text()).toContain('esc to go back')
+    expect(out.text()).toContain('implement')
+    expect(out.text()).toContain('final line of the session')
+    expect(out.text()).toContain(`arc show ${transcriptId}`)
+    out.send('')   // esc: back to the list
+    await tick()
+    expect(out.text()).toContain('enter open')
+    app.unmount(); store.close()
+  })
+
   it('labels a dead arc as the kept evidence record, with when it ended', async () => {
     const store = new Store(home)
     store.createArc(plan('corpse'), '/r', 'a'.repeat(40), 'arc/corpse-integration')

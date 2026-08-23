@@ -1,5 +1,6 @@
 import React, { useState, useEffect } from 'react'
 import { Box, Text, useInput, useApp } from 'ink'
+import { openSync, fstatSync, readSync, closeSync } from 'node:fs'
 import { Store } from './store.ts'
 import { TIER_RANK, type ClaimTier } from './types.ts'
 
@@ -48,6 +49,83 @@ function Rule({ label, width }: { label?: string; width: number }) {
 
 type Pane = 'events' | 'findings' | 'criteria'
 
+/** Last `bytes` of a file, whole lines only — a transcript can be megabytes
+ *  and this rerenders every poll tick. */
+function tailFile(path: string, bytes = 8192, lines = 14): string[] {
+  try {
+    const fd = openSync(path, 'r')
+    try {
+      const size = fstatSync(fd).size
+      const want = Math.min(bytes, size)
+      const buf = Buffer.alloc(want)
+      readSync(fd, buf, 0, want, size - want)
+      const all = buf.toString('utf8').split('\n')
+      return all.slice(Math.max(0, all.length - lines))
+    } finally { closeSync(fd) }
+  } catch { return [] }
+}
+
+/** Everything about ONE task: attempts, transcript tail, findings, criteria.
+ *  The answer to "how do I open the session and see what is happening?" */
+function TaskDetail({ store, arcId, task, width }: { store: Store; arcId: string; task: Record<string, any>; width: number }) {
+  const taskId = String(task.id)
+  const attempts = store.attemptsFor(arcId, taskId)
+  const findings = store.findingsFor(arcId).filter((f) => f.task_id === taskId).slice(-6)
+  const events = store.eventsSince(arcId, 0).filter((e) => e.taskId === taskId).slice(-6)
+  const latest = attempts[attempts.length - 1]
+  const transcriptPath = latest?.transcript_artifact_id
+    ? store.artifactPath(String(latest.transcript_artifact_id)) : undefined
+  const tail = transcriptPath ? tailFile(transcriptPath) : []
+  const cut = (s: string, pad = 4) => s.replace(/\s+/g, ' ').slice(0, Math.max(10, width - pad))
+  return (
+    <Box flexDirection="column" paddingX={1}>
+      <Text bold>{cut(String(task.title))}</Text>
+      <Text> </Text>
+      <Text color="gray">attempts</Text>
+      {attempts.length === 0 && <Text color="gray">  none yet — the task has not been dispatched</Text>}
+      {attempts.map((a) => (
+        <Box key={String(a.id)}>
+          <Text color={a.ended_at ? 'gray' : 'yellow'}>{a.ended_at ? '  ' : '▶ '}</Text>
+          <Text>#{String(a.attempt_no)} </Text>
+          <Text color="magenta">{String(a.role).padEnd(10)}</Text>
+          <Text color="gray">{String(a.cli)}/{String(a.requested_model)}  </Text>
+          {a.ended_at
+            ? <Text color={a.terminal_reason === 'ok' ? 'green' : 'red'}>{String(a.terminal_reason)} · took {Math.max(1, Math.round((Number(a.ended_at) - Number(a.started_at)) / 1000))}s</Text>
+            : <Text color="yellow">running {ago(Number(a.started_at))}</Text>}
+        </Box>
+      ))}
+      {latest && !latest.ended_at && (
+        <Text color="gray">  the transcript lands here the moment this attempt ends</Text>
+      )}
+      {tail.length > 0 && (
+        <>
+          <Text> </Text>
+          <Text color="gray">transcript of attempt #{String(latest!.attempt_no)} (last lines) — full: arc show {String(latest!.transcript_artifact_id)}</Text>
+          {tail.map((line, i) => <Text key={i} color="white">  {cut(line)}</Text>)}
+        </>
+      )}
+      {findings.length > 0 && (
+        <>
+          <Text> </Text>
+          <Text color="gray">findings</Text>
+          {findings.map((f) => (
+            <Text key={String(f.id)} color={f.severity === 'high' ? 'red' : 'yellow'}>  {cut(`[${f.kind}] ${f.text}`)}</Text>
+          ))}
+        </>
+      )}
+      {events.length > 0 && (
+        <>
+          <Text> </Text>
+          <Text color="gray">recent events</Text>
+          {events.map((e) => (
+            <Text key={e.seq} color="gray">  {new Date(e.at).toTimeString().slice(0, 8)} {cut(`${e.kind} ${e.payload ? JSON.stringify(e.payload) : ''}`, 14)}</Text>
+          ))}
+        </>
+      )}
+    </Box>
+  )
+}
+
 export function Dashboard({ store, width, interactive, compact = false }: { store: Store; width: number; interactive: boolean; compact?: boolean }) {
   const { exit } = useApp()
   const [tick, setTick] = useState(0)
@@ -59,6 +137,7 @@ export function Dashboard({ store, width, interactive, compact = false }: { stor
     return idx >= 0 ? idx : 0
   })
   const [taskIdx, setTaskIdx] = useState(0)
+  const [opened, setOpened] = useState(false)
   const [pane, setPane] = useState<Pane>('events')
 
   useEffect(() => {
@@ -74,10 +153,12 @@ export function Dashboard({ store, width, interactive, compact = false }: { stor
   // the dashboard degrades to a one-frame snapshot instead of crashing.
   useInput((input, key) => {
     if (input === 'q' || (key.ctrl && input === 'c')) { exit(); return }
+    if (key.return) { setOpened((o) => !o); return }
+    if (key.escape) { setOpened(false); return }
     if (key.upArrow || input === 'k') setTaskIdx((i) => Math.max(0, i - 1))
     if (key.downArrow || input === 'j') setTaskIdx((i) => i + 1)
-    if (key.leftArrow || input === '[') { setArcIdx((i) => Math.max(0, i - 1)); setTaskIdx(0) }
-    if (key.rightArrow || input === ']') { setArcIdx((i) => Math.min(arcs.length - 1, i + 1)); setTaskIdx(0) }
+    if (key.leftArrow || input === '[') { setArcIdx((i) => Math.max(0, i - 1)); setTaskIdx(0); setOpened(false) }
+    if (key.rightArrow || input === ']') { setArcIdx((i) => Math.min(arcs.length - 1, i + 1)); setTaskIdx(0); setOpened(false) }
     if (key.tab) setPane((p) => (p === 'events' ? 'findings' : p === 'findings' ? 'criteria' : 'events'))
   }, { isActive: interactive })
 
@@ -166,6 +247,21 @@ export function Dashboard({ store, width, interactive, compact = false }: { stor
         ))}
       </Box>
 
+      {opened && sel ? (
+        <>
+          <Rule label={`task ${String(sel.id)} — esc to go back`} width={width} />
+          <TaskDetail store={store} arcId={arcId} task={sel} width={width} />
+          <Rule label={`criteria`} width={width} />
+          <Box flexDirection="column" paddingX={1}>
+            <Criteria store={store} arcId={arcId} taskId={String(sel.id)} width={width} />
+          </Box>
+          <Rule width={width} />
+          <Box paddingX={1}>
+            <Text color="gray">↑↓ other task · esc back · q quit</Text>
+          </Box>
+        </>
+      ) : (
+      <>
       <Rule label="tasks" width={width} />
 
       {/* ── task list ────────────────────────────────────────────────── */}
@@ -198,10 +294,12 @@ export function Dashboard({ store, width, interactive, compact = false }: { stor
       <Rule width={width} />
       <Box paddingX={1}>
         <Text color="gray">
-          {interactive ? '↑↓ task · ←→ arc · tab pane · q quit' : 'snapshot (no tty — run in a terminal for live view)'}
+          {interactive ? '↑↓ task · enter open · ←→ arc · tab pane · q quit' : 'snapshot (no tty — run in a terminal for live view)'}
         </Text>
         <Text color="gray">{'   '}{interactive ? `refreshed ${tick % 2 === 0 ? '·' : ' '}` : ''}</Text>
       </Box>
+      </>
+      )}
     </Box>
   )
 }
