@@ -353,7 +353,14 @@ describe('escape actually stops the work', () => {
     expect(r.terminalReason).toBe('cancelled')
 
     const { execSync } = await import('node:child_process')
-    const strays = execSync('pgrep -f "sleep 287" || true', { encoding: 'utf8' }).trim()
+    // SIGKILL delivery is immediate; /proc visibility on a loaded CI runner
+    // is not. Give the reaper a bounded moment before calling it a survivor.
+    let strays = ''
+    for (let i = 0; i < 10; i++) {
+      strays = execSync('pgrep -f "sleep 287" || true', { encoding: 'utf8' }).trim()
+      if (strays === '') break
+      await new Promise((r) => setTimeout(r, 250))
+    }
     expect(strays, 'a sleep survived the kill').toBe('')
     delete process.env.ARC_FAKE_HANG
   }, 20_000)

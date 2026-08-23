@@ -22,7 +22,12 @@ beforeEach(() => {
   realHome = process.env.HOME
   home = mkdtempSync(join(tmpdir(), 'tsetup-'))
   process.env.HOME = home
-  const userDir = join(home, 'Library', 'Application Support', 'Code', 'User')
+  // The production path is platform-aware; asserting the macOS layout on
+  // Linux was the first thing public CI caught.
+  const base = process.platform === 'darwin'
+    ? join(home, 'Library', 'Application Support')
+    : join(home, '.config')
+  const userDir = join(base, 'Code', 'User')
   mkdirSync(userDir, { recursive: true })
   kb = join(userDir, 'keybindings.json')
 })
