@@ -73,6 +73,45 @@ describe('the compose screen', () => {
     app.unmount(); store.close()
   })
 
+  it('header shows the arc logo and version', async () => {
+    const store = new Store(home)
+    const out = fakeTerminal(80)
+    const app = render(
+      <App store={store} config={detectProject(repo).config} danger={false} version="9.8.7" />,
+      { stdout: out.stream, exitOnCtrlC: false, patchConsole: false },
+    )
+    await tick()
+    expect(out.text()).toContain('▐▌     ▐▌')
+    expect(out.text()).toContain('9.8.7')
+    app.unmount(); store.close()
+  })
+
+  it('empty state pins the prompt to the bottom', async () => {
+    const store = new Store(home)
+    const config = detectProject(repo).config
+    const out = fakeTerminal(80, 24)
+    const app = render(
+      <App store={store} config={config} danger={false} />,
+      { stdout: out.stream, exitOnCtrlC: false, patchConsole: false },
+    )
+    await tick()
+    const promptLine = out.text().split('\n').findIndex((line) => line.includes('what do you want done?'))
+    expect(promptLine).toBeGreaterThan(12)
+    app.unmount()
+
+    const fallback = fakeTerminal(80)
+    fallback.stream.rows = undefined as unknown as number
+    const fallbackApp = render(
+      <App store={store} config={config} danger={false} />,
+      { stdout: fallback.stream, exitOnCtrlC: false, patchConsole: false },
+    )
+    await tick()
+    const fallbackPromptLine = fallback.text().split('\n').findIndex((line) => line.includes('what do you want done?'))
+    expect(fallbackPromptLine).toBeGreaterThanOrEqual(0)
+    expect(fallbackPromptLine).toBeLessThanOrEqual(10)
+    fallbackApp.unmount(); store.close()
+  })
+
   it('warns when nothing can verify the work', async () => {
     writeFileSync(join(repo, 'package.json'), JSON.stringify({ name: 'x', scripts: {} }))
     const store = new Store(home)

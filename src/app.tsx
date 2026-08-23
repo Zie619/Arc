@@ -17,6 +17,8 @@ import { theme, agentColor, agentName } from './theme.ts'
 import { mode as getMode, nextMode, prevMode, type ModeName } from './modes.ts'
 import { codexLimitsSnapshot } from './limits.ts'
 import { describeEvent } from './activity.ts'
+import { git } from './git.ts'
+import { ArcLogo } from './logo.tsx'
 import {
   loadSettings, setMode as persistMode, setRole, clearRole, applySettings,
   describeRole, TUNABLE_ROLES, KNOWN_MODELS, EFFORT_LEVELS, type Settings,
@@ -775,6 +777,14 @@ export function App({ store, config, danger, initialBrief, version = '0.2.0' }: 
   const { exit } = useApp()
   const { stdout } = useStdout()
   const width = Math.min(Math.max(stdout?.columns || 80, 40), 200)
+  const rows = stdout?.rows && stdout.rows > 0 ? stdout.rows : undefined
+  const [branch] = useState(() => {
+    try {
+      return git(config.repo, 'rev-parse', '--abbrev-ref', 'HEAD')
+    } catch {
+      return ''
+    }
+  })
 
   const [mode, setMode] = useState<Mode>('compose')
   const [timeline, setTimeline] = useState<Timeline>(emptyTimeline)
@@ -1319,27 +1329,28 @@ export function App({ store, config, danger, initialBrief, version = '0.2.0' }: 
   const workflowStages = thread ? service.workflowFor(threadId).steps.length : 0
 
   const Banner = () => (
-    <Box flexDirection="column" paddingX={1} marginBottom={1}>
-      <Box>
-        <Text color="cyan" bold>◆ arc </Text>
-        <Text color="gray">v{version}</Text>
+    <Box paddingX={1} marginBottom={1}>
+      <ArcLogo />
+      <Box flexDirection="column" marginLeft={2}>
+        <Text><Text bold>arc</Text><Text color="gray"> v{version}</Text></Text>
+        <Text color="gray">
+          <Text color={theme.sol}>Sol</Text> writes · <Text color={theme.opus}>Opus</Text> reviews
+        </Text>
+        <Text color="gray">{tilde(config.repo)}{branch ? ` · ${branch}` : ''}</Text>
+        <ThreadStatus title={thread?.title ?? threadId} lane={thread?.lane ?? 'chat'} stages={workflowStages} />
+        {config.gates.length === 0
+          ? <Text color="yellow">⚠ nothing here can check the work — no test or build script</Text>
+          : <Text color="gray">checks: {config.gates.map((g) => g.name).join(' · ')}</Text>}
       </Box>
-      <Text color="gray">
-        {'  '}<Text color={theme.sol}>Sol</Text> writes · <Text color={theme.opus}>Opus</Text> reviews
-      </Text>
-      <Text color="gray">{'  '}{tilde(config.repo)}</Text>
-      <ThreadStatus title={thread?.title ?? threadId} lane={thread?.lane ?? 'chat'} stages={workflowStages} />
-      {config.gates.length === 0
-        ? <Text color="yellow">{'  '}⚠ nothing here can check the work — no test or build script</Text>
-        : <Text color="gray">{'  '}checks: {config.gates.map((g) => g.name).join(' · ')}</Text>}
     </Box>
   )
 
   // Keep one root and one <Static> mounted for the whole session. Remounting
   // Static when a question opens would print the entire history a second time.
   const empty = timeline.completed.length === 0 && !timeline.liveStep
+  const pinCompose = mode === 'compose' && empty && rows !== undefined
   return (
-    <Box flexDirection="column" width={width}>
+    <Box flexDirection="column" width={width} height={pinCompose ? Math.max(rows - 1, 1) : undefined}>
       {mode === 'compose' && empty && <Banner />}
       <Transcript entries={timeline.completed} liveStep={timeline.liveStep} width={width} spin={spin} />
 
@@ -1411,6 +1422,8 @@ export function App({ store, config, danger, initialBrief, version = '0.2.0' }: 
           onCancel={() => setMode('compose')}
         />
       )}
+
+      {pinCompose && <Box flexGrow={1} />}
 
       {mode === 'compose' && (
         <>
