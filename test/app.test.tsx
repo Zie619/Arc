@@ -1160,6 +1160,27 @@ describe('the message queue', () => {
 })
 
 describe('the slash menu and image paste', () => {
+  it('slash menu descriptions align in a fixed column', async () => {
+    const out = fakeStdout(110)
+    const store = new Store(home)
+    const app = render(<App store={store} config={detectProject(repo).config} danger={false} />, {
+      stdout: out.stream, stdin: out.stdin, exitOnCtrlC: false, patchConsole: false,
+    })
+    try {
+      await tick()
+      out.send('/s')
+      await tick()
+      const lines = out.text().split('\n')
+      const status = lines.find((line) => line.includes('/status') && line.includes('tasks, agents, and proof state'))
+      const steer = lines.find((line) => line.includes('/steer <note>') && line.includes('durable guidance for the next agent dispatch'))
+      expect(status).toBeDefined()
+      expect(steer).toBeDefined()
+      expect(status!.indexOf('tasks, agents, and proof state')).toBe(
+        steer!.indexOf('durable guidance for the next agent dispatch'),
+      )
+    } finally { app.unmount(); store.close() }
+  })
+
   it('pops a filtered command menu on "/", completes with tab, runs with enter', async () => {
     const out = fakeStdout(110)
     const store = new Store(home)

@@ -253,19 +253,27 @@ export function Prompt({ onSubmit, busy, placeholder, history, onInterrupt, onEx
           )
         })}
       </Box>
-      {menuOpen && (
-        <Box flexDirection="column" paddingX={1}>
-          {menuMatches.slice(0, 8).map((command, i) => (
-            <Text key={command.name} color={i === Math.min(menuAt, menuMatches.length - 1) ? 'cyan' : 'gray'}>
-              {i === Math.min(menuAt, menuMatches.length - 1) ? '❯ ' : '  '}
-              <Text bold={i === Math.min(menuAt, menuMatches.length - 1)}>{command.name}</Text>
-              {command.args ? ` ${command.args}` : ''}
-              {'  '}
-              <Text color="gray">{command.description.slice(0, Math.max(0, cols - command.name.length - 10))}</Text>
-            </Text>
-          ))}
-        </Box>
-      )}
+      {menuOpen && (() => {
+        const leftWidth = Math.max(...menuMatches.map((command) =>
+          `${command.name}${command.args ? ` ${command.args}` : ''}`.length))
+        const descriptionWidth = Math.max(0, cols - leftWidth - 6)
+        const sel = Math.min(menuAt, menuMatches.length - 1)
+        return (
+          <Box flexDirection="column" paddingX={1}>
+            {menuMatches.slice(0, 8).map((command, i) => {
+              const left = `${command.name}${command.args ? ` ${command.args}` : ''}`
+              return (
+                <Text key={command.name} color={i === sel ? 'cyan' : 'gray'}>
+                  {i === sel ? '❯ ' : '  '}
+                  <Text bold>{left.padEnd(leftWidth)}</Text>
+                  {'  '}
+                  <Text color="gray">{command.description.slice(0, descriptionWidth)}</Text>
+                </Text>
+              )
+            })}
+          </Box>
+        )
+      })()}
       <Text color="gray">{rule}</Text>
     </Box>
   )
