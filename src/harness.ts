@@ -624,11 +624,26 @@ export function checkModel(
    * is exactly the silent downgrade we are watching for. Every entry must match.
    */
   mode: 'present' | 'every' = 'present',
+  /**
+   * Per-model receipts, when the run reported them. Presence answers "was it
+   * billed"; only the counters answer "did it do the work" — and a session can
+   * switch models part-way and finish on the substitute, which leaves the
+   * requested model present while another one writes the actual output.
+   */
+  usage: ProviderUsage[] = [],
 ): 'ok' | 'drift' | 'unverified' {
   if (!verified || observed.length === 0) return 'unverified'
-  return mode === 'every'
-    ? (observed.every((m) => sameModel(requested, m)) ? 'ok' : 'drift')
-    : (observed.some((m) => sameModel(requested, m)) ? 'ok' : 'drift')
+  if (mode === 'every') return observed.every((m) => sameModel(requested, m)) ? 'ok' : 'drift'
+  if (!observed.some((m) => sameModel(requested, m))) return 'drift'
+
+  let requestedOutput = 0
+  let otherOutput = 0
+  for (const row of usage) {
+    if (row.model === undefined || row.outputTokens === undefined) continue
+    if (sameModel(requested, row.model)) requestedOutput += row.outputTokens
+    else otherOutput += row.outputTokens
+  }
+  return otherOutput > requestedOutput ? 'drift' : 'ok'
 }
 
 /** Which rule applies to a given CLI. */

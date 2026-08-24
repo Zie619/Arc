@@ -535,7 +535,7 @@ function modelStatus(
   attemptId: string,
   taskId: string | null,
 ): 'ok' | 'drift' | 'unverified' {
-  const status = checkModel(role.model, result.observedModels, result.modelVerified, modelCheckMode(role.cli))
+  const status = checkModel(role.model, result.observedModels, result.modelVerified, modelCheckMode(role.cli), result.usage)
   if (status === 'unverified') {
     o.store.appendEvent(o.plan.arcId, 'model.unverified', {
       cli: role.cli, requested: role.model,

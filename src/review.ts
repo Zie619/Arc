@@ -24,7 +24,7 @@ export interface ReviewLaneResult {
 function transcript(phase: 'risk' | 'review', role: RoleBinding, result: Awaited<ReturnType<typeof dispatch>>): DirectTranscript {
   return {
     phase, requestedModel: role.model, observedModels: result.observedModels,
-    modelStatus: checkModel(role.model, result.observedModels, result.modelVerified, modelCheckMode(role.cli)),
+    modelStatus: checkModel(role.model, result.observedModels, result.modelVerified, modelCheckMode(role.cli), result.usage),
     terminalReason: result.terminalReason, transcript: result.transcript,
   }
 }

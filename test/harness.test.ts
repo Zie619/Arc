@@ -221,6 +221,23 @@ describe('model drift detection', () => {
     expect(checkModel('haiku', ['claude-haiku-4-5-20251001'], true)).toBe('ok')
   })
 
+  it('reads which model did the WORK, not merely which ones were billed', () => {
+    const receipt = (model: string, outputTokens: number) =>
+      ({ provider: 'claude' as const, model, outputTokens, raw: {} })
+
+    // The ordinary shape: Opus reviewed, Haiku did the harness's own bookkeeping.
+    expect(checkModel('opus', ['claude-opus-5', 'claude-haiku-4-5'], true, 'present',
+      [receipt('claude-opus-5', 8_000), receipt('claude-haiku-4-5', 120)])).toBe('ok')
+
+    // A mid-session switch leaves the requested model PRESENT while another
+    // model writes the actual verdict. Presence alone would grade the wrong work.
+    expect(checkModel('opus', ['claude-opus-5', 'claude-haiku-4-5'], true, 'present',
+      [receipt('claude-opus-5', 120), receipt('claude-haiku-4-5', 8_000)])).toBe('drift')
+
+    // No receipts: unchanged: presence is all there is to go on.
+    expect(checkModel('opus', ['claude-opus-5', 'claude-haiku-4-5'], true, 'present', [])).toBe('ok')
+  })
+
   it('flags a run that silently executed on a different family', async () => {
     // This is the whole point: a reviewer that quietly downgraded is exactly
     // what "the agent started to slack" looks like from the outside.

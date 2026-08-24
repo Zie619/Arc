@@ -101,7 +101,7 @@ async function callAgent<T>(
 
   const res = await dispatch({ role: r, cwd, prompt, schema, signal: o.signal })
   const transcriptId = store.putArtifact(arcId, 'transcript', res.transcript, attemptId)
-  const drift = checkModel(r.model, res.observedModels, res.modelVerified, modelCheckMode(r.cli))
+  const drift = checkModel(r.model, res.observedModels, res.modelVerified, modelCheckMode(r.cli), res.usage)
   store.finishAttempt(arcId, attemptId, {
     terminalReason: drift === 'drift' ? 'model-drift' : res.terminalReason,
     exitCode: res.exitCode,
