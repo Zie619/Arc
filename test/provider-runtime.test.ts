@@ -50,6 +50,14 @@ describe('provider child environments', () => {
     expect(env).not.toHaveProperty('NODE_OPTIONS')
   })
 
+  it('disables auto-memory so the operator\'s own notes never reach a delegate', () => {
+    expect(buildProviderChildEnv('claude', source).CLAUDE_CODE_DISABLE_AUTO_MEMORY).toBe('1')
+    // The operator cannot re-enable it by exporting the variable themselves.
+    expect(buildProviderChildEnv('claude', { ...source, CLAUDE_CODE_DISABLE_AUTO_MEMORY: '0' })
+      .CLAUDE_CODE_DISABLE_AUTO_MEMORY).toBe('1')
+    expect(buildProviderChildEnv('codex', source)).not.toHaveProperty('CLAUDE_CODE_DISABLE_AUTO_MEMORY')
+  })
+
   it('keeps Codex authentication without leaking Claude credentials', () => {
     const env = buildProviderChildEnv('codex', source)
     expect(env.OPENAI_API_KEY).toBe('openai-auth')

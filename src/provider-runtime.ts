@@ -103,6 +103,10 @@ export function buildProviderChildEnv(
   for (const [key, value] of Object.entries(additions)) {
     if (value !== undefined) env[key] = value
   }
+  // `--setting-sources project` does NOT cover auto-memory: Claude Code loads
+  // the operator's own memory files regardless of it. Set last so neither the
+  // parent environment nor a role allowlist can switch it back on.
+  if (provider === 'claude') env.CLAUDE_CODE_DISABLE_AUTO_MEMORY = '1'
   return env
 }
 
