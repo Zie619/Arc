@@ -2,11 +2,15 @@ import { z } from 'zod'
 import { resolve } from 'node:path'
 import { Store } from './store.ts'
 import { compileBrief, BriefTooLarge } from './brief.ts'
-import { dispatch, checkModel, auxiliaryModels, modelCheckMode, type DispatchResult } from './harness.ts'
+import {
+  dispatch, checkModel, auxiliaryModels, capacityFailure, modelCheckMode,
+  type DispatchOptions, type DispatchResult,
+} from './harness.ts'
 import { computeFrontier } from './scheduler.ts'
 import { runGate, selectGates, isSubsetOfBaseline, describe, type GateResult } from './gates.ts'
 import { signaturesMatch, signatureSimilarity } from './classify.ts'
 import * as G from './git.ts'
+import { formatCostSummary } from './cost.ts'
 import {
   TaskResult, ReviewVerdict, RiskChecklist, ProjectConfig,
   type Plan, type PlanTask, type AgentRole, type RoleBinding,
@@ -36,6 +40,12 @@ export interface RunOptions {
   onTaskResult?: (result: TaskProduct) => void
   /** The durable thread this arc belongs to, recorded on the arc row. */
   threadId?: string
+  /** Run the provider/model probe before the first scheduling wave. */
+  preflight?: boolean
+  /** A supervised CLI may wait at preflight; an interactive start refuses. */
+  waitForPreflightCapacity?: boolean
+  /** Shared across every step so the configured budget is an arc budget. */
+  capacityState?: { waitedMs: number }
 }
 
 export interface TaskProduct {
@@ -87,6 +97,12 @@ export async function runArc(o: RunOptions): Promise<void> {
   }
 
   const { store, plan, config, log } = o
+  const persistedCapacityWait = o.resume
+    ? store.eventsSince(plan.arcId, 0)
+      .filter((event) => event.kind === 'capacity.wait')
+      .reduce((total, event) => total + Number((event.payload as { waitMs?: number } | null)?.waitMs ?? 0), 0)
+    : 0
+  o.capacityState ??= { waitedMs: persistedCapacityWait }
   const arcId = plan.arcId
   const repo = config.repo
 
@@ -158,6 +174,19 @@ export async function runArc(o: RunOptions): Promise<void> {
     log(`arc ${arcId} — ${plan.tasks.length} tasks, base ${baseSha.slice(0, 8)}, integration ${integrationBranch}`)
   }
 
+  // Test-only fault injection exercises the process-level crash recorder at a
+  // point where the arc row exists but no normal terminal event can be written.
+  if (process.env.ARC_TEST_CRASH_AFTER_START) {
+    throw new Error(process.env.ARC_TEST_CRASH_AFTER_START)
+  }
+
+  if (o.preflight && !o.resume && !await preflightCapacity(o)) {
+    store.closeArc(arcId, 'incomplete')
+    log('INCOMPLETE — provider capacity preflight refused to dispatch wave 1.')
+    logCostSummary(o)
+    return
+  }
+
   const heavy = new Semaphore(config.heavyGateLimit)
   // Agents and their local gates may run in parallel; rebasing/advancing the
   // one integration ref is a serial transaction. Synchronous gates used to
@@ -216,9 +245,51 @@ export async function runArc(o: RunOptions): Promise<void> {
     })
   }
 
-  const integrationApproved = await finalReview(o, integrationBranch, baseSha)
+  const landedCount = store.allTasks(arcId).filter((task) => task.state === 'landed').length
+  let integrationApproved = true
+  if (landedCount === 0) log('nothing landed — skipping integration review')
+  else integrationApproved = await finalReview(o, integrationBranch, baseSha)
   const complete = report(o, integrationBranch, integrationApproved)
   await finalize(o, integrationBranch, baseSha, complete)
+}
+
+async function preflightCapacity(o: RunOptions): Promise<boolean> {
+  const seen = new Set<string>()
+  for (const [name, binding] of Object.entries(o.config.roles)) {
+    if (!binding) continue
+    const role = binding as RoleBinding
+    const key = `${role.cli}:${role.model}`
+    if (seen.has(key)) continue
+    seen.add(key)
+    const roleName = name as AgentRole
+    o.log(`preflight: probing ${role.cli}/${role.model}`)
+    const probeRole: RoleBinding = { ...role, sandbox: 'read-only', tools: undefined }
+    const probe = await dispatchStep(o, {
+      roleName, role: probeRole, taskId: null, attemptNo: 0,
+      waitForCapacity: o.waitForPreflightCapacity === true,
+      dispatch: {
+        cwd: o.config.repo,
+        prompt: 'Arc capacity probe. Reply with a single short acknowledgement; do not inspect or modify the repository.',
+        signal: o.signal,
+      },
+    })
+    if (probe.capacityError) {
+      o.log(`! capacity preflight: ${probe.capacityError}`)
+      o.store.appendEvent(o.plan.arcId, 'preflight.refused', {
+        provider: role.cli, requested: role.model, message: probe.capacityError,
+      })
+      return false
+    }
+    if (probe.model === 'drift') {
+      o.log(`! capacity preflight: MODEL DRIFT — asked for ${role.model}, observed ${probe.result.observedModels.join(', ')}`)
+      return false
+    }
+    if (probe.result.terminalReason !== 'ok') {
+      o.log(`! capacity preflight: ${role.cli}/${role.model} ended ${probe.result.terminalReason}`)
+      return false
+    }
+  }
+  return true
 }
 
 /**
@@ -397,7 +468,7 @@ async function runTask(
 
     store.setTaskState(arcId, task.id, 'reviewing', LEASE_MS)
     let review = await reviewLoop(o, task, wt)
-    if (review === 'repair') {
+    if (review.status === 'repair') {
       // CHANGES_REQUIRED used to be a death sentence — a real overnight run
       // died with a perfect review naming exactly what to fix and a writer
       // who never got to see it. The findings are on record; the writer gets
@@ -408,17 +479,21 @@ async function runTask(
         .map((f) => `- [${f.severity}] ${f.text}`)
       log(`  · ${task.id}: review requires changes — one repair round with ${reviewFindings.length} finding(s)`)
       store.setTaskState(arcId, task.id, 'running', LEASE_MS)
+      const repairBaseSha = G.headSha(wt.path)
       const repaired = await implementLoop(o, task, wt, baselines, heavy,
         `The reviewer requires changes. Fix ALL of these findings in your existing branch:\n${reviewFindings.join('\n')}`)
       if (repaired === 'ok') {
         store.setTaskState(arcId, task.id, 'reviewing', LEASE_MS)
-        review = await reviewLoop(o, task, wt)
-        if (review === 'repair') log(`  ✗ ${task.id}: changes still required after the repair round — stopping`)
+        review = await reviewLoop(o, task, wt, {
+          previousVerdict: review.verdict ?? 'CHANGES_REQUIRED',
+          findings: reviewFindings,
+          diff: G.git(wt.path, 'diff', `${repairBaseSha}...HEAD`).slice(0, 120_000),
+        })
       } else {
-        review = 'fail'
+        review = { status: 'fail', findings: [] }
       }
     }
-    if (review !== 'pass') { store.setTaskState(arcId, task.id, 'failed'); return }
+    if (review.status !== 'pass') { store.setTaskState(arcId, task.id, 'failed'); return }
 
     const unmet = store.unmetCriteria(arcId, task.id)
     if (unmet.length > 0) {
@@ -475,6 +550,131 @@ function modelStatus(
   return status
 }
 
+interface DispatchStepOptions {
+  roleName: AgentRole
+  role: RoleBinding
+  taskId: string | null
+  attemptNo: number
+  baseSha?: string
+  briefArtifactId?: string
+  dispatch: Omit<DispatchOptions, 'role'>
+  waitForCapacity?: boolean
+}
+
+interface DispatchStepResult {
+  result: DispatchResult
+  attemptId: string
+  model: 'ok' | 'drift' | 'unverified'
+  capacityError?: string
+}
+
+function capacityBackoffMs(round: number): number {
+  const override = Number(process.env.ARC_CAPACITY_BACKOFF_MS)
+  const floor = Number.isFinite(override) && override > 0 ? override : 5 * 60_000
+  return Math.min(floor * (2 ** round), 30 * 60_000)
+}
+
+async function sleepForCapacity(o: RunOptions, taskId: string | null, ms: number): Promise<void> {
+  if (taskId) {
+    try { o.store.renewLease(o.plan.arcId, taskId, LEASE_MS) } catch { /* the task heartbeat is the second line */ }
+  }
+  await new Promise<void>((resolve) => {
+    let settled = false
+    const finish = (): void => {
+      if (settled) return
+      settled = true
+      clearTimeout(timer)
+      o.signal?.removeEventListener('abort', finish)
+      resolve()
+    }
+    const timer = setTimeout(finish, ms)
+    o.signal?.addEventListener('abort', finish, { once: true })
+  })
+  if (taskId) {
+    try { o.store.renewLease(o.plan.arcId, taskId, LEASE_MS) } catch { /* lease expiry remains recoverable */ }
+  }
+}
+
+/** Capacity retries remain inside one logical step. Every substituted output
+ *  is receipted as model-drift, then discarded before another attempt starts. */
+async function dispatchStep(o: RunOptions, step: DispatchStepOptions): Promise<DispatchStepResult> {
+  const { store, plan, config, log } = o
+  let capacityRound = 0
+  for (;;) {
+    const writableCheckpoint = step.role.sandbox === 'workspace-write'
+      ? { head: G.headSha(step.dispatch.cwd), untracked: new Set(G.untrackedFiles(step.dispatch.cwd)) }
+      : null
+    const attemptId = store.startAttempt({
+      arcId: plan.arcId, taskId: step.taskId, attemptNo: step.attemptNo,
+      role: step.roleName, cli: step.role.cli, requestedModel: step.role.model,
+      baseSha: step.baseSha, briefArtifactId: step.briefArtifactId,
+    })
+    const result = await dispatch({ role: step.role, ...step.dispatch })
+    const model = modelStatus(o, step.role, result, attemptId, step.taskId)
+    store.finishAttempt(plan.arcId, attemptId, {
+      terminalReason: model === 'drift' ? 'model-drift' : result.terminalReason,
+      exitCode: result.exitCode,
+      observedModel: result.observedModels.join(',') || null,
+      transcriptArtifactId: store.putArtifact(plan.arcId, 'transcript', result.transcript, attemptId),
+      usage: result.usage,
+    })
+
+    const weather = capacityFailure({
+      terminalReason: model === 'drift' ? 'model-drift' : result.terminalReason,
+      observedModels: result.observedModels,
+      errorText: result.errorText,
+    }, step.role.cli, step.role.model)
+    if (!weather) return { result, attemptId, model }
+
+    if (writableCheckpoint) {
+      G.git(step.dispatch.cwd, 'reset', '--hard', writableCheckpoint.head)
+      const created = G.untrackedFiles(step.dispatch.cwd).filter((path) => !writableCheckpoint.untracked.has(path))
+      for (const path of created) G.git(step.dispatch.cwd, 'clean', '-fd', '--', path)
+      store.appendEvent(plan.arcId, 'capacity.discard', {
+        role: step.roleName, restoredHead: writableCheckpoint.head, removedUntracked: created,
+      }, step.taskId, attemptId)
+    }
+
+    if (step.waitForCapacity === false) {
+      const detail = weather.observed ? `observed ${weather.observed}` : weather.errorClass
+      const capacityError = `${step.role.cli} capacity unavailable for ${step.role.model} (${detail}); re-run with --until-done to wait for the requested model`
+      store.appendEvent(plan.arcId, 'capacity.warning', {
+        role: step.roleName, provider: step.role.cli, requested: step.role.model,
+        ...(weather.observed ? { observed: weather.observed } : { errorClass: weather.errorClass }),
+      }, step.taskId, attemptId)
+      return { result, attemptId, model, capacityError }
+    }
+
+    const state = o.capacityState!
+    const budgetMs = config.capacityWaitMinutes * 60_000
+    const remainingMs = Math.max(0, budgetMs - state.waitedMs)
+    if (remainingMs === 0) {
+      const minutes = Math.round(state.waitedMs / 60_000 * 10) / 10
+      const detail = weather.observed ? `observed ${weather.observed}` : weather.errorClass
+      const capacityError = `${step.role.cli} capacity unavailable for ${step.role.model} (${detail}); capacity wait budget exhausted after ${minutes} minute(s)`
+      store.appendEvent(plan.arcId, 'capacity.exhausted', {
+        role: step.roleName, provider: step.role.cli, requested: step.role.model,
+        ...(weather.observed ? { observed: weather.observed } : { errorClass: weather.errorClass }),
+        attempt: step.attemptNo, waitedMs: state.waitedMs,
+      }, step.taskId, attemptId)
+      log(`  ✗ ${capacityError}`)
+      return { result, attemptId, model, capacityError }
+    }
+    const delayMs = Math.min(capacityBackoffMs(capacityRound), remainingMs)
+
+    store.appendEvent(plan.arcId, 'capacity.wait', {
+      role: step.roleName, provider: step.role.cli, requested: step.role.model,
+      ...(weather.observed ? { observed: weather.observed } : { errorClass: weather.errorClass }),
+      attempt: step.attemptNo, waitMs: delayMs, waitedMs: state.waitedMs,
+    }, step.taskId, attemptId)
+    const detail = weather.observed ? `served ${weather.observed}` : weather.errorClass
+    log(`  ! ${step.role.cli}/${step.role.model} capacity weather (${detail}) — waiting ${Math.round(delayMs / 1000)}s and retrying ${step.roleName}`)
+    await sleepForCapacity(o, step.taskId, delayMs)
+    state.waitedMs += delayMs
+    capacityRound++
+  }
+}
+
 async function implementLoop(
   o: RunOptions, task: PlanTask, wt: G.Worktree, baselines: Map<string, GateResult>, heavy: Semaphore,
   initialFeedback = '',
@@ -505,39 +705,36 @@ async function implementLoop(
     }
 
     const briefId = store.putArtifact(arcId, 'brief', brief.text)
-    const attemptId = store.startAttempt({
-      arcId, taskId: task.id, attemptNo: attempt, role: 'implement',
-      cli: role.cli, requestedModel: role.model, baseSha: wt.baseSha, briefArtifactId: briefId,
-    })
     log(`  · ${task.id} implement attempt ${attempt}/${config.maxAttempts} (${role.cli}/${role.model}, brief ${brief.bytes}B)`)
 
-    const res = await dispatch({
-      role, cwd: wt.path, prompt: brief.text, schema: TaskResult,
-      onEvent: () => { try { store.renewLease(arcId, task.id, LEASE_MS) } catch { /* lease expiry is the recovery path */ } },
-      signal: o.signal,
-      // Commits from a worktree write into the main repo's .git; without this
-      // the sandboxed writer dies on index.lock the moment the repo lives
-      // outside the sandbox-writable temp areas.
-      writableRoots: [resolve(wt.path, G.git(wt.path, 'rev-parse', '--git-common-dir'))],
+    const dispatched = await dispatchStep(o, {
+      roleName: 'implement', role, taskId: task.id, attemptNo: attempt,
+      baseSha: wt.baseSha, briefArtifactId: briefId,
+      dispatch: {
+        cwd: wt.path, prompt: brief.text, schema: TaskResult,
+        onEvent: () => { try { store.renewLease(arcId, task.id, LEASE_MS) } catch { /* lease expiry is the recovery path */ } },
+        signal: o.signal,
+        // Commits from a worktree write into the main repo's .git; without this
+        // the sandboxed writer dies on index.lock the moment the repo lives
+        // outside the sandbox-writable temp areas.
+        writableRoots: [resolve(wt.path, G.git(wt.path, 'rev-parse', '--git-common-dir'))],
+      },
     })
+    const { result: res, attemptId, model: drift } = dispatched
 
     // Steering counts as APPLIED only once an attempt ran to completion on a
     // brief that contained it. Marking it before dispatch silently dropped it
     // whenever the attempt was cancelled, stalled, or the process died first —
     // a pending intervention is re-included in every retry brief instead.
-    if (res.terminalReason === 'ok') {
+    if (res.terminalReason === 'ok' && drift !== 'drift' && !dispatched.capacityError) {
       for (const interventionId of brief.interventionIds) store.applyIntervention(interventionId)
     }
 
-    const transcriptId = store.putArtifact(arcId, 'transcript', res.transcript, attemptId)
-    const drift = modelStatus(o, role, res, attemptId, task.id)
-    store.finishAttempt(arcId, attemptId, {
-      terminalReason: drift === 'drift' ? 'model-drift' : res.terminalReason,
-      exitCode: res.exitCode,
-      observedModel: res.observedModels.join(',') || null,
-      transcriptArtifactId: transcriptId,
-      usage: res.usage,
-    })
+    if (dispatched.capacityError) {
+      store.addFinding({ arcId, taskId: task.id, attemptId, kind: 'risk', severity: 'high',
+        text: dispatched.capacityError })
+      return 'failed'
+    }
 
     if (drift === 'drift') {
       log(`  ✗ MODEL DRIFT: asked for ${role.model}, ran on ${res.observedModels.join(', ')}`)
@@ -593,21 +790,26 @@ async function implementLoop(
       continue
     }
 
-    const measured = G.measuredFootprint(wt.path, wt.baseSha)
-    store.setTaskHead(arcId, task.id, G.headSha(wt.path), measured)
+    const refreshResults = await runRefreshCommands(o, task, wt, attemptId)
+    const refreshFailed = refreshResults.filter((entry) => !entry.ok)
+    let failed = refreshFailed
+    if (refreshFailed.length === 0) {
+      const measured = G.measuredFootprint(wt.path, wt.baseSha)
+      store.setTaskHead(arcId, task.id, G.headSha(wt.path), measured)
 
-    if (task.footprint.length > 0) {
-      const undeclared = measured.filter((f) => !task.footprint.some((d) => f === d || f.startsWith(d)))
-      if (undeclared.length > 0) {
-        store.addFinding({ arcId, taskId: task.id, attemptId, kind: 'risk', severity: 'medium',
-          text: `touched ${undeclared.length} file(s) outside declared footprint: ${undeclared.slice(0, 5).join(', ')}`,
-          affects: undeclared })
-        log(`  ! footprint drift: ${undeclared.length} undeclared file(s)`)
+      if (task.footprint.length > 0) {
+        const undeclared = measured.filter((f) => !task.footprint.some((d) => f === d || f.startsWith(d)))
+        if (undeclared.length > 0) {
+          store.addFinding({ arcId, taskId: task.id, attemptId, kind: 'risk', severity: 'medium',
+            text: `touched ${undeclared.length} file(s) outside declared footprint: ${undeclared.slice(0, 5).join(', ')}`,
+            affects: undeclared })
+          log(`  ! footprint drift: ${undeclared.length} undeclared file(s)`)
+        }
       }
-    }
 
-    const gateResults = await runTaskGates(o, task, wt, baselines, attemptId, heavy)
-    const failed = gateResults.filter((g) => !g.ok)
+      const gateResults = await runTaskGates(o, task, wt, baselines, attemptId, heavy)
+      failed = gateResults.filter((g) => !g.ok)
+    }
 
     if (failed.length === 0) {
       log(`  ✓ ${task.id} green after ${attempt} attempt(s)`)
@@ -639,6 +841,40 @@ async function implementLoop(
 
   log(`  ✗ ${task.id}: exhausted ${config.maxAttempts} attempts`)
   return 'failed'
+}
+
+async function runRefreshCommands(
+  o: RunOptions, task: PlanTask, wt: G.Worktree, attemptId: string,
+): Promise<Array<{ ok: boolean; result: GateResult }>> {
+  const out: Array<{ ok: boolean; result: GateResult }> = []
+  for (const refresh of o.config.refreshCommands ?? []) {
+    const name = `refresh:${refresh.name}`
+    const result = await runGate({
+      name, command: refresh.command,
+      proves: `operator-owned refresh "${refresh.name}" completed`,
+      cwd: '.', timeoutMs: refresh.timeoutMs ?? 20 * 60_000,
+      heavy: false, baselineSubset: false,
+    }, wt.path, wt.baseSha, o.signal)
+    const artifactId = o.store.putArtifact(o.plan.arcId, 'gate-output', result.output, attemptId)
+    o.store.recordGate({
+      arcId: o.plan.arcId, taskId: task.id, attemptId,
+      name, command: refresh.command, proves: result.proves,
+      exitCode: result.exitCode, baseSha: wt.baseSha,
+      verdict: result.pass ? 'pass' : 'fail', signature: result.signature, artifactId,
+    })
+    if (!result.pass) {
+      const tail = result.output.slice(-800)
+      o.log(`    ${name}: FAIL (exit ${result.exitCode ?? 'timeout'})${tail ? ` — ${tail.replace(/\s+/g, ' ').slice(0, 300)}` : ''}`)
+      out.push({ ok: false, result })
+      break
+    }
+
+    const changed = G.worktreeChanges(wt.path)
+    if (changed.length > 0) G.commitPaths(wt.path, changed, `refresh: ${refresh.name}`)
+    o.log(`    ${name}: pass${changed.length > 0 ? ` — committed ${changed.length} file(s)` : ''}`)
+    out.push({ ok: true, result })
+  }
+  return out
 }
 
 /** Prepare a fresh worktree (dependency install, codegen) so project checks can run in it. */
@@ -910,12 +1146,26 @@ async function runReviewFindingCheck(
  * SPEC and BASE TREE first, before it is allowed to see the implementation.
  * Otherwise review degenerates into rationalising whatever was written.
  */
+interface ReviewOutcome {
+  status: 'pass' | 'repair' | 'fail'
+  verdict?: z.infer<typeof ReviewVerdict>['verdict']
+  findings: string[]
+}
+
+interface RepairReviewContext {
+  previousVerdict: string
+  findings: string[]
+  diff: string
+}
+
 /** 'repair': the review found CONTENT problems the writer can fix; 'fail': infrastructure or a rejection. */
-async function reviewLoop(o: RunOptions, task: PlanTask, wt: G.Worktree): Promise<'pass' | 'repair' | 'fail'> {
+async function reviewLoop(
+  o: RunOptions, task: PlanTask, wt: G.Worktree, repair?: RepairReviewContext,
+): Promise<ReviewOutcome> {
   const { store, plan, config, log } = o
   const arcId = plan.arcId
   const role = config.roles.review
-  if (!role) { log('  (no review role configured — skipping)'); return 'pass' }
+  if (!role) { log('  (no review role configured — skipping)'); return { status: 'pass', findings: [] } }
 
   const checklistBrief = [
     `# PREDICT THE RISKS — you have NOT seen the implementation`,
@@ -935,34 +1185,48 @@ async function reviewLoop(o: RunOptions, task: PlanTask, wt: G.Worktree): Promis
     ``, `Base commit: ${wt.baseSha}. Read the tree at that commit with your tools.`,
   ].join('\n')
 
-  const clAttempt = store.startAttempt({
-    arcId, taskId: task.id, attemptNo: 0, role: 'review', cli: role.cli, requestedModel: role.model,
-  })
-  const cl = await dispatch({ role, cwd: wt.path, prompt: checklistBrief, schema: RiskChecklist, signal: o.signal })
-  const clModel = modelStatus(o, role, cl, clAttempt, task.id)
-  store.finishAttempt(arcId, clAttempt, {
-    terminalReason: clModel === 'drift' ? 'model-drift' : cl.terminalReason, exitCode: cl.exitCode,
-    observedModel: cl.observedModels.join(',') || null,
-    transcriptArtifactId: store.putArtifact(arcId, 'transcript', cl.transcript, clAttempt),
-    usage: cl.usage,
-  })
-  if (clModel === 'drift') {
-    log(`  ✗ MODEL DRIFT in risk prediction: asked for ${role.model}, ran on ${cl.observedModels.join(', ')}`)
-    store.addFinding({ arcId, taskId: task.id, attemptId: clAttempt, kind: 'risk', severity: 'high',
-      text: `review model drift: requested ${role.model}, observed ${cl.observedModels.join(', ')}` })
-    return 'fail'
+  let checklist: z.infer<typeof RiskChecklist>['risks'] = []
+  if (!repair) {
+    const dispatched = await dispatchStep(o, {
+      roleName: 'review', role, taskId: task.id, attemptNo: 0,
+      dispatch: { cwd: wt.path, prompt: checklistBrief, schema: RiskChecklist, signal: o.signal },
+    })
+    const { result: cl, attemptId: clAttempt, model: clModel } = dispatched
+    if (dispatched.capacityError) {
+      store.addFinding({ arcId, taskId: task.id, attemptId: clAttempt, kind: 'risk', severity: 'high', text: dispatched.capacityError })
+      return { status: 'fail', findings: [] }
+    }
+    if (clModel === 'drift') {
+      log(`  ✗ MODEL DRIFT in risk prediction: asked for ${role.model}, ran on ${cl.observedModels.join(', ')}`)
+      store.addFinding({ arcId, taskId: task.id, attemptId: clAttempt, kind: 'risk', severity: 'high',
+        text: `review model drift: requested ${role.model}, observed ${cl.observedModels.join(', ')}` })
+      return { status: 'fail', findings: [] }
+    }
+    if (cl.terminalReason !== 'ok' || !cl.parsed) {
+      log(`  ✗ ${task.id}: risk prediction ended "${cl.terminalReason}" — treating as not-reviewed`)
+      return { status: 'fail', findings: [] }
+    }
+    checklist = (cl.parsed as z.infer<typeof RiskChecklist> | undefined)?.risks ?? []
+    log(`  · ${task.id} review: ${checklist.length} risk(s) predicted before seeing the diff`)
   }
-  if (cl.terminalReason !== 'ok' || !cl.parsed) {
-    log(`  ✗ ${task.id}: risk prediction ended "${cl.terminalReason}" — treating as not-reviewed`)
-    return 'fail'
-  }
-  const checklist = (cl.parsed as z.infer<typeof RiskChecklist> | undefined)?.risks ?? []
-  log(`  · ${task.id} review: ${checklist.length} risk(s) predicted before seeing the diff`)
 
-  const diff = G.git(wt.path, 'diff', `${wt.baseSha}...HEAD`).slice(0, 120_000)
+  const diff = repair?.diff ?? G.git(wt.path, 'diff', `${wt.baseSha}...HEAD`).slice(0, 120_000)
   const gates = store.gatesFor(arcId, task.id).filter((g) => g.verdict !== 'baseline')
 
-  const reviewBrief = [
+  const reviewBrief = repair ? [
+    `# REPAIR REVIEW`,
+    ``,
+    `Judge whether the requested repair fixed the previously reviewed defects.`,
+    `Do not re-litigate the original implementation or introduce unrelated`,
+    `minor work. New findings must be consequences of the repair diff below.`,
+    `Every finding must carry file and line; use checkCommand when it can be`,
+    `executed, because non-reproducing command findings are discarded.`,
+    ``,
+    `## Previous verdict`, repair.previousVerdict,
+    ``, `## Findings sent to the writer`, ...repair.findings,
+    ``, `## Repair diff only`, '```diff', diff, '```',
+    ``, `Return REJECT only when the repair makes the approach untenable.`,
+  ].join('\n') : [
     `# REVIEW`,
     ``,
     `Review this diff against the spec and the criteria. You are scoped to`,
@@ -994,23 +1258,24 @@ async function reviewLoop(o: RunOptions, task: PlanTask, wt: G.Worktree): Promis
   let rv!: DispatchResult
   let rvAttempt = ''
   for (let round = 1; round <= 2; round++) {
-    rvAttempt = store.startAttempt({
-      arcId, taskId: task.id, attemptNo: round, role: 'review', cli: role.cli, requestedModel: role.model,
+    const briefArtifactId = store.putArtifact(arcId, 'brief', reviewBrief)
+    const dispatched = await dispatchStep(o, {
+      roleName: 'review', role, taskId: task.id, attemptNo: round,
+      briefArtifactId,
+      dispatch: { cwd: wt.path, prompt: reviewBrief, schema: ReviewVerdict, signal: o.signal },
     })
-    rv = await dispatch({ role, cwd: wt.path, prompt: reviewBrief, schema: ReviewVerdict, signal: o.signal })
-    const rvModel = modelStatus(o, role, rv, rvAttempt, task.id)
-    store.finishAttempt(arcId, rvAttempt, {
-      terminalReason: rvModel === 'drift' ? 'model-drift' : rv.terminalReason, exitCode: rv.exitCode,
-      observedModel: rv.observedModels.join(',') || null,
-      transcriptArtifactId: store.putArtifact(arcId, 'transcript', rv.transcript, rvAttempt),
-      usage: rv.usage,
-    })
+    rv = dispatched.result
+    rvAttempt = dispatched.attemptId
 
-    if (rvModel === 'drift') {
+    if (dispatched.capacityError) {
+      store.addFinding({ arcId, taskId: task.id, attemptId: rvAttempt, kind: 'risk', severity: 'high', text: dispatched.capacityError })
+      return { status: 'fail', findings: [] }
+    }
+    if (dispatched.model === 'drift') {
       log(`  ✗ MODEL DRIFT in review: asked for ${role.model}, ran on ${rv.observedModels.join(', ')}`)
       store.addFinding({ arcId, taskId: task.id, attemptId: rvAttempt, kind: 'risk', severity: 'high',
         text: `review model drift: requested ${role.model}, observed ${rv.observedModels.join(', ')}` })
-      return 'fail'
+      return { status: 'fail', findings: [] }
     }
     if ((rv.terminalReason === 'hard-timeout' || rv.terminalReason === 'stall-kill') && round === 1) {
       log(`  ! ${task.id}: review ${rv.terminalReason} — the task is green, so the review gets one more try`)
@@ -1021,7 +1286,7 @@ async function reviewLoop(o: RunOptions, task: PlanTask, wt: G.Worktree): Promis
 
   if (rv.terminalReason !== 'ok' || !rv.parsed) {
     log(`  ✗ ${task.id}: review ended "${rv.terminalReason}" — treating as not-reviewed`)
-    return 'fail'
+    return { status: 'fail', findings: [] }
   }
 
   const verdict = rv.parsed as z.infer<typeof ReviewVerdict>
@@ -1061,21 +1326,42 @@ async function reviewLoop(o: RunOptions, task: PlanTask, wt: G.Worktree): Promis
   const criticals = findings.filter((f) => f.severity === 'critical')
   log(`  · ${task.id} verdict ${verdict.verdict}: ${findings.length} finding(s), ${criticals.length} critical`)
 
+  if (repair) {
+    const blockers = findings.filter((finding) => finding.severity === 'critical' || finding.severity === 'major')
+    if (verdict.verdict === 'REJECT') {
+      log(`  ✗ ${task.id}: repaired approach was rejected`)
+      return { status: 'fail', verdict: verdict.verdict, findings: findings.map((finding) => finding.claim) }
+    }
+    if (blockers.length > 0) {
+      log(`  ✗ ${task.id}: ${blockers.length} critical/major finding(s) remain after repair`)
+      return { status: 'fail', verdict: verdict.verdict, findings: findings.map((finding) => finding.claim) }
+    }
+    return { status: 'pass', verdict: verdict.verdict, findings: findings.map((finding) => finding.claim) }
+  }
+
   if (verdict.verdict === 'PASS' || verdict.verdict === 'PASS_WITH_NOTES') {
     if (criticals.length > 0) {
       log(`  ✗ ${task.id}: verdict says pass but carries ${criticals.length} critical finding(s) — gate wins`)
-      return 'repair'
+      return { status: 'repair', verdict: verdict.verdict, findings: findings.map((finding) => finding.claim) }
     }
     for (const a of verdict.criteriaAssessment.filter((c) => !c.met)) {
       log(`  ! reviewer says criterion ${a.id} NOT met: ${a.evidence}`)
       store.addFinding({ arcId, taskId: task.id, attemptId: rvAttempt, kind: 'risk', severity: 'medium',
         text: `reviewer: criterion ${a.id} not met — ${a.evidence}` })
     }
-    return (verdict.criteriaAssessment.every((c) => c.met !== false) || verdict.verdict === 'PASS') ? 'pass' : 'repair'
+    return {
+      status: (verdict.criteriaAssessment.every((c) => c.met !== false) || verdict.verdict === 'PASS') ? 'pass' : 'repair',
+      verdict: verdict.verdict,
+      findings: findings.map((finding) => finding.claim),
+    }
   }
 
   // REJECT means "this approach is wrong" — a repair round cannot save it.
-  return verdict.verdict === 'CHANGES_REQUIRED' ? 'repair' : 'fail'
+  return {
+    status: verdict.verdict === 'CHANGES_REQUIRED' ? 'repair' : 'fail',
+    verdict: verdict.verdict,
+    findings: findings.map((finding) => finding.claim),
+  }
 }
 
 async function landTask(
@@ -1193,19 +1479,17 @@ async function reviewIntegrationHead(
     ``, `## The combined diff`, '```diff', diff, '```',
   ].join('\n')
 
-  const attemptId = store.startAttempt({
-    arcId, taskId: null, attemptNo: 1, role: 'integrate', cli: role.cli, requestedModel: role.model,
+  const dispatched = await dispatchStep(o, {
+    roleName: 'integrate', role, taskId: null, attemptNo: 1,
+    dispatch: { cwd: reviewWt.path, prompt, schema: ReviewVerdict, signal: o.signal },
   })
-  const rv = await dispatch({ role, cwd: reviewWt.path, prompt, schema: ReviewVerdict, signal: o.signal })
-  const rvModel = modelStatus(o, role, rv, attemptId, null)
-  store.finishAttempt(arcId, attemptId, {
-    terminalReason: rvModel === 'drift' ? 'model-drift' : rv.terminalReason, exitCode: rv.exitCode,
-    observedModel: rv.observedModels.join(',') || null,
-    transcriptArtifactId: store.putArtifact(arcId, 'transcript', rv.transcript, attemptId),
-    usage: rv.usage,
-  })
+  const { result: rv, attemptId } = dispatched
 
-  if (rvModel === 'drift') {
+  if (dispatched.capacityError) {
+    store.addFinding({ arcId, attemptId, kind: 'integration', severity: 'high', text: dispatched.capacityError })
+    return false
+  }
+  if (dispatched.model === 'drift') {
     log(`! MODEL DRIFT in integration review: asked for ${role.model}, ran on ${rv.observedModels.join(', ')}`)
     store.addFinding({ arcId, attemptId, kind: 'integration', severity: 'high',
       text: `integration review model drift: requested ${role.model}, observed ${rv.observedModels.join(', ')}` })
@@ -1292,6 +1576,8 @@ function report(o: RunOptions, integrationBranch: string, integrationApproved: b
     log('  INTEGRATION REVIEW DID NOT PASS — whole-branch findings block completion.')
   }
 
+  logCostSummary(o)
+
   const complete = integrationApproved && failed.length === 0 && blocked.length === 0 && weak.length === 0 && ops.length === 0
   log('')
   log(`  integration branch: ${integrationBranch}`)
@@ -1300,4 +1586,12 @@ function report(o: RunOptions, integrationBranch: string, integrationApproved: b
 
   store.closeArc(arcId, complete ? 'done' : 'incomplete')
   return complete
+}
+
+function logCostSummary(o: RunOptions): void {
+  const cost = formatCostSummary(o.store.costSummary(o.plan.arcId))
+  o.log('')
+  o.log(`  token bill — ${cost.lines.length > 0 ? 'provider receipts' : 'no attempts recorded'}`)
+  for (const line of cost.lines) o.log(line)
+  if (cost.missing > 0) o.log(`  ! ${cost.missing} attempt(s) reported no usage receipt — every number above is a FLOOR.`)
 }

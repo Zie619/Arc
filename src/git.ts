@@ -58,6 +58,22 @@ export function untrackedFiles(repo: string): string[] {
   return out ? out.split('\n').filter(Boolean) : []
 }
 
+/** Tracked and untracked paths exactly as git sees them. NUL framing keeps
+ *  spaces and rename arrows in filenames from becoming staging syntax. */
+export function worktreeChanges(repo: string): string[] {
+  const out = git(repo, 'status', '--porcelain=v1', '-z', '--untracked-files=all')
+  if (!out) return []
+  const entries = out.split('\0')
+  const paths: string[] = []
+  for (let index = 0; index < entries.length; index++) {
+    const entry = entries[index]
+    if (!entry || entry.length < 4) continue
+    paths.push(entry.slice(3))
+    if (entry[0] === 'R' || entry[0] === 'C' || entry[1] === 'R' || entry[1] === 'C') index++
+  }
+  return paths
+}
+
 export interface Worktree {
   path: string
   branch: string

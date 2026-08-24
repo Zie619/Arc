@@ -10,6 +10,7 @@ if [ "$1" = "--help" ]; then
 fi
 MODEL="opus"; while [ $# -gt 0 ]; do case "$1" in --model) MODEL="$2"; shift 2;; *) shift;; esac; done
 PAYLOAD="$ARC_FAKE_PAYLOAD"
+CALL_INDEX=""
 [ -z "$PAYLOAD" ] && PAYLOAD='{"status":"done","noop":true,"noopReason":"fixture"}'
 # ARC_FAKE_QUEUE=<dir>: serve one payload per call, in order. The design phase
 # makes several different calls (extract -> charter -> scout plan -> report ->
@@ -23,12 +24,15 @@ if [ -n "$ARC_FAKE_QUEUE" ]; then
   while [ "$N" -lt 64 ]; do
     if mv "$ARC_FAKE_QUEUE/$N.json" "$ARC_FAKE_QUEUE/$N.taken.$$" 2>/dev/null; then
       PAYLOAD=$(cat "$ARC_FAKE_QUEUE/$N.taken.$$")
+      CALL_INDEX="$N"
       break
     fi
     N=$((N + 1))
   done
 fi
 REPORTED="${ARC_FAKE_MODEL:-$MODEL}"
+QUEUED_MODEL=$(printf '%s' "$PAYLOAD" | sed -n 's/.*"__model"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
+[ -n "$QUEUED_MODEL" ] && REPORTED="$QUEUED_MODEL"
 [ -n "$ARC_FAKE_NOINIT" ] && { echo '{"type":"system","subtype":"init"}'; exit 0; }
 # A numeric ARC_FAKE_HANG > 1 sets the sleep duration, so a test can pgrep for
 # ITS OWN hang instead of matching every "sleep 300" on the machine — two
@@ -43,6 +47,16 @@ case "$PAYLOAD" in
 esac
 echo '{"type":"system","subtype":"init"}'
 echo "{\"type\":\"assistant\",\"message\":{\"model\":\"$REPORTED\"}}"
+WRITE_AT=",${ARC_FAKE_WRITE_AT},"
+if [ -n "$ARC_FAKE_CLAUDE_WRITE" ] && { [ -z "$ARC_FAKE_WRITE_AT" ] || [[ "$WRITE_AT" = *",$CALL_INDEX,"* ]]; }; then
+  TARGET="$ARC_FAKE_CLAUDE_WRITE"
+  [ "$TARGET" = auto ] && TARGET="$(basename "$PWD")-generated.ts"
+  VALUE=1
+  [ -n "$CALL_INDEX" ] && VALUE=$((CALL_INDEX + 1))
+  printf 'export const x = %s\n' "$VALUE" > "$TARGET"
+  git add -- "$TARGET" >/dev/null 2>&1
+  git -c user.email=f@f.f -c user.name=fake commit -q -m "fake: $TARGET" >/dev/null 2>&1
+fi
 if [ -n "$ARC_FAKE_ERROR" ]; then
   echo "{\"type\":\"result\",\"subtype\":\"error\",\"is_error\":true,\"modelUsage\":{\"$REPORTED\":{}},\"result\":\"${ARC_FAKE_ERRTEXT:-}\"}"
   exit 1

@@ -149,6 +149,13 @@ export const ProjectConfig = z.object({
    * which is exactly how the first self-arc died.
    */
   setupCommand: z.string().optional(),
+  /** Operator-owned commands that close capability gaps in writer sandboxes
+   *  before project gates inspect generated artifacts. */
+  refreshCommands: z.array(z.object({
+    name: z.string(),
+    command: z.string(),
+    timeoutMs: z.number().int().positive().optional(),
+  })).optional(),
   /** Explicit rather than a record over the role enum: only `implement` is
    *  required, and naming each key gives a usable error when one is missing. */
   roles: z.object({
@@ -169,6 +176,8 @@ export const ProjectConfig = z.object({
   /** Inner loop bound: attempts, and wall clock checked BETWEEN attempts. */
   maxAttempts: z.number().int().positive().default(4),
   maxTaskMinutes: z.number().int().positive().default(90),
+  /** Provider capacity is weather, bounded separately from task work. */
+  capacityWaitMinutes: z.number().nonnegative().default(240),
 })
 export type ProjectConfig = z.infer<typeof ProjectConfig>
 

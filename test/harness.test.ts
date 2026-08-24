@@ -3,7 +3,7 @@ import { resolve, join, dirname } from 'node:path'
 import { readFileSync, existsSync } from 'node:fs'
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync, utimesSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { dispatch, extractJson, checkModel, auxiliaryModels, codexSessionModels } from '../src/harness.ts'
+import { dispatch, extractJson, checkModel, auxiliaryModels, codexSessionModels, capacityFailure } from '../src/harness.ts'
 import { resetHelpProbeCacheForTests } from '../src/provider-runtime.ts'
 import { TaskResult, type RoleBinding } from '../src/types.ts'
 
@@ -37,6 +37,21 @@ const codexRole: RoleBinding = {
 }
 
 describe('dispatch parses a real-shaped event stream', () => {
+  it('classifies only known cheaper substitutions and rate limits as capacity weather', () => {
+    expect(capacityFailure({
+      terminalReason: 'model-drift', observedModels: ['claude-haiku-4-5'], errorText: undefined,
+    }, 'claude', 'opus')).toMatchObject({ kind: 'model-substitution', observed: 'claude-haiku-4-5' })
+    expect(capacityFailure({
+      terminalReason: 'model-drift', observedModels: ['claude-opus-4-6'], errorText: undefined,
+    }, 'claude', 'sonnet')).toBeNull()
+    expect(capacityFailure({
+      terminalReason: 'provider-error', observedModels: [], errorText: 'HTTP 429: rate limit exceeded',
+    }, 'claude', 'opus')).toMatchObject({ kind: 'rate-limit' })
+    expect(capacityFailure({
+      terminalReason: 'ok', observedModels: ['claude-opus-4-6'], errorText: 'retried after 429, recovered',
+    }, 'claude', 'opus')).toBeNull()
+  })
+
   it('validates the envelope and reports the model claude actually used', async () => {
     process.env.ARC_FAKE_PAYLOAD = JSON.stringify({
       status: 'done', noop: false,

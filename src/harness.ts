@@ -305,7 +305,11 @@ export async function dispatch(o: DispatchOptions): Promise<DispatchResult> {
         }
         if (typeof d.result === 'string') finalText = d.result
         if (d.subtype && d.subtype !== 'success') facts.truncated = d.subtype === 'error_max_turns'
-        if (d.is_error === true) facts.sawTerminalMarker = false
+        if (d.is_error === true) {
+          facts.sawTerminalMarker = false
+          facts.providerError = true
+          if (typeof d.result === 'string' && d.result.length > providerErrorText.length) providerErrorText = d.result
+        }
         else facts.sawTerminalMarker = true
       }
     } else {
@@ -460,6 +464,10 @@ export async function dispatch(o: DispatchOptions): Promise<DispatchResult> {
     }
   }
 
+  const stderrText = stderrChunks.join('')
+  const capacityErrorText = /(?:\b429\b|rate[ -]?limit|usage[ -]?limit|overloaded)/i.test(stderrText)
+    ? stderrText.trim()
+    : ''
   const transcript = [
     `# arc dispatch — ${cli} ${o.role.model} (${o.role.sandbox})`,
     `# args: ${JSON.stringify(args)}`,
@@ -469,7 +477,7 @@ export async function dispatch(o: DispatchOptions): Promise<DispatchResult> {
     ...lines,
     '',
     '# ---- stderr ----',
-    stderrChunks.join(''),
+    stderrText,
   ].join('\n')
 
   return {
@@ -482,7 +490,7 @@ export async function dispatch(o: DispatchOptions): Promise<DispatchResult> {
     transcript,
     eventCount,
     durationMs: Date.now() - started,
-    errorText: providerErrorText || undefined,
+    errorText: providerErrorText || capacityErrorText || undefined,
     usage,
   }
   } finally {
@@ -650,4 +658,37 @@ export function sameModel(requested: string, observed: string): boolean {
 /** Models billed that were NOT what we asked for — worth showing, not fatal. */
 export function auxiliaryModels(requested: string, observed: string[]): string[] {
   return observed.filter((m) => !sameModel(requested, m))
+}
+
+export interface CapacityFailure {
+  kind: 'model-substitution' | 'rate-limit'
+  observed?: string
+  errorClass?: string
+}
+
+/** Claude Code may silently serve a cheaper family when the requested pool is
+ *  exhausted. This names only the substitutions observed in that provider;
+ *  every other mismatch remains ordinary model drift and fails closed. */
+export function capacityFailure(
+  result: Pick<DispatchResult, 'terminalReason' | 'observedModels' | 'errorText'>,
+  cli: 'codex' | 'claude',
+  requested: string,
+): CapacityFailure | null {
+  // A dispatch that ended 'ok' is evidence about the work; stderr retry noise
+  // carrying a rate-limit signature must never turn a success into weather.
+  if (result.terminalReason === 'ok') return null
+  if (cli === 'claude' && /(?:opus|fable)/i.test(requested)) {
+    const observed = result.observedModels.find((model) => /(?:haiku|sonnet)/i.test(model))
+    if (observed && !result.observedModels.some((model) => sameModel(requested, model))) {
+      return { kind: 'model-substitution', observed }
+    }
+  }
+  const error = result.errorText ?? ''
+  if (/(?:\b429\b|rate[ -]?limit|usage[ -]?limit|overloaded)/i.test(error)) {
+    const signature = error.match(/\b429\b/i) ? '429'
+      : error.match(/rate[ -]?limit/i) ? 'rate-limit'
+        : error.match(/usage[ -]?limit/i) ? 'usage-limit' : 'overloaded'
+    return { kind: 'rate-limit', errorClass: signature }
+  }
+  return null
 }

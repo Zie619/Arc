@@ -29,18 +29,24 @@ if [ -n "$ARC_FAKE_QUEUE" ]; then
   done
   CALL_INDEX="$N"
 fi
+case "$PAYLOAD" in
+  *'"__kill_parent"'*) kill -9 "$PPID"; exit 137;;
+esac
 echo '{"type":"thread.started","thread_id":"t1"}'
 echo '{"type":"turn.started"}'
 echo '{"type":"item.completed","item":{"text":"working"}}'
 [ -n "$ARC_FAKE_HANG" ] && case "$ARC_FAKE_HANG" in ''|1) sleep 300;; *) sleep "$ARC_FAKE_HANG";; esac
 # ARC_FAKE_WRITE=<file>: actually create and commit a file, so a full
 # orchestrator run can be exercised end to end without spending a token.
-if [ -n "$ARC_FAKE_WRITE" ] && { [ -z "$ARC_FAKE_WRITE_AT" ] || [ "$CALL_INDEX" = "$ARC_FAKE_WRITE_AT" ]; }; then
+WRITE_AT=",${ARC_FAKE_WRITE_AT},"
+if [ -n "$ARC_FAKE_WRITE" ] && { [ -z "$ARC_FAKE_WRITE_AT" ] || [[ "$WRITE_AT" = *",$CALL_INDEX,"* ]]; }; then
   TARGET="$ARC_FAKE_WRITE"
   # "auto" -> a filename unique to this worktree, so parallel fixtures touch
   # disjoint files exactly as two real independent tasks would.
   [ "$TARGET" = auto ] && TARGET="$(basename "$PWD")-generated.ts"
-  printf 'export const x = 1\n' > "$TARGET"
+  VALUE=1
+  [ -n "$CALL_INDEX" ] && VALUE=$((CALL_INDEX + 1))
+  printf 'export const x = %s\n' "$VALUE" > "$TARGET"
   git add -- "$TARGET" >/dev/null 2>&1
   git -c user.email=f@f.f -c user.name=fake commit -q -m "fake: $TARGET" >/dev/null 2>&1
 fi

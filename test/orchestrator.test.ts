@@ -18,6 +18,12 @@ let repo: string
 let home: string
 let originalPath: string | undefined
 const logs: string[] = []
+const sandboxUsable = process.platform !== 'darwin' || (() => {
+  try {
+    execFileSync('/usr/bin/sandbox-exec', ['-p', '(version 1)(allow default)', '/usr/bin/true'], { stdio: 'ignore' })
+    return true
+  } catch { return false }
+})()
 
 function sh(cwd: string, ...args: string[]): string {
   return execFileSync('git', args, { cwd, encoding: 'utf8' }).trim()
@@ -51,6 +57,8 @@ afterEach(() => {
   delete process.env.ARC_FAKE_QUEUE
   delete process.env.ARC_FAKE_WRITE_AT
   delete process.env.ARC_FAKE_MODEL
+  delete process.env.ARC_FAKE_CLAUDE_WRITE
+  delete process.env.ARC_CAPACITY_BACKOFF_MS
   rmSync(repo, { recursive: true, force: true })
   rmSync(home, { recursive: true, force: true })
 })
@@ -89,6 +97,159 @@ function plan(tasks: any[]): Plan {
 const log = (l: string) => { logs.push(l); if (process.env.ARC_TEST_VERBOSE) console.log(l) }
 
 describe('the orchestrator, end to end', () => {
+  it('waits out cheaper-model capacity weather and discards every substituted result', async () => {
+    const queue = join(home, 'queue-capacity')
+    mkdirSync(queue)
+    const payloads = [
+      {
+        status: 'done', noop: false,
+        shipped: [{ path: 'generated.ts', whatChanged: 'created' }],
+        criteria: [{ id: 'c1', claimedTier: 'checked', evidence: 'fixture ran' }],
+      },
+      { __model: 'claude-haiku-4-5', risks: [{ id: 'impostor-1', text: 'discard me', howToCheck: 'never' }] },
+      { __model: 'claude-sonnet-4-6', risks: [{ id: 'impostor-2', text: 'discard me too', howToCheck: 'never' }] },
+      { risks: [{ id: 'real', text: 'real risk', howToCheck: 'inspect' }] },
+      { verdict: 'PASS', findings: [], criteriaAssessment: [], seamRisks: [] },
+    ]
+    payloads.forEach((payload, index) => writeFileSync(join(queue, `${index}.json`), JSON.stringify(payload)))
+    process.env.ARC_FAKE_QUEUE = queue
+    process.env.ARC_FAKE_WRITE_AT = '0,3'
+    process.env.ARC_CAPACITY_BACKOFF_MS = '20'
+    delete process.env.ARC_FAKE_PAYLOAD
+
+    const roles = {
+      implement: { cli: 'codex', model: 'gpt-5.6-sol', sandbox: 'workspace-write', timeoutMs: 20000, stallMs: 15000 },
+      review: { cli: 'claude', model: 'opus', sandbox: 'read-only', timeoutMs: 20000, stallMs: 15000 },
+    }
+    const store = new Store(home)
+    await runArc({ store, plan: plan([task('weather')]), config: config({ landStrategy: 'none', roles }), log })
+
+    expect(store.allTasks('e2e')[0]!.state).toBe('landed')
+    expect(store.eventsSince('e2e', 0).filter((event) => event.kind === 'capacity.wait')).toHaveLength(2)
+    const reviews = store.attemptsFor('e2e', 'weather').filter((attempt) => attempt.role === 'review')
+    expect(reviews.map((attempt) => attempt.terminal_reason)).toEqual(['model-drift', 'model-drift', 'ok', 'ok'])
+    const reviewBrief = store.artifactsFor('e2e', 'brief')
+      .map((artifact) => readFileSync(String(store.artifactPath(String(artifact.id))), 'utf8'))
+      .find((brief) => brief.includes('# REVIEW'))
+    expect(reviewBrief).toContain('real risk')
+    expect(reviewBrief).not.toContain('discard me')
+    store.close()
+  }, 60_000)
+
+  it('fails honestly when the capacity wait budget is exhausted', async () => {
+    const queue = join(home, 'queue-capacity-exhausted')
+    mkdirSync(queue)
+    const payloads = [
+      {
+        status: 'done', noop: false,
+        shipped: [{ path: 'generated.ts', whatChanged: 'created' }],
+        criteria: [{ id: 'c1', claimedTier: 'checked', evidence: 'fixture ran' }],
+      },
+      { __model: 'claude-haiku-4-5', risks: [] },
+    ]
+    payloads.forEach((payload, index) => writeFileSync(join(queue, `${index}.json`), JSON.stringify(payload)))
+    process.env.ARC_FAKE_QUEUE = queue
+    process.env.ARC_FAKE_WRITE_AT = '0,3'
+    process.env.ARC_CAPACITY_BACKOFF_MS = '20'
+    delete process.env.ARC_FAKE_PAYLOAD
+
+    const roles = {
+      implement: { cli: 'codex', model: 'gpt-5.6-sol', sandbox: 'workspace-write', timeoutMs: 20000, stallMs: 15000 },
+      review: { cli: 'claude', model: 'opus', sandbox: 'read-only', timeoutMs: 20000, stallMs: 15000 },
+    }
+    const store = new Store(home)
+    await runArc({ store, plan: plan([task('no-capacity')]), config: config({ landStrategy: 'none', roles, capacityWaitMinutes: 0 }), log })
+
+    expect(store.allTasks('e2e')[0]!.state).toBe('failed')
+    expect(logs.join('\n')).toMatch(/claude.*capacity.*0 minute/i)
+    expect(store.eventsSince('e2e', 0).some((event) => event.kind === 'capacity.exhausted')).toBe(true)
+    store.close()
+  }, 60_000)
+
+  it('removes commits produced by a substituted implementer before retrying', async () => {
+    const queue = join(home, 'queue-capacity-implement')
+    mkdirSync(queue)
+    const result = {
+      status: 'done', noop: false,
+      shipped: [{ path: 'generated.ts', whatChanged: 'created' }],
+      criteria: [{ id: 'c1', claimedTier: 'checked', evidence: 'fixture ran' }],
+    }
+    writeFileSync(join(queue, '0.json'), JSON.stringify({ ...result, __model: 'claude-haiku-4-5' }))
+    writeFileSync(join(queue, '1.json'), JSON.stringify(result))
+    process.env.ARC_FAKE_QUEUE = queue
+    process.env.ARC_FAKE_CLAUDE_WRITE = 'generated.ts'
+    process.env.ARC_FAKE_WRITE_AT = '0,1'
+    process.env.ARC_CAPACITY_BACKOFF_MS = '20'
+    delete process.env.ARC_FAKE_PAYLOAD
+
+    const roles = {
+      implement: { cli: 'claude', model: 'opus', sandbox: 'workspace-write', timeoutMs: 20000, stallMs: 15000 },
+    }
+    const store = new Store(home)
+    await runArc({ store, plan: plan([task('discard-impostor')]), config: config({ landStrategy: 'none', roles }), log })
+
+    expect(store.allTasks('e2e')[0]!.state).toBe('landed')
+    expect(sh(repo, 'show', 'arc/e2e-integration:generated.ts')).toContain('x = 2')
+    expect(sh(repo, 'rev-list', '--count', `${sh(repo, 'rev-parse', 'main')}..arc/e2e-integration`)).toBe('1')
+    expect(store.eventsSince('e2e', 0).some((event) => event.kind === 'capacity.discard')).toBe(true)
+    store.close()
+  }, 60_000)
+
+  it('refuses wave one when preflight observes a cheaper substitute without supervision', async () => {
+    const queue = join(home, 'queue-preflight-refusal')
+    mkdirSync(queue)
+    writeFileSync(join(queue, '0.json'), JSON.stringify({ ok: true }))
+    writeFileSync(join(queue, '1.json'), JSON.stringify({ __model: 'claude-haiku-4-5', ok: true }))
+    process.env.ARC_FAKE_QUEUE = queue
+    delete process.env.ARC_FAKE_PAYLOAD
+
+    const roles = {
+      implement: { cli: 'codex', model: 'gpt-5.6-sol', sandbox: 'workspace-write', timeoutMs: 20000, stallMs: 15000 },
+      review: { cli: 'claude', model: 'opus', sandbox: 'read-only', timeoutMs: 20000, stallMs: 15000 },
+    }
+    const store = new Store(home)
+    await runArc({
+      store, plan: plan([task('not-started')]),
+      config: config({ landStrategy: 'none', roles }), log, preflight: true,
+    })
+
+    expect(store.getArc('e2e')?.status).toBe('incomplete')
+    expect(store.allTasks('e2e')[0]!.state).toBe('pending')
+    expect(store.eventsSince('e2e', 0).some((event) => event.kind === 'preflight.refused')).toBe(true)
+    expect(store.attemptsFor('e2e', 'not-started')).toHaveLength(0)
+    store.close()
+  }, 60_000)
+
+  it('waits for the requested model during supervised preflight', async () => {
+    const queue = join(home, 'queue-preflight-wait')
+    mkdirSync(queue)
+    const payloads = [
+      { __model: 'claude-haiku-4-5', ok: true },
+      { ok: true },
+      { status: 'done', noop: true, noopReason: 'preflight recovered' },
+    ]
+    payloads.forEach((payload, index) => writeFileSync(join(queue, `${index}.json`), JSON.stringify(payload)))
+    process.env.ARC_FAKE_QUEUE = queue
+    process.env.ARC_CAPACITY_BACKOFF_MS = '20'
+    delete process.env.ARC_FAKE_PAYLOAD
+    delete process.env.ARC_FAKE_WRITE
+
+    const roles = {
+      implement: { cli: 'claude', model: 'opus', sandbox: 'workspace-write', timeoutMs: 20000, stallMs: 15000 },
+    }
+    const store = new Store(home)
+    await runArc({
+      store, plan: plan([task('starts-after-wait')]),
+      config: config({ landStrategy: 'none', roles }), log,
+      preflight: true, waitForPreflightCapacity: true,
+    })
+
+    expect(store.getArc('e2e')?.status).toBe('done')
+    expect(store.eventsSince('e2e', 0).some((event) => event.kind === 'capacity.wait' && event.taskId === null)).toBe(true)
+    expect(store.allTasks('e2e')[0]!.state).toBe('landed')
+    store.close()
+  }, 60_000)
+
   it('runs two independent tasks IN PARALLEL and lands both', async () => {
     const store = new Store(home)
     const products: any[] = []
@@ -165,6 +326,27 @@ describe('the orchestrator, end to end', () => {
     store.close()
   })
 
+  it('skips integration review when every task failed and includes the bill', async () => {
+    const roles = {
+      implement: { cli: 'codex', model: 'gpt-5.6-sol', sandbox: 'workspace-write', timeoutMs: 20000, stallMs: 15000 },
+      integrate: { cli: 'claude', model: 'opus', sandbox: 'read-only', timeoutMs: 20000, stallMs: 15000 },
+    }
+    const store = new Store(home)
+    await runArc({
+      store,
+      plan: plan([task('all-red', { gates: ['red'] })]),
+      config: config({ landStrategy: 'none', roles, gates: [{ name: 'red', command: 'false', proves: 'forced failure' }] }),
+      log,
+    })
+
+    expect(store.allTasks('e2e')[0]!.state).toBe('failed')
+    expect(store.eventsSince('e2e', 0).some((event) => event.kind === 'attempt.start' &&
+      (event.payload as { role: string }).role === 'integrate')).toBe(false)
+    expect(logs.join('\n')).toContain('nothing landed — skipping integration review')
+    expect(logs.join('\n')).toContain('token bill — provider receipts')
+    store.close()
+  }, 60_000)
+
   it('leaves no worktree or branch behind after a landed task, so it can re-run', async () => {
     const store = new Store(home)
     await runArc({ store, plan: plan([task('reruns')]), config: config(), log })
@@ -210,7 +392,7 @@ describe('the orchestrator, end to end', () => {
     }))
     process.env.ARC_FAKE_QUEUE = queue
     process.env.ARC_FAKE_WRITE_AT = '0'
-    process.env.ARC_FAKE_MODEL = 'sonnet'
+    process.env.ARC_FAKE_MODEL = 'claude-unknown-1'
     delete process.env.ARC_FAKE_PAYLOAD
 
     const roles = {
@@ -226,7 +408,7 @@ describe('the orchestrator, end to end', () => {
     store.close()
   }, 60_000)
 
-  it('runs reviewer checkCommand and attaches its output to the exact finding', async () => {
+  it.skipIf(!sandboxUsable)('runs reviewer checkCommand and attaches its output to the exact finding', async () => {
     const queue = join(home, 'queue-review-check')
     mkdirSync(queue)
     const payloads = [
@@ -241,7 +423,7 @@ describe('the orchestrator, end to end', () => {
         findings: [{
           severity: 'minor', file: 'generated.ts', line: 1,
           claim: 'the generated file exists', failureScenario: 'missing file',
-          suggestedFix: null, checkCommand: 'test -n "$(git diff-tree --no-commit-id --name-only -r HEAD)"',
+          suggestedFix: null, checkCommand: 'test -f generated.ts',
         }],
         criteriaAssessment: [{ id: 'c1', met: true, evidence: 'command proof already ran' }],
         seamRisks: [],
@@ -251,6 +433,8 @@ describe('the orchestrator, end to end', () => {
     payloads.forEach((payload, index) => writeFileSync(join(queue, `${index}.json`), JSON.stringify(payload)))
     process.env.ARC_FAKE_QUEUE = queue
     process.env.ARC_FAKE_WRITE_AT = '0'
+    // The checkCommand names this exact file; "auto" would write a worktree-unique one.
+    process.env.ARC_FAKE_WRITE = 'generated.ts'
     delete process.env.ARC_FAKE_PAYLOAD
 
     const roles = {
@@ -292,6 +476,57 @@ describe('the orchestrator, end to end', () => {
     expect(store.allTasks('e2e')[0]!.state).toBe('landed')
     const setupGate = store.gatesFor('e2e', 'setup-ok').find((gate) => gate.name === 'worktree-setup')
     expect(setupGate?.verdict).toBe('pass')
+    store.close()
+  }, 60_000)
+
+  it('commits post-implement refresh output before gates inspect it', async () => {
+    const store = new Store(home)
+    await runArc({
+      store,
+      plan: plan([task('refreshes', { gates: ['refreshed'] })]),
+      config: config({
+        landStrategy: 'none',
+        refreshCommands: [{ name: 'generated-types', command: "printf 'fresh\\n' > refreshed.txt" }],
+        gates: [{ name: 'refreshed', command: "test \"$(cat refreshed.txt)\" = fresh && git diff --quiet", proves: 'refresh output is committed' }],
+      }),
+      log,
+    })
+
+    expect(store.allTasks('e2e')[0]!.state).toBe('landed')
+    expect(sh(repo, 'log', '--format=%s', 'arc/e2e-integration')).toContain('refresh: generated-types')
+    expect(sh(repo, 'show', 'arc/e2e-integration:refreshed.txt')).toBe('fresh')
+    expect(store.gatesFor('e2e', 'refreshes').some((gate) => gate.name === 'refresh:generated-types' && gate.verdict === 'pass')).toBe(true)
+    store.close()
+  }, 60_000)
+
+  it('feeds a named refresh failure and its output into the next attempt', async () => {
+    const queue = join(home, 'queue-refresh-failure')
+    mkdirSync(queue)
+    const payload = {
+      status: 'done', noop: false,
+      shipped: [{ path: 'generated.ts', whatChanged: 'created' }],
+      criteria: [{ id: 'c1', claimedTier: 'checked', evidence: 'fixture ran' }],
+    }
+    writeFileSync(join(queue, '0.json'), JSON.stringify(payload))
+    writeFileSync(join(queue, '1.json'), JSON.stringify(payload))
+    process.env.ARC_FAKE_QUEUE = queue
+    delete process.env.ARC_FAKE_PAYLOAD
+
+    const store = new Store(home)
+    await runArc({
+      store, plan: plan([task('refresh-fails')]),
+      config: config({
+        landStrategy: 'none', maxAttempts: 2,
+        refreshCommands: [{ name: 'db-types', command: 'echo docker daemon unavailable; false' }],
+      }),
+      log,
+    })
+
+    expect(store.allTasks('e2e')[0]!.state).toBe('failed')
+    const briefs = store.artifactsFor('e2e', 'brief').map((artifact) =>
+      readFileSync(String(store.artifactPath(String(artifact.id))), 'utf8'))
+    expect(briefs[0]).toContain('db-types')
+    expect(briefs[0]).toContain('docker daemon unavailable')
     store.close()
   }, 60_000)
 
@@ -534,12 +769,11 @@ describe('CHANGES_REQUIRED buys a repair round, not a burial', () => {
         shipped: [{ path: 'generated.ts', whatChanged: 'added the policy' }],
         criteria: [{ id: 'c1', claimedTier: 'checked', evidence: 'fixture ran again' }],
       },
-      { risks: [{ id: 'r1', text: 'risk', howToCheck: 'look' }] },
       { verdict: 'PASS', findings: [], criteriaAssessment: [], seamRisks: [] },
     ]
     payloads.forEach((payload, index) => writeFileSync(join(queue, `${index}.json`), JSON.stringify(payload)))
     process.env.ARC_FAKE_QUEUE = queue
-    process.env.ARC_FAKE_WRITE_AT = '0'
+    process.env.ARC_FAKE_WRITE_AT = '0,3'
     delete process.env.ARC_FAKE_PAYLOAD
 
     const roles = {
@@ -557,6 +791,87 @@ describe('CHANGES_REQUIRED buys a repair round, not a burial', () => {
     const { readFileSync: rf } = await import('node:fs')
     const texts = briefs.map((b) => rf(String(store.artifactPath(String(b.id))), 'utf8'))
     expect(texts.some((t) => t.includes('no INSERT policy on the new table'))).toBe(true)
+    store.close()
+  }, 60_000)
+
+  it('lands after repair when the second review has only minor findings and scopes the brief to the fix', async () => {
+    const queue = join(home, 'queue-repair-minor')
+    mkdirSync(queue)
+    const payloads = [
+      {
+        status: 'done', noop: false,
+        shipped: [{ path: 'generated.ts', whatChanged: 'created' }],
+        criteria: [{ id: 'c1', claimedTier: 'checked', evidence: 'fixture ran' }],
+      },
+      { risks: [{ id: 'r1', text: 'risk', howToCheck: 'look' }] },
+      {
+        verdict: 'CHANGES_REQUIRED',
+        findings: [{ severity: 'major', file: 'generated.ts', line: 1, claim: 'needs a repair', failureScenario: 'breaks', suggestedFix: 'repair it' }],
+        criteriaAssessment: [], seamRisks: [],
+      },
+      {
+        status: 'done', noop: false,
+        shipped: [{ path: 'generated.ts', whatChanged: 'repaired' }],
+        criteria: [{ id: 'c1', claimedTier: 'checked', evidence: 'fixture ran again' }],
+      },
+      {
+        verdict: 'CHANGES_REQUIRED',
+        findings: [{ severity: 'minor', file: 'generated.ts', line: 1, claim: 'small note remains', failureScenario: 'cosmetic', suggestedFix: null }],
+        criteriaAssessment: [], seamRisks: [],
+      },
+    ]
+    payloads.forEach((payload, index) => writeFileSync(join(queue, `${index}.json`), JSON.stringify(payload)))
+    process.env.ARC_FAKE_QUEUE = queue
+    process.env.ARC_FAKE_WRITE_AT = '0,3'
+    delete process.env.ARC_FAKE_PAYLOAD
+
+    const roles = {
+      implement: { cli: 'codex', model: 'gpt-5.6-sol', sandbox: 'workspace-write', timeoutMs: 20000, stallMs: 15000 },
+      review: { cli: 'claude', model: 'opus', sandbox: 'read-only', timeoutMs: 20000, stallMs: 15000 },
+    }
+    const store = new Store(home)
+    await runArc({ store, plan: plan([task('minor-after-repair')]), config: config({ landStrategy: 'none', roles }), log })
+
+    expect(store.allTasks('e2e')[0]!.state).toBe('landed')
+    expect(store.findingsFor('e2e').some((finding) => String(finding.text).includes('small note remains'))).toBe(true)
+    const briefs = store.artifactsFor('e2e', 'brief').map((artifact) =>
+      readFileSync(String(store.artifactPath(String(artifact.id))), 'utf8'))
+    const repairReview = briefs.find((brief) => brief.includes('# REPAIR REVIEW'))
+    expect(repairReview).toContain('CHANGES_REQUIRED')
+    expect(repairReview).toContain('needs a repair')
+    expect(repairReview).toContain('diff --git')
+    store.close()
+  }, 60_000)
+
+  it('fails after repair when the second review retains a critical finding', async () => {
+    const queue = join(home, 'queue-repair-critical')
+    mkdirSync(queue)
+    const baseResult = {
+      status: 'done', noop: false,
+      shipped: [{ path: 'generated.ts', whatChanged: 'changed' }],
+      criteria: [{ id: 'c1', claimedTier: 'checked', evidence: 'fixture ran' }],
+    }
+    const payloads = [
+      baseResult,
+      { risks: [] },
+      { verdict: 'CHANGES_REQUIRED', findings: [{ severity: 'major', file: 'generated.ts', line: 1, claim: 'repair me', failureScenario: 'breaks', suggestedFix: 'fix' }], criteriaAssessment: [], seamRisks: [] },
+      baseResult,
+      { verdict: 'PASS_WITH_NOTES', findings: [{ severity: 'critical', file: 'generated.ts', line: 1, claim: 'still unsafe', failureScenario: 'data loss', suggestedFix: 'fix' }], criteriaAssessment: [], seamRisks: [] },
+    ]
+    payloads.forEach((payload, index) => writeFileSync(join(queue, `${index}.json`), JSON.stringify(payload)))
+    process.env.ARC_FAKE_QUEUE = queue
+    process.env.ARC_FAKE_WRITE_AT = '0,3'
+    delete process.env.ARC_FAKE_PAYLOAD
+
+    const roles = {
+      implement: { cli: 'codex', model: 'gpt-5.6-sol', sandbox: 'workspace-write', timeoutMs: 20000, stallMs: 15000 },
+      review: { cli: 'claude', model: 'opus', sandbox: 'read-only', timeoutMs: 20000, stallMs: 15000 },
+    }
+    const store = new Store(home)
+    await runArc({ store, plan: plan([task('critical-after-repair')]), config: config({ landStrategy: 'none', roles }), log })
+
+    expect(store.allTasks('e2e')[0]!.state).toBe('failed')
+    expect(logs.join('\n')).toContain('critical')
     store.close()
   }, 60_000)
 })
