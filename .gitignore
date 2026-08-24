@@ -3,3 +3,4 @@ dist/
 *.tsbuildinfo
 .arc/
 test/.tmp/
+HANDOFF-*.md
