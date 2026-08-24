@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import { readFileSync, readdirSync, existsSync, statSync, writeFileSync } from 'node:fs'
 import { resolve, join } from 'node:path'
-import { spawnSync } from 'node:child_process'
+import { spawn, spawnSync } from 'node:child_process'
 import { parse as parseYaml, stringify as toYaml } from 'yaml'
 import { Store } from './store.ts'
 import { Plan, ProjectConfig, TIER_RANK, type ClaimTier } from './types.ts'
@@ -16,6 +16,7 @@ import { tmpdir } from 'node:os'
 import { runInterview, runScouts, runPlanner, type Ask } from './design.ts'
 import { createInterface } from 'node:readline/promises'
 import { doctorProviders } from './provider-runtime.ts'
+import { formatCostSummary } from './cost.ts'
 
 const C = {
   dim: (s: string) => `\x1b[2m${s}\x1b[0m`,
@@ -122,6 +123,127 @@ function stateRoot(config: ProjectConfig): string {
   return process.env.ARC_HOME ?? join(process.env.HOME ?? '.', '.arc', config.name)
 }
 
+let activeRun: { store: Store; arcId: string } | null = null
+let crashRecorded = false
+
+function errorRecord(reason: unknown): { message: string; stack: string } {
+  const error = reason instanceof Error ? reason : new Error(String(reason))
+  return {
+    message: error.message.slice(0, 800),
+    stack: (error.stack ?? error.message).split('\n').slice(0, 12).join('\n').slice(0, 4_000),
+  }
+}
+
+function recordActiveCrash(reason: unknown): void {
+  if (!activeRun || crashRecorded) return
+  crashRecorded = true
+  try { activeRun.store.appendEvent(activeRun.arcId, 'arc.crash', errorRecord(reason)) } catch { /* stderr remains the final fallback */ }
+}
+
+function beginActiveRun(store: Store, arcId: string): void {
+  activeRun = { store, arcId }
+  crashRecorded = false
+}
+
+function endActiveRun(): void {
+  activeRun = null
+  crashRecorded = false
+}
+
+process.on('unhandledRejection', (reason) => {
+  recordActiveCrash(reason)
+  console.error(C.red('✗ ') + errorRecord(reason).message)
+  try { activeRun?.store.close() } catch { /* process termination is already committed */ }
+  process.exit(1)
+})
+
+process.on('uncaughtException', (error) => {
+  recordActiveCrash(error)
+  console.error(C.red('✗ ') + errorRecord(error).message)
+  try { activeRun?.store.close() } catch { /* process termination is already committed */ }
+  process.exit(1)
+})
+
+interface SupervisedExit {
+  code: number | null
+  signal: NodeJS.Signals | null
+  error?: string
+}
+
+function supervisorArgs(mode: 'run' | 'resume', planPath: string, configPath?: string): string[] {
+  const args = [resolve(process.argv[1]!), mode, planPath]
+  if (configPath) args.push('--config', configPath)
+  const repo = flag(process.argv.slice(2), '--repo')
+  if (repo) args.push('--repo', resolve(repo))
+  return args
+}
+
+async function launchSupervisedChild(
+  mode: 'run' | 'resume', planPath: string, configPath?: string,
+): Promise<SupervisedExit> {
+  const nodeArgs = supervisorArgs(mode, planPath, configPath)
+  const hasCaffeinate = process.platform === 'darwin' && spawnSync('which', ['caffeinate'], { stdio: 'ignore' }).status === 0
+  const command = hasCaffeinate ? 'caffeinate' : process.execPath
+  const args = hasCaffeinate ? ['-dims', process.execPath, ...nodeArgs] : nodeArgs
+  return await new Promise((resolveExit) => {
+    let settled = false
+    const finish = (result: SupervisedExit): void => {
+      if (settled) return
+      settled = true
+      resolveExit(result)
+    }
+    const child = spawn(command, args, {
+      cwd: process.cwd(), stdio: 'inherit',
+      env: { ...process.env, ARC_UNTIL_DONE_CHILD: '1' },
+    })
+    child.on('error', (error) => finish({ code: null, signal: null, error: error.message }))
+    child.on('exit', (code, signal) => finish({ code, signal }))
+  })
+}
+
+async function superviseRun(
+  store: Store, plan: Plan, planPath: string, configPath?: string,
+): Promise<number> {
+  const crashes: Array<SupervisedExit & { event?: unknown }> = []
+  const delay = Number(process.env.ARC_SUPERVISOR_BACKOFF_MS)
+  const relaunchDelayMs = Number.isFinite(delay) && delay >= 0 ? delay : 15_000
+  let mode: 'run' | 'resume' = 'run'
+  let relaunches = 0
+
+  for (;;) {
+    const result = await launchSupervisedChild(mode, planPath, configPath)
+    const arc = store.getArc(plan.arcId)
+    if (arc?.status === 'done') return 0
+    if (arc?.status !== 'running') return result.code ?? 2
+
+    const last = store.eventsSince(plan.arcId, 0).at(-1)
+    crashes.push({ ...result, event: last ? { kind: last.kind, payload: last.payload } : undefined })
+    console.error(C.yellow(`! run child ${result.signal ? `died on ${result.signal}` : `exited ${result.code ?? 'without a code'}`} while arc is still running${result.error ? ` — ${result.error}` : ''}`))
+    if (last) console.error(C.dim(`  last event: ${last.kind} ${JSON.stringify(last.payload).slice(0, 300)}`))
+
+    if (relaunches >= 10) {
+      store.appendEvent(plan.arcId, 'arc.supervisor.exhausted', { relaunches, crashes })
+      store.closeArc(plan.arcId, 'incomplete')
+      console.error(C.red(`✗ relaunch cap reached after ${crashes.length} crash(es); arc is INCOMPLETE`))
+      crashes.forEach((crash, index) => console.error(`  ${index + 1}. code=${crash.code ?? 'null'} signal=${crash.signal ?? 'none'} last=${JSON.stringify(crash.event ?? null)}`))
+      const cost = formatCostSummary(store.costSummary(plan.arcId))
+      console.error('  token bill — ' + (cost.lines.length > 0 ? 'provider receipts' : 'no attempts recorded'))
+      for (const line of cost.lines) console.error(line)
+      if (cost.missing > 0) console.error(`  ! ${cost.missing} attempt(s) reported no usage receipt — every number above is a FLOOR.`)
+      return 2
+    }
+
+    relaunches++
+    store.appendEvent(plan.arcId, 'arc.supervisor.relaunch', {
+      relaunch: relaunches, delayMs: relaunchDelayMs,
+      code: result.code, signal: result.signal, lastEvent: last?.kind,
+    })
+    console.error(C.dim(`  relaunching through resume in ${Math.round(relaunchDelayMs / 1000)}s (${relaunches}/10)`))
+    await new Promise((resolveDelay) => setTimeout(resolveDelay, relaunchDelayMs))
+    mode = 'resume'
+  }
+}
+
 const USAGE = `
 ${C.bold('arc')} — point it at a repo, describe what you want, walk away.
 
@@ -158,6 +280,7 @@ ${C.bold('Plumbing — arc "..." already runs all of these for you:')}
 
 Options:
   --danger        no approval stops: take every recommendation, run the plan
+  --until-done    supervise arc run, prevent sleep, and resume after crashes
   --config <p>    use a specific config instead of auto-detection
   --id <name>     name the arc (default: derived from your brief)
   --version, -V   print the installed arc version
@@ -304,8 +427,25 @@ async function main(): Promise<void> {
   try {
     switch (cmd) {
       case 'run': {
-        const plan = loadPlan(resolve(positional[0] ?? 'plan.yaml'))
-        await runArc({ store, plan, config, log: (l) => console.log(l) })
+        const planPath = resolve(positional[0] ?? 'plan.yaml')
+        const plan = loadPlan(planPath)
+        if (argv.includes('--until-done') && process.env.ARC_UNTIL_DONE_CHILD !== '1') {
+          const code = await superviseRun(store, plan, planPath, configPath)
+          if (code !== 0) { store.close(); process.exit(code) }
+          break
+        }
+        beginActiveRun(store, plan.arcId)
+        try {
+          await runArc({
+            store, plan, config, log: (l) => console.log(l), preflight: true,
+            waitForPreflightCapacity: process.env.ARC_UNTIL_DONE_CHILD === '1',
+          })
+        } catch (error) {
+          recordActiveCrash(error)
+          throw error
+        } finally {
+          endActiveRun()
+        }
         // Exit non-zero on an incomplete arc. A caller that cannot tell success
         // from failure by exit code is exactly how a false "done" propagates.
         if (store.getArc(plan.arcId)?.status !== 'done') { store.close(); process.exit(2) }
@@ -393,7 +533,15 @@ async function main(): Promise<void> {
           plan = stored!
         }
         if (!store.getArc(plan.arcId)) die(`no arc "${plan.arcId}" to resume — use \`run\``)
-        await runArc({ store, plan, config, log: (l) => console.log(l), resume: true })
+        beginActiveRun(store, plan.arcId)
+        try {
+          await runArc({ store, plan, config, log: (l) => console.log(l), resume: true, preflight: true })
+        } catch (error) {
+          recordActiveCrash(error)
+          throw error
+        } finally {
+          endActiveRun()
+        }
         if (store.getArc(plan.arcId)?.status !== 'done') { store.close(); process.exit(2) }
         break
       }
@@ -449,15 +597,8 @@ async function main(): Promise<void> {
         if (rows.length === 0) { console.log('no attempts recorded for this arc'); break }
         console.log(C.bold(`token bill — arc ${arcId}`))
         console.log('')
-        const fmt = (n: number | null) => n == null || n === 0 ? '—' : n >= 1_000_000 ? `${(n / 1_000_000).toFixed(2)}M` : n >= 1_000 ? `${Math.round(n / 1_000)}K` : String(n)
-        let missing = 0
-        for (const r of rows) {
-          const mins = Math.round(Number(r.wall_ms) / 60_000)
-          missing += Number(r.attempts) - Number(r.receipted)
-          console.log(`  ${String(r.role).padEnd(10)} ${String(r.cli).padEnd(7)} ${String(r.attempts).padStart(2)} attempt(s)  ${String(mins).padStart(4)}min  ` +
-            `in ${fmt(r.input_tokens).padStart(7)} (${fmt(r.cached_input_tokens)} cached)  out ${fmt(r.output_tokens).padStart(6)}  reasoning ${fmt(r.reasoning_tokens)}` +
-            (r.cost_usd ? `  $${Number(r.cost_usd).toFixed(2)}` : ''))
-        }
+        const { lines, missing } = formatCostSummary(rows)
+        for (const line of lines) console.log(line)
         if (missing > 0) {
           console.log('')
           console.log(C.yellow(`  ! ${missing} attempt(s) reported no usage receipt — every number above is a FLOOR.`))
