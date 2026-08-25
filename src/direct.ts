@@ -5,7 +5,8 @@ import { tmpdir } from 'node:os'
 import { join, relative, resolve } from 'node:path'
 import { dispatch, checkModel, modelCheckMode, sameModel, type DispatchOptions, type DispatchResult } from './harness.ts'
 import { git, headSha } from './git.ts'
-import { checkOutcome, describe, isSubsetOfBaseline, runGate, selectGates, type GateResult } from './gates.ts'
+import { describe, isSubsetOfBaseline, runGate, selectGates, type GateResult } from './gates.ts'
+import { checkReviewFinding, type FindingOutcome } from './finding-check.ts'
 import { signaturesMatch } from './classify.ts'
 import {
   RiskChecklist,
@@ -73,9 +74,13 @@ export interface DirectFindingCheck {
   line: number
   claim: string
   command: string
-  /** False when the operator declined to run reviewer-authored commands. */
+  /** False when the operator declined, or when the command could not execute
+   *  at all. Both are "no evidence", never "the defect is not there". */
   ran: boolean
   reproduced: boolean
+  outcome: FindingOutcome
+  /** Honest limits of this check — an unsandboxed run, a command that never started. */
+  caveats: string[]
   result: GateResult | null
 }
 
@@ -721,34 +726,22 @@ async function runDirectFrom(
     ? true
     : await options.confirmFindingChecks(commandFindings.map(finding => finding.checkCommand!))
   for (const finding of commandFindings) {
-    if (!checksApproved) {
-      findingChecks.push({
-        file: finding.file, line: finding.line, claim: finding.claim,
-        command: finding.checkCommand!, ran: false, reproduced: false, result: null,
-      })
-      continue
-    }
-    const result = await dependencies.runGate({
+    const check = await checkReviewFinding(finding, repo, before.head, {
       name: `direct-review:${finding.file}:${finding.line}`,
-      command: finding.checkCommand!,
-      proves: finding.claim,
-      cwd: '.',
-      timeoutMs: 300_000,
-      heavy: false,
-      baselineSubset: false,
-      readOnly: true,
-    }, repo, before.head, options.signal)
+      sandboxPolicy: options.config.sandboxPolicy,
+      signal: options.signal,
+      declined: !checksApproved,
+    })
     findingChecks.push({
       file: finding.file,
       line: finding.line,
       claim: finding.claim,
       command: finding.checkCommand!,
-      // `ran` is FALSE when the command could not execute at all — a missing
-      // binary, a sandbox that refused to launch. That is not "did not
-      // reproduce"; it is no evidence either way.
-      ran: checkOutcome(result) !== 'could-not-run',
-      reproduced: result.pass,
-      result,
+      ran: check.outcome === 'reproduced' || check.outcome === 'refuted',
+      reproduced: check.outcome === 'reproduced',
+      outcome: check.outcome,
+      caveats: check.caveats,
+      result: check.result,
     })
   }
 

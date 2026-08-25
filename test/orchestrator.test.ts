@@ -769,6 +769,72 @@ describe('the orchestrator, end to end', () => {
   }, 60_000)
 })
 
+describe('the gate surface is not the writer\'s to move', () => {
+  it('refuses a task that edits a test file it never declared', async () => {
+    // The canonical reward hack: make the thing that proves you green by
+    // editing the thing that proves you. Path matching catches this one.
+    process.env.ARC_FAKE_WRITE = 'thing.test.ts'
+    const store = new Store(home)
+    await runArc({ store, plan: plan([task('sneaky')]), config: config(), log })
+
+    expect(store.allTasks('e2e')[0]!.state).toBe('failed')
+    expect(logs.join('\n')).toContain('protected gate-surface path')
+    expect(store.findingsFor('e2e').some((f) =>
+      String(f.text).includes('changed the gate surface without declaring it'))).toBe(true)
+    store.close()
+  }, 60_000)
+
+  it('allows it when the task declares WHY, and records the exception', async () => {
+    process.env.ARC_FAKE_WRITE = 'thing.test.ts'
+    const store = new Store(home)
+    const p = plan([{ ...task('honest'), touchesGateSurface: 'this task adds the missing tests for the importer' }])
+    await runArc({ store, plan: p, config: config(), log })
+
+    expect(store.allTasks('e2e')[0]!.state).toBe('landed')
+    // The exception is RECORDED, not silent — that is the whole point of the
+    // override existing at all.
+    expect(store.findingsFor('e2e').some((f) =>
+      String(f.text).includes('adds the missing tests for the importer'))).toBe(true)
+    store.close()
+  }, 60_000)
+
+  it('refuses a green gate that ran fewer tests than the baseline', async () => {
+    // Both runs EXIT 0. `result.pass` short-circuits every baseline comparison,
+    // so nothing else in the system can see that two proofs disappeared.
+    const store = new Store(home)
+    const countingGate = {
+      name: 'suite',
+      command: 'if [ -f alpha-generated.ts ]; then echo "Tests  5 passed (5)"; else echo "Tests  7 passed (7)"; fi',
+      proves: 'the suite is green',
+      baselineSubset: true,
+    }
+    await runArc({
+      store, plan: plan([{ ...task('alpha'), gates: ['suite'] }]),
+      config: config({ gates: [countingGate] }), log,
+    })
+
+    expect(logs.join('\n')).toContain('2 fewer test(s) than baseline')
+    expect(store.allTasks('e2e')[0]!.state).toBe('failed')
+    store.close()
+  }, 60_000)
+
+  it('rewriting package.json scripts is gate surface even though package.json is not', async () => {
+    // package.json is deliberately unprotected by path — every dependency bump
+    // touches it. `scripts.test = echo ok` is the attack, and only a content
+    // comparison sees it.
+    writeFileSync(join(repo, 'package.json'), JSON.stringify({ name: 'x', scripts: { test: 'vitest run' } }, null, 2))
+    sh(repo, 'add', 'package.json')
+    sh(repo, 'commit', '-q', '-m', 'add package.json')
+    process.env.ARC_FAKE_WRITE = 'package.json'
+    const store = new Store(home)
+    await runArc({ store, plan: plan([task('rewrite')]), config: config(), log })
+
+    expect(store.allTasks('e2e')[0]!.state).toBe('failed')
+    expect(logs.join('\n')).toContain('protected gate-surface path')
+    store.close()
+  }, 60_000)
+})
+
 describe('CHANGES_REQUIRED buys a repair round, not a burial', () => {
   it('feeds the findings back to the writer once, re-reviews, and lands', async () => {
     // A real overnight run died with a PERFECT review naming exactly what to

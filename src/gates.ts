@@ -162,6 +162,47 @@ function failureLines(signature: string): string[] {
     .map((l) => l.trim())
 }
 
+/**
+ * How many tests a run actually EXECUTED, when the runner says so.
+ *
+ * A gate comparison over failure lines is structurally blind to deletion: a
+ * removed test produces no failure line, so deleting the inconvenient tests
+ * makes every gate strictly greener, forever, and the evidence system records
+ * `checked` against a proof that no longer exists. Nothing else in Arc would
+ * notice — the footprint audit records a test-file edit as a note.
+ *
+ * Deliberately conservative: an unrecognised runner returns undefined and the
+ * count check simply does not apply, rather than guessing a number and failing
+ * honest work. `protectedGatePaths` covers what this cannot parse.
+ */
+export function testsExecuted(output: string): number | undefined {
+  // vitest: "Tests  2 failed | 5 passed (7)" — the parenthesised total.
+  const vitest = output.match(/^\s*Tests\s+.*?\((\d+)\)\s*$/m)
+  if (vitest) return Number(vitest[1])
+  // jest: "Tests:       2 failed, 5 passed, 7 total"
+  const jest = output.match(/^\s*Tests:\s+.*?(\d+)\s+total\s*$/m)
+  if (jest) return Number(jest[1])
+  // pytest: "5 passed, 2 failed in 0.42s" / "7 passed in 0.1s"
+  const pytest = output.match(/^=+\s*(.*?\b\d+ (?:passed|failed|error).*?)\s+in\s+[\d.]+s\s*=+$/m)
+  if (pytest) {
+    const counts = [...pytest[1]!.matchAll(/(\d+)\s+(?:passed|failed|xfailed|xpassed|error(?:s)?)\b/g)]
+    if (counts.length > 0) return counts.reduce((n, m) => n + Number(m[1]), 0)
+  }
+  return undefined
+}
+
+/**
+ * The gate surface a task may not quietly move. A green suite that got green by
+ * losing tests is the canonical reward-hacking vector, and `isSubsetOfBaseline`
+ * cannot see it: `result.pass` short-circuits before any comparison happens.
+ */
+export function testsVanished(result: GateResult, baseline: GateResult): number {
+  const before = testsExecuted(baseline.output)
+  const after = testsExecuted(result.output)
+  if (before === undefined || after === undefined) return 0
+  return Math.max(0, before - after)
+}
+
 export type CheckOutcome = 'reproduced' | 'refuted' | 'could-not-run'
 
 /**
@@ -196,4 +237,22 @@ export function selectGates(all: GateDef[], names: string[]): GateDef[] {
 export function describe(r: GateResult): string {
   if (r.timedOut) return `${r.name}: TIMED OUT after ${Math.round(r.durationMs / 1000)}s → FAILED (a check that hangs is a broken check)`
   return `${r.name}: ${r.pass ? 'pass' : `FAIL (exit ${r.exitCode})`} — proves: ${r.proves}`
+}
+
+/**
+ * Minimal glob for operator-authored path patterns: `*` matches inside a path
+ * segment, `**` crosses segments, and `** /` (no space) also matches zero
+ * directories so `**\/*.test.*` catches a test file at the repo root.
+ * Deliberately not a dependency.
+ */
+export function matchesGlob(path: string, pattern: string): boolean {
+  let rx = ''
+  for (let i = 0; i < pattern.length; i++) {
+    const c = pattern[i]!
+    if (c !== '*') { rx += /[a-zA-Z0-9/_-]/.test(c) ? c : `\\${c}`; continue }
+    if (pattern[i + 1] === '*') {
+      if (pattern[i + 2] === '/') { rx += '(?:.*/)?'; i += 2 } else { rx += '.*'; i += 1 }
+    } else rx += '[^/]*'
+  }
+  return new RegExp(`^${rx}$`).test(path)
 }

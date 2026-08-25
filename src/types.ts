@@ -169,6 +169,22 @@ export const ProjectConfig = z.object({
    *   'refuse' — do not run it; the finding stays unverified and says why
    */
   sandboxPolicy: z.enum(['caveat', 'refuse']).default('caveat'),
+  /**
+   * The surface a task may not quietly move, because it is what PROVES the
+   * task. A writer that deletes an inconvenient test makes every gate strictly
+   * greener, and the baseline comparison is structurally blind to it — a
+   * removed test produces no failure line.
+   *
+   * Touching one of these without declaring `touchesGateSurface` on the task is
+   * a blocking finding, not a note. `package.json` is deliberately absent:
+   * every dependency change touches it, so its `scripts` block is checked by
+   * content instead (see gateScriptsChanged).
+   */
+  protectedGatePaths: z.array(z.string()).default([
+    '**/*.test.*', '**/*.spec.*', 'test/**', 'tests/**', '__tests__/**',
+    'vitest.config.*', 'jest.config.*', 'pytest.ini', 'conftest.py',
+    '.github/workflows/**', 'arc.yaml',
+  ]),
   gates: z.array(GateDef).default([]),
   /**
    * Run once in every freshly provisioned worktree before agents or checks
@@ -387,6 +403,15 @@ export const PlanTask = z.object({
   contractsRead: z.array(z.string()).default([]),
   /** Gate names from project.yaml. Empty ⇒ all non-heavy gates. */
   gates: z.array(z.string()).default([]),
+  /**
+   * Why this task is allowed to change the thing that PROVES it — a test file,
+   * a CI config, a runner script. Absent, touching `protectedGatePaths` is a
+   * blocking finding. Present, it is allowed and the reason is recorded, so the
+   * exception appears in the report instead of being invisible.
+   *
+   * The override exists because without one, operators turn the check off.
+   */
+  touchesGateSurface: z.string().optional(),
   acceptance: z.array(AcceptanceCriterion).min(1),
 })
 export type PlanTask = z.infer<typeof PlanTask>
@@ -493,6 +518,11 @@ export const RiskChecklist = z.object({
     id: z.string(),
     text: z.string(),
     howToCheck: z.string(),
+    /** Where the risk would live. Phase 1 explored the base tree to write this
+     *  checklist and then threw the exploration away; naming the files keeps
+     *  the cheapest part of it, and lets phase 2 spend its diff budget on the
+     *  files a reviewer already predicted were dangerous. */
+    files: z.array(z.string()).default([]),
   })).min(1),
 })
 export type RiskChecklist = z.infer<typeof RiskChecklist>

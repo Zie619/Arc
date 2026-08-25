@@ -6,14 +6,22 @@ import {
   dispatch, checkModel, auxiliaryModels, capacityFailure, modelCheckMode,
   type DispatchOptions, type DispatchResult,
 } from './harness.ts'
-import { computeFrontier } from './scheduler.ts'
-import { runGate, selectGates, isSubsetOfBaseline, describe, checkOutcome, sandboxUsable, type CheckOutcome, type GateResult } from './gates.ts'
-import { signaturesMatch, signatureSimilarity } from './classify.ts'
+import { computeFrontier, validatePlan } from './scheduler.ts'
+import { runGate, selectGates, isSubsetOfBaseline, describe, testsVanished, matchesGlob, type GateResult } from './gates.ts'
+import { checkReviewFinding, type FindingOutcome } from './finding-check.ts'
+import { assembleDiff } from './diff.ts'
+
+/** Byte budgets for what a reviewer is shown. Deliberately named rather than
+ *  inlined: they used to be three unrelated magic numbers, and the implement
+ *  lane's own ceiling was a fourth that disagreed with all of them. */
+const REVIEW_DIFF_BUDGET = 120_000
+const INTEGRATION_DIFF_BUDGET = 200_000
+import { signaturesMatch, signatureSimilarity, isRetryable } from './classify.ts'
 import * as G from './git.ts'
 import { formatCostSummary } from './cost.ts'
 import {
-  TaskResult, ReviewVerdict, RiskChecklist, ProjectConfig,
-  type Plan, type PlanTask, type AgentRole, type RoleBinding,
+  TaskResult, ReviewVerdict, RiskChecklist, ProjectConfig, TIER_RANK,
+  type Plan, type PlanTask, type AgentRole, type RoleBinding, type ClaimTier,
 } from './types.ts'
 
 /**
@@ -193,6 +201,17 @@ export async function runArc(o: RunOptions): Promise<void> {
   // point where the arc row exists but no normal terminal event can be written.
   if (process.env.ARC_TEST_CRASH_AFTER_START) {
     throw new Error(process.env.ARC_TEST_CRASH_AFTER_START)
+  }
+
+  // Validate the plan AGAINST THIS CONFIG before spending anything. A task
+  // naming a gate the project does not declare used to throw from selectGates
+  // at task runtime — after the implement dispatch had already been billed.
+  const planErrors = validatePlan(plan, config)
+  if (planErrors.length > 0) {
+    for (const e of planErrors) log(`  ✗ ${e}`)
+    store.closeArc(arcId, 'incomplete')
+    log('INCOMPLETE — the plan does not fit this project config; nothing was dispatched.')
+    return
   }
 
   if (o.preflight && !o.resume && !await preflightCapacity(o)) {
@@ -517,7 +536,11 @@ async function runTask(
         review = await reviewLoop(o, task, wt, {
           previousVerdict: review.verdict ?? 'CHANGES_REQUIRED',
           findings: reviewFindings,
-          diff: G.git(wt.path, 'diff', `${repairBaseSha}...HEAD`).slice(0, 120_000),
+          ...(() => {
+            const a = assembleDiff(wt.path, `${repairBaseSha}...HEAD`,
+              { budget: REVIEW_DIFF_BUDGET, functionContext: true })
+            return { diff: a.text, diffComplete: a.complete }
+          })(),
         })
       } else {
         review = { status: 'fail', findings: [] }
@@ -777,6 +800,16 @@ async function implementLoop(
     if (res.terminalReason !== 'ok' || !res.parsed) {
       log(`  ✗ attempt ${attempt} ended "${res.terminalReason}"`)
       if (res.errorText) log(`      provider said: ${res.errorText.replace(/\s+/g, ' ').slice(0, 220)}`)
+      // isRetryable already encodes which endings a retry can actually fix, and
+      // this loop ignored it — so a permission-blocked or provider-error attempt
+      // burned every remaining attempt on feedback that could not possibly help.
+      // The classifier existed, with a doc comment describing exactly this waste.
+      if (!isRetryable(res.terminalReason)) {
+        log(`      "${res.terminalReason}" is not something a retry can fix — stopping instead of burning ${config.maxAttempts - attempt} more attempt(s)`)
+        store.addFinding({ arcId, taskId: task.id, attemptId, kind: 'risk', severity: 'high',
+          text: `implement ended "${res.terminalReason}", which no retry can fix` })
+        return 'failed'
+      }
       feedback = `The previous attempt ended without a usable result: ${res.terminalReason}.`
       continue
     }
@@ -838,6 +871,25 @@ async function implementLoop(
         }
       }
 
+      const protectedTouched = protectedSurfaceTouched(o, measured, wt)
+      if (protectedTouched.length > 0 && !task.touchesGateSurface) {
+        // Blocking, not a note. Everything else Arc proves rests on the gate
+        // surface staying put, so a task that moves it without saying so has
+        // changed what "green" means underneath its own evidence.
+        store.addFinding({ arcId, taskId: task.id, attemptId, kind: 'risk', severity: 'high',
+          text: `changed the gate surface without declaring it: ${protectedTouched.slice(0, 5).join(', ')}`
+            + ' — set touchesGateSurface on the task with a reason if this is intended',
+          affects: protectedTouched })
+        log(`  ✗ ${task.id}: changed ${protectedTouched.length} protected gate-surface path(s) undeclared`)
+        return 'failed'
+      }
+      if (protectedTouched.length > 0) {
+        store.addFinding({ arcId, taskId: task.id, attemptId, kind: 'deviation', severity: 'medium',
+          text: `changed the gate surface, as declared: ${task.touchesGateSurface}`,
+          affects: protectedTouched })
+        log(`  · ${task.id}: gate surface changed by declaration — ${task.touchesGateSurface}`)
+      }
+
       const gateResults = await runTaskGates(o, task, wt, baselines, attemptId, heavy)
       failed = gateResults.filter((g) => !g.ok)
     }
@@ -865,7 +917,7 @@ async function implementLoop(
 
     feedback = [
       `These checks FAILED. Fix ONLY what they report; do not restyle unrelated code.`,
-      ...failed.map((f) => `\n## ${f.result.name} (proves: ${f.result.proves})\n\`\`\`\n${f.result.signature.slice(0, 3000)}\n\`\`\``),
+      ...failed.map((f) => `\n## ${f.result.name} (proves: ${f.result.proves})\n\`\`\`\n${failureExcerpt(f.result.output)}\n\`\`\``),
     ].join('\n')
     log(`  ✗ attempt ${attempt}: ${failed.map((f) => f.result.name).join(', ')} failed`)
   }
@@ -933,6 +985,63 @@ async function setupWorktree(o: RunOptions, wt: G.Worktree, taskId?: string): Pr
   return setup.pass
 }
 
+/**
+ * Which of the measured footprint is gate surface the task did not declare.
+ *
+ * `package.json` is deliberately NOT a protected path: every dependency change
+ * touches it, so blocking on the path would produce enough false positives that
+ * an operator disables the whole check. Its `scripts` block IS gate surface, so
+ * that is compared by content instead — rewriting `scripts.test` to `echo ok`
+ * is the canonical version of this attack and path matching cannot see it.
+ */
+function protectedSurfaceTouched(o: RunOptions, measured: string[], wt: G.Worktree): string[] {
+  const hits = measured.filter((path) =>
+    o.config.protectedGatePaths.some((pattern) => matchesGlob(path, pattern)))
+  if (measured.includes('package.json') && gateScriptsChanged(wt)) hits.push('package.json (scripts)')
+  return hits
+}
+
+function gateScriptsChanged(wt: G.Worktree): boolean {
+  const read = (ref: string): string => {
+    try {
+      const raw = G.git(wt.path, 'show', `${ref}:package.json`)
+      return JSON.stringify((JSON.parse(raw) as { scripts?: unknown }).scripts ?? null)
+    } catch {
+      // Unreadable at either end (added, deleted, unparseable) is a CHANGE we
+      // cannot rule out. Fail closed: this is the surface that defines green.
+      return `unreadable:${ref}`
+    }
+  }
+  return read(wt.baseSha) !== read('HEAD')
+}
+
+/**
+ * What the writer is TOLD about why it failed.
+ *
+ * Two defects lived in the one expression this replaces.
+ *
+ * It sent `signature`, which is the output of `normalizeFailureSignature` — a
+ * function written to decide whether two failures are the SAME failure, and
+ * which destroys detail on purpose to do that job. Its `<SHA>` rule rewrites any
+ * 7-40 hex characters, so fixture ids, colour values and hashes under assertion
+ * all collapse: a failing assertion arrives as `expected <SHA> to equal <SHA>`,
+ * and the writer is asked to fix a bug whose evidence has been redacted.
+ *
+ * And it took `.slice(0, 3000)` — the HEAD. Every common runner prints its
+ * banner, its config and per-file progress first and the failure summary last,
+ * so the window was disproportionately preamble. Tail-weighted here, with the
+ * head kept because the first error is often the causal one.
+ *
+ * `signature` still serves signaturesMatch/signatureSimilarity, where it is
+ * correct. The raw output was already on disk the whole time.
+ */
+function failureExcerpt(output: string, head = 500, tail = 3_500): string {
+  const text = output.trim()
+  if (text.length <= head + tail) return text
+  const elided = text.length - head - tail
+  return `${text.slice(0, head)}\n\n[... ${elided} characters elided ...]\n\n${text.slice(-tail)}`
+}
+
 async function runTaskGates(
   o: RunOptions, task: PlanTask, wt: G.Worktree,
   // undefined for runs not tied to an attempt (the post-rebase regate) — a
@@ -948,7 +1057,19 @@ async function runTaskGates(
       ? await heavy.run(() => runGate(g, wt.path, wt.baseSha, o.signal))
       : await runGate(g, wt.path, wt.baseSha, o.signal)
     const base = baselines.get(g.name)
-    const ok = g.baselineSubset && base ? isSubsetOfBaseline(r, base) : r.pass
+    let ok = g.baselineSubset && base ? isSubsetOfBaseline(r, base) : r.pass
+    // A suite that got greener by losing tests is not greener. `result.pass`
+    // short-circuits every baseline comparison, so this is the only place the
+    // deletion is visible at all — a removed test produces no failure line.
+    const vanished = base ? testsVanished(r, base) : 0
+    if (vanished > 0) {
+      ok = false
+      o.store.addFinding({
+        arcId: o.plan.arcId, taskId: task.id, attemptId, kind: 'risk', severity: 'high',
+        text: `gate "${g.name}" executed ${vanished} fewer test(s) than the baseline — a proof was removed, not satisfied`,
+      })
+      o.log(`    ! ${g.name}: ${vanished} fewer test(s) than baseline — NOT green`)
+    }
     o.store.recordGate({
       arcId: o.plan.arcId, taskId: task.id, attemptId, name: g.name, command: g.command,
       proves: g.proves, exitCode: r.exitCode, baseSha: wt.baseSha,
@@ -1144,66 +1265,34 @@ async function runReviewFindingCheck(
   baseSha: string,
   attemptId: string,
   taskId?: string,
-): Promise<{ keep: boolean; outcome: CheckOutcome | 'no-command'; caveat?: string; artifactId?: string; exitCode?: number | null }> {
-  if (!finding.checkCommand) return { keep: true, outcome: 'no-command' }
+): Promise<{ keep: boolean; outcome: FindingOutcome; caveat?: string; artifactId?: string; exitCode?: number | null }> {
   const name = `${taskId ? `review:${taskId}` : 'integration-review'}:${finding.file}:${finding.line}`
-  // sandboxPolicy: 'refuse' — an operator who would rather have no finding than
-  // an unsandboxed one. The finding is KEPT and says why it is unverified.
-  if (o.config.sandboxPolicy === 'refuse' && !sandboxUsable()) {
-    o.log(`    ! ${name}: refused — no OS write sandbox on this platform (sandboxPolicy: refuse)`)
-    return {
-      keep: true,
-      outcome: 'could-not-run',
-      caveat: 'not run: sandboxPolicy is "refuse" and this platform has no OS write sandbox',
-    }
+  const check = await checkReviewFinding(finding, cwd, baseSha, {
+    name, sandboxPolicy: o.config.sandboxPolicy, signal: o.signal,
+  })
+  const caveat = check.caveats.length > 0 ? check.caveats.join('; ') : undefined
+  if (!check.result) {
+    if (caveat) o.log(`    ! ${name}: ${caveat}`)
+    return { keep: check.keep, outcome: check.outcome, caveat }
   }
-  const result = await runGate({
-    name,
-    command: finding.checkCommand,
-    proves: finding.claim,
-    cwd: '.',
-    timeoutMs: 300_000,
-    heavy: false,
-    baselineSubset: false,
-    readOnly: true,
-  }, cwd, baseSha, o.signal)
-  const artifactId = o.store.putArtifact(o.plan.arcId, 'review-check', result.output, attemptId)
+  const artifactId = o.store.putArtifact(o.plan.arcId, 'review-check', check.result.output, attemptId)
   o.store.recordGate({
     arcId: o.plan.arcId,
     taskId,
     attemptId,
     name,
-    command: finding.checkCommand,
+    command: finding.checkCommand!,
     proves: finding.claim,
-    exitCode: result.exitCode,
+    exitCode: check.result.exitCode,
     baseSha,
-    verdict: result.pass ? 'pass' : 'fail',
-    signature: result.signature,
+    verdict: check.result.pass ? 'pass' : 'fail',
+    signature: check.result.signature,
     artifactId,
-    durationMs: result.durationMs,
+    durationMs: check.result.durationMs,
   })
-  // Three outcomes, not two. `keep: result.pass` treated "the command could not
-  // run" as "the defect is not real" and DELETED the finding — so a reviewer
-  // that attached a real reproduction to a real bug lost it to a missing binary
-  // or a sandbox that refused to launch, while a reviewer that attached nothing
-  // was believed unconditionally. Silence is not agreement.
-  const outcome = checkOutcome(result)
-  const caveats: string[] = []
-  if (outcome === 'could-not-run') {
-    caveats.push(`the check could not run (exit ${result.exitCode ?? 'none'}${result.timedOut ? ', timed out' : ''}) — this finding is UNVERIFIED, not refuted`)
-  }
-  if (!result.sandboxed) {
-    caveats.push('ran without an OS sandbox — model-authored shell had write access to the tree it was grading')
-  }
-  for (const caveat of caveats) o.log(`    ! ${name}: ${caveat}`)
-  o.log(`    ${name}: ${outcome} (exit ${result.exitCode ?? 'timeout'})`)
-  return {
-    keep: outcome !== 'refuted',
-    outcome,
-    caveat: caveats.length > 0 ? caveats.join('; ') : undefined,
-    artifactId,
-    exitCode: result.exitCode,
-  }
+  for (const c of check.caveats) o.log(`    ! ${name}: ${c}`)
+  o.log(`    ${name}: ${check.outcome} (exit ${check.result.exitCode ?? 'timeout'})`)
+  return { keep: check.keep, outcome: check.outcome, caveat, artifactId, exitCode: check.result.exitCode }
 }
 
 /**
@@ -1221,6 +1310,9 @@ interface RepairReviewContext {
   previousVerdict: string
   findings: string[]
   diff: string
+  /** False when the repair diff itself was over budget. Carried through so the
+   *  criterion cap survives a repair round. */
+  diffComplete?: boolean
 }
 
 /** 'repair': the review found CONTENT problems the writer can fix; 'fail': infrastructure or a rejection. */
@@ -1241,6 +1333,8 @@ async function reviewLoop(
     ``,
     `You will be shown the diff afterwards. Committing to a checklist now is`,
     `what stops the review becoming a rationalisation of whatever was written.`,
+    ``,
+    `For each risk, name the files it would live in. They get shown to you first.`,
     ``,
     ...charterContext(o),
     ``,
@@ -1275,7 +1369,34 @@ async function reviewLoop(
     log(`  · ${task.id} review: ${checklist.length} risk(s) predicted before seeing the diff`)
   }
 
-  const diff = repair?.diff ?? G.git(wt.path, 'diff', `${wt.baseSha}...HEAD`).slice(0, 120_000)
+  // Spend the budget on the SURPRISING files first. Arc knows which those are
+  // and no generic review tool does: the risks phase 1 just named, the contracts
+  // this task mutates, its declared footprint — and, ahead of all of them, the
+  // files it touched that the plan never predicted.
+  const measured = String(store.allTasks(arcId).find((t) => t.id === task.id)?.footprint_measured ?? '[]')
+  const drifted = (JSON.parse(measured) as string[])
+    .filter((f) => !task.footprint.some((d) => f === d || f.startsWith(d)))
+  const priority = [
+    ...drifted,
+    ...checklist.flatMap((r) => r.files ?? []),
+    ...task.footprint,
+  ]
+  const assembled = repair
+    ? { text: repair.diff, complete: repair.diffComplete !== false, shown: [], summarised: [], excluded: [] }
+    : assembleDiff(wt.path, `${wt.baseSha}...HEAD`, { budget: REVIEW_DIFF_BUDGET, priority, functionContext: true })
+  const diff = assembled.text
+  if (!assembled.complete) {
+    // Recorded, not just printed. A partial review must be visible in the
+    // ledger, and it caps what the verdict may promote.
+    log(`  ! ${task.id} review sees a PARTIAL diff: ${assembled.shown.length} file(s) in full,`
+      + ` ${assembled.summarised.length} named only, ${assembled.excluded.length} excluded as generated`)
+    store.appendEvent(arcId, 'review.truncated', {
+      shown: assembled.shown.length, summarised: assembled.summarised, excluded: assembled.excluded,
+    }, task.id)
+    store.addFinding({ arcId, taskId: task.id, kind: 'risk', severity: 'medium',
+      text: `review saw a partial diff — ${assembled.summarised.length} changed file(s) were named but not shown`,
+      affects: assembled.summarised })
+  }
   const gates = store.gatesFor(arcId, task.id).filter((g) => g.verdict !== 'baseline')
 
   const reviewBrief = repair ? [
@@ -1384,9 +1505,19 @@ async function reviewLoop(
 
   for (const assessment of verdict.criteriaAssessment.filter((item) => item.met)) {
     const criterion = task.acceptance.find((item) => item.id === assessment.id)
-    if (criterion?.proofKind === 'agent-review') {
-      store.promoteCriterion(arcId, task.id, criterion.id, 'checked', assessment.evidence, verdictArtifact)
+    if (criterion?.proofKind !== 'agent-review') continue
+    // A reviewer that saw part of a diff cannot grant full-confidence evidence
+    // for the whole task. `checked` is supposed to mean the harness held the
+    // proof; here it would mean a model held an opinion about code it was not
+    // shown. Cap it, and say so — never let the shortfall be silent.
+    if (!assembled.complete) {
+      store.promoteCriterion(arcId, task.id, criterion.id, 'claimed', assessment.evidence, verdictArtifact)
+      store.appendEvent(arcId, 'tier.capped', {
+        id: criterion.id, from: 'checked', to: 'claimed', why: 'the review saw a partial diff',
+      }, task.id)
+      continue
     }
+    store.promoteCriterion(arcId, task.id, criterion.id, 'checked', assessment.evidence, verdictArtifact)
   }
 
   const criticals = findings.filter((f) => f.severity === 'critical')
@@ -1491,8 +1622,19 @@ async function finalReview(o: RunOptions, integrationBranch: string, baseSha: st
   const head = G.git(config.repo, 'rev-parse', integrationBranch)
   if (head === baseSha) { log('nothing landed — skipping integration review'); return true }
 
-  const diff = G.git(config.repo, 'diff', `${baseSha}...${head}`).slice(0, 200_000)
+  const assembled = assembleDiff(config.repo, `${baseSha}...${head}`, { budget: INTEGRATION_DIFF_BUDGET })
+  const diff = assembled.text
   log(`integration review over ${baseSha.slice(0, 8)}...${head.slice(0, 8)}`)
+  if (!assembled.complete) {
+    log(`! integration review sees a PARTIAL diff: ${assembled.summarised.length} file(s) named but not shown`)
+    store.appendEvent(arcId, 'review.truncated', {
+      scope: 'integration', shown: assembled.shown.length,
+      summarised: assembled.summarised, excluded: assembled.excluded,
+    })
+    store.addFinding({ arcId, kind: 'integration', severity: 'medium',
+      text: `integration review saw a partial diff — ${assembled.summarised.length} changed file(s) were named but not shown`,
+      affects: assembled.summarised })
+  }
 
   // The main checkout is intentionally left where the operator had it. Review
   // and reproduction commands need the INTEGRATION tree, so give them a
@@ -1635,11 +1777,16 @@ function report(o: RunOptions, integrationBranch: string, integrationApproved: b
   log('')
   log(`  criteria: observed ${byTier('observed')} · checked ${byTier('checked')} · claimed-only ${byTier('claimed')} · unproven ${byTier('unproven')}`)
 
-  const weak = crit.filter((c) => c.tier === 'claimed' || c.tier === 'unproven')
+  // Against the criterion's OWN declared bar, not an absolute floor. A plan may
+  // legitimately set requiredTier: 'claimed' for something no command can prove
+  // — the absolute test reported such an arc INCOMPLETE forever, disagreeing
+  // with unmetCriteria, which is what actually gates landing.
+  const weak = crit.filter((c) =>
+    TIER_RANK[c.tier as ClaimTier] < TIER_RANK[c.required_tier as ClaimTier])
   if (weak.length) {
     log('')
-    log('  NOT PROVEN — an agent asserted these but nothing verified them:')
-    for (const c of weak) log(`    ${c.task_id}/${c.id}: ${c.text.slice(0, 64)}`)
+    log('  NOT PROVEN — below the tier the plan itself asked for:')
+    for (const c of weak) log(`    ${c.task_id}/${c.id}: ${c.tier} < required ${c.required_tier} — ${c.text.slice(0, 64)}`)
   }
   if (ops.length) {
     log('')

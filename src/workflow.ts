@@ -1,6 +1,25 @@
 import { z } from 'zod'
 
 /** The product lane is separate from approval/trust mode. */
+/**
+ * A declarative workflow IR whose authoritative executor was never built.
+ *
+ * What remains is the honest part: `builtInWorkflow(lane).steps.length`, read
+ * once (service.ts → app.tsx) to print a stage count. `WorkflowEngine`,
+ * `computeWorkflowFrontier` and `validateWorkflow` were DELETED rather than
+ * kept — they had no production caller, and their passing tests reported
+ * coverage of a subsystem that never ran, which is worse than no coverage
+ * because it reads as reassurance.
+ *
+ * Finishing it instead would mean re-platforming the orchestrator, the direct
+ * lane and the review lane onto one interpreter. Those three are not naive:
+ * each is a long list of incident-driven fixes earned by dogfooding, and
+ * direct.ts's hand-tuned concurrency is BETTER than a generic scheduler would
+ * produce for a two-node graph.
+ *
+ * The trigger to revisit is a genuinely new lane forcing a FOURTH hand-rolled
+ * tick loop. Not a date.
+ */
 export const Lane = z.enum(['chat', 'direct', 'research', 'plan', 'review', 'deep'])
 export type Lane = z.infer<typeof Lane>
 
@@ -34,93 +53,6 @@ export const WorkflowDefinition = z.object({
   steps: z.array(WorkflowStep).min(1),
 })
 export type WorkflowDefinition = z.infer<typeof WorkflowDefinition>
-
-export type WorkflowStepState = 'pending' | 'running' | 'blocked' | 'failed' | 'done' | 'waived'
-
-/** Structural validation happens before a generated workflow can be snapshotted. */
-export function validateWorkflow(workflow: WorkflowDefinition): string[] {
-  const errors: string[] = []
-  const ids = new Set<string>()
-  const producers = new Map<string, string>()
-
-  for (const step of workflow.steps) {
-    if (ids.has(step.id)) errors.push(`duplicate step id "${step.id}"`)
-    ids.add(step.id)
-    if (step.mode === 'fan_in' && step.dependsOn.length === 0) {
-      errors.push(`fan-in step "${step.id}" has no upstream steps`)
-    }
-    for (const artifact of step.produces) {
-      const prior = producers.get(artifact)
-      if (prior) errors.push(`artifact "${artifact}" is produced by both "${prior}" and "${step.id}"`)
-      else producers.set(artifact, step.id)
-    }
-  }
-
-  for (const step of workflow.steps) {
-    for (const dep of step.dependsOn) {
-      if (!ids.has(dep)) errors.push(`step "${step.id}" depends on unknown step "${dep}"`)
-      if (dep === step.id) errors.push(`step "${step.id}" depends on itself`)
-    }
-    for (const artifact of step.consumes) {
-      if (!producers.has(artifact)) errors.push(`step "${step.id}" consumes unknown artifact "${artifact}"`)
-    }
-  }
-
-  const visiting = new Set<string>()
-  const visited = new Set<string>()
-  const byId = new Map(workflow.steps.map((step) => [step.id, step]))
-  const visit = (id: string): boolean => {
-    if (visiting.has(id)) return true
-    if (visited.has(id)) return false
-    visiting.add(id)
-    for (const dep of byId.get(id)?.dependsOn ?? []) if (byId.has(dep) && visit(dep)) return true
-    visiting.delete(id)
-    visited.add(id)
-    return false
-  }
-  if (workflow.steps.some((step) => visit(step.id))) errors.push('workflow contains a dependency cycle')
-
-  return [...new Set(errors)]
-}
-
-function pathsOverlap(a: string, b: string): boolean {
-  const clean = (value: string) => value.replace(/^\.\//, '').replace(/\/$/, '')
-  const x = clean(a)
-  const y = clean(b)
-  return x === y || x.startsWith(`${y}/`) || y.startsWith(`${x}/`)
-}
-
-function collides(a: WorkflowStep, b: WorkflowStep): boolean {
-  const aMut = new Set(a.contractsMutated)
-  const bMut = new Set(b.contractsMutated)
-  if (b.contractsRead.some((c) => aMut.has(c))) return true
-  if (a.contractsRead.some((c) => bMut.has(c))) return true
-  if (b.contractsMutated.some((c) => aMut.has(c))) return true
-  return a.footprint.some((x) => b.footprint.some((y) => pathsOverlap(x, y)))
-}
-
-/** Pure frontier calculation for durable stage rows. */
-export function computeWorkflowFrontier(
-  workflow: WorkflowDefinition,
-  state: Record<string, WorkflowStepState>,
-  concurrency: number,
-): WorkflowStep[] {
-  const active = workflow.steps.filter((step) => state[step.id] === 'running')
-  const capacity = Math.max(0, concurrency - active.length)
-  if (capacity === 0) return []
-
-  const candidates = workflow.steps.filter((step) => {
-    if ((state[step.id] ?? 'pending') !== 'pending') return false
-    return step.dependsOn.every((dep) => state[dep] === 'done' || state[dep] === 'waived')
-  })
-  const selected: WorkflowStep[] = []
-  for (const step of candidates) {
-    if ([...active, ...selected].some((other) => collides(step, other))) continue
-    selected.push(step)
-    if (selected.length === capacity) break
-  }
-  return selected
-}
 
 function step(
   id: string,

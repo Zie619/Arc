@@ -634,62 +634,9 @@ export class Store {
     ).run(Date.now(), id)
   }
 
-  createWorkflowRun(threadId: string, definition: { steps: Array<{ id: string }> }, id?: string): string {
-    const runId = id ?? randomUUID()
-    this.db.prepare(
-      `INSERT INTO workflow_run (id, thread_id, definition_json, status, created_at)
-       VALUES (?, ?, ?, 'running', ?)`,
-    ).run(runId, threadId, JSON.stringify(definition), Date.now())
-    for (const step of definition.steps) {
-      this.db.prepare(
-        `INSERT INTO workflow_step_state (run_id, step_id, state, attempt) VALUES (?, ?, 'pending', 0)`,
-      ).run(runId, step.id)
-    }
-    return runId
-  }
 
-  workflowRun(runId: string): Record<string, any> | undefined {
-    return this.db.prepare(`SELECT * FROM workflow_run WHERE id = ?`).get(runId) as any
-  }
 
-  workflowStepStates(runId: string): Record<string, string> {
-    const rows = this.db.prepare(
-      `SELECT step_id, state FROM workflow_step_state WHERE run_id = ?`,
-    ).all(runId) as Array<{ step_id: string; state: string }>
-    return Object.fromEntries(rows.map((row) => [row.step_id, row.state]))
-  }
 
-  setWorkflowStepState(runId: string, stepId: string, state: string): void {
-    const now = Date.now()
-    const result = this.db.prepare(
-      `UPDATE workflow_step_state SET state = ?,
-         attempt = attempt + CASE WHEN ? = 'running' THEN 1 ELSE 0 END,
-         started_at = CASE WHEN ? = 'running' THEN ? ELSE started_at END,
-         ended_at = CASE WHEN ? IN ('done', 'failed', 'blocked', 'waived') THEN ? ELSE ended_at END
-       WHERE run_id = ? AND step_id = ?`,
-    ).run(state, state, state, now, state, now, runId, stepId)
-    if (result.changes === 0) throw new Error(`workflow step "${runId}/${stepId}" does not exist`)
-    const remaining = this.db.prepare(
-      `SELECT COUNT(*) AS n FROM workflow_step_state WHERE run_id = ? AND state NOT IN ('done', 'waived')`,
-    ).get(runId) as { n: number }
-    if (remaining.n === 0) {
-      this.db.prepare(`UPDATE workflow_run SET status = 'done', ended_at = ? WHERE id = ?`)
-        .run(now, runId)
-      return
-    }
-    // A run whose remaining steps are all failed/blocked is not 'running'
-    // forever — it is over, and the status must say so.
-    const live = this.db.prepare(
-      `SELECT COUNT(*) AS n FROM workflow_step_state WHERE run_id = ? AND state IN ('pending', 'running')`,
-    ).get(runId) as { n: number }
-    if (live.n === 0) {
-      const failed = this.db.prepare(
-        `SELECT COUNT(*) AS n FROM workflow_step_state WHERE run_id = ? AND state = 'failed'`,
-      ).get(runId) as { n: number }
-      this.db.prepare(`UPDATE workflow_run SET status = ?, ended_at = ? WHERE id = ?`)
-        .run(failed.n > 0 ? 'failed' : 'blocked', now, runId)
-    }
-  }
 
   // -- design phase ----------------------------------------------------------
 

@@ -68,6 +68,9 @@ export interface DispatchResult {
   usage: ProviderUsage[]
 }
 
+/** A transcript is evidence, not a memory leak. Matches gates.ts's own cap. */
+const MAX_TRANSCRIPT_BYTES = 64 * 1024 * 1024
+
 /** Non-fatal shell noise that must never count as "the model produced output". */
 function isModelOutputEvent(cli: 'codex' | 'claude', type: string): boolean {
   if (cli === 'claude') return type === 'assistant'
@@ -267,6 +270,8 @@ export async function dispatch(o: DispatchOptions): Promise<DispatchResult> {
   let finalText = ''
   let eventCount = 0
   const lines: string[] = []
+  let transcriptBytes = 0
+  let transcriptDropped = 0
   let lastEventAt = Date.now()
   let stallExtended = false
 
@@ -298,7 +303,17 @@ export async function dispatch(o: DispatchOptions): Promise<DispatchResult> {
   } catch { /* same: classified by the child handlers */ }
 
   const handleLine = (line: string) => {
+    // Bounded, like gates.ts already bounds gate output at 64MB. A verbose
+    // provider relaying a build to stdout grew this array until the process
+    // OOMed — and under `--until-done` an OOM is a relaunch, which re-runs the
+    // same task, which OOMs again, ten times. Keep the TAIL: the ending is what
+    // classifies the run.
     lines.push(line)
+    transcriptBytes += line.length + 1
+    while (transcriptBytes > MAX_TRANSCRIPT_BYTES && lines.length > 1) {
+      transcriptBytes -= (lines.shift() as string).length + 1
+      transcriptDropped++
+    }
     const t = line.trim()
     if (!t.startsWith('{')) return
     let d: any
@@ -530,6 +545,9 @@ export async function dispatch(o: DispatchOptions): Promise<DispatchResult> {
     `# args: ${JSON.stringify(args)}`,
     `# exit=${facts.exitCode} reason=${terminalReason} events=${eventCount}`,
     `# observed models: ${[...observed].join(', ') || '(none reported by this CLI)'}`,
+    ...(transcriptDropped > 0
+      ? [`# [${transcriptDropped} earlier line(s) dropped — transcript capped at ${MAX_TRANSCRIPT_BYTES / 1024 / 1024}MB]`]
+      : []),
     '',
     ...lines,
     '',

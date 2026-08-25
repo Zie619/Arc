@@ -205,14 +205,29 @@ export function findCycle(plan: Plan): string[] | null {
   return null
 }
 
-/** Structural validation, run BEFORE anything is dispatched. */
-export function validatePlan(plan: Plan): string[] {
+/**
+ * Structural validation, run BEFORE anything is dispatched.
+ *
+ * `config` is optional only because `arc validate` can be pointed at a plan
+ * without one. Pass it wherever you have it: a plan naming a gate the project
+ * does not declare used to throw at TASK RUNTIME, after the implement dispatch
+ * had already been paid for.
+ */
+export function validatePlan(plan: Plan, config?: { gates: Array<{ name: string }> }): string[] {
   const errors: string[] = []
   const ids = new Set<string>()
+  const gateNames = config ? new Set(config.gates.map((g) => g.name)) : null
 
   for (const t of plan.tasks) {
     if (ids.has(t.id)) errors.push(`duplicate task id "${t.id}"`)
     ids.add(t.id)
+    if (gateNames) {
+      for (const g of t.gates) {
+        if (!gateNames.has(g)) {
+          errors.push(`task "${t.id}" names unknown gate "${g}" — declared gates are: ${[...gateNames].join(', ') || '(none)'}`)
+        }
+      }
+    }
     const critIds = new Set<string>()
     for (const c of t.acceptance) {
       if (critIds.has(c.id)) errors.push(`task "${t.id}": duplicate criterion id "${c.id}"`)
