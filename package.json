@@ -15,7 +15,8 @@
     "typecheck": "tsc --noEmit",
     "test": "vitest run --configLoader runner",
     "arc": "node src/cli.ts",
-    "ui": "esbuild src/ui.tsx --bundle --platform=node --format=esm --packages=external --outfile=dist/ui.mjs --log-level=warning && node dist/ui.mjs"
+    "ui": "esbuild src/ui.tsx --bundle --platform=node --format=esm --packages=external --outfile=dist/ui.mjs --log-level=warning && node dist/ui.mjs",
+    "bench": "node --experimental-strip-types src/cli.ts bench"
   },
   "dependencies": {
     "ink": "^7.1.1",

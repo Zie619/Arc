@@ -1,5 +1,6 @@
 import { DatabaseSync } from 'node:sqlite'
 import { mkdirSync, writeFileSync } from 'node:fs'
+import { hostname } from 'node:os'
 import { createHash, randomUUID } from 'node:crypto'
 import { dirname, join } from 'node:path'
 import type { ClaimTier, Plan, TerminalReason, AgentRole, ProviderUsage } from './types.ts'
@@ -27,6 +28,8 @@ const MIGRATIONS: string[] = [
      base_sha TEXT NOT NULL,
      integration_branch TEXT NOT NULL,
      status TEXT NOT NULL DEFAULT 'running',
+     lease_owner TEXT,
+     lease_expires_at INTEGER,
      created_at INTEGER NOT NULL,
      closed_at INTEGER
    )`,
@@ -37,6 +40,7 @@ const MIGRATIONS: string[] = [
      spec TEXT NOT NULL,
      state TEXT NOT NULL DEFAULT 'pending',
      lease_expires_at INTEGER,
+     lease_owner TEXT,
      base_sha TEXT,
      head_sha TEXT,
      branch TEXT,
@@ -63,7 +67,8 @@ const MIGRATIONS: string[] = [
      head_sha TEXT,
      brief_artifact_id TEXT,
      transcript_artifact_id TEXT,
-     effort TEXT
+     effort TEXT,
+     phase TEXT NOT NULL DEFAULT 'implement'
    )`,
   `CREATE TABLE IF NOT EXISTS criterion (
      arc_id TEXT NOT NULL,
@@ -329,6 +334,17 @@ export class Store {
     this.ensureColumn('attempt', 'effort', 'TEXT')
     // runGate already computes this and recordGate threw it away.
     this.ensureColumn('gate_run', 'duration_ms', 'INTEGER')
+    // A repair round is a SECOND budget, not a continuation of the first. Its
+    // attempts used to be indistinguishable from the implement round's, which
+    // is how it acquired a fresh clock and a fresh counter by accident.
+    this.ensureColumn('attempt', 'phase', `TEXT NOT NULL DEFAULT 'implement'`)
+    // A lease with no owner is a TIMER, not a lock: any process could renew any
+    // task's lease, so two processes on one arc would both believe they held it
+    // and both keep renewing. Cheap now, expensive to retrofit once concurrency
+    // exists — which is what an arc lease is for.
+    this.ensureColumn('task', 'lease_owner', 'TEXT')
+    this.ensureColumn('arc', 'lease_owner', 'TEXT')
+    this.ensureColumn('arc', 'lease_expires_at', 'INTEGER')
   }
 
   private ensureColumn(table: string, column: string, decl: string): void {
@@ -760,16 +776,17 @@ export class Store {
     taskId?: string | null,
     attemptId?: string | null,
   ): number {
+    // ONE statement, so the max and the insert cannot be interleaved by a second
+    // writer. As a read-then-write this was harmless with exactly one process
+    // and a live race the moment the supervisor opened the same db from two.
     const row = this.db
-      .prepare(`SELECT COALESCE(MAX(seq), 0) + 1 AS next FROM event WHERE arc_id = ?`)
-      .get(arcId) as { next: number }
-    this.db
       .prepare(
         `INSERT INTO event (arc_id, seq, at, task_id, attempt_id, kind, payload)
-         VALUES (?, ?, ?, ?, ?, ?, ?)`,
+         VALUES (?, (SELECT COALESCE(MAX(seq), 0) + 1 FROM event WHERE arc_id = ?), ?, ?, ?, ?, ?)
+         RETURNING seq`,
       )
-      .run(arcId, row.next, Date.now(), taskId ?? null, attemptId ?? null, kind, JSON.stringify(payload))
-    return row.next
+      .get(arcId, arcId, Date.now(), taskId ?? null, attemptId ?? null, kind, JSON.stringify(payload)) as { seq: number }
+    return row.seq
   }
 
   eventsSince(arcId: string, seq: number): EventRow[] {
@@ -805,10 +822,71 @@ export class Store {
   }
 
   /** Heartbeat. A lease that stops being extended is how a dead worker is found. */
-  renewLease(arcId: string, taskId: string, leaseMs: number): void {
+  /**
+   * Who holds a lease. Stable for the life of the process and unique per
+   * process — pid alone is not enough, because pids are recycled and a
+   * recycled pid makes a dead holder look alive forever.
+   */
+  readonly owner = `${hostname()}:${process.pid}:${randomUUID().slice(0, 8)}`
+
+  /**
+   * Claim the arc, so a second `arc resume` refuses rather than racing.
+   *
+   * There was no arc-level lease at all: two resumes would both run, both
+   * provision worktrees, and collide nondeterministically on provisionWorktree's
+   * refuse-to-reuse check. With one, `arc resume <arcId>` becomes idempotent and
+   * safe to fire from cron every few minutes — most of a daemon without shipping
+   * one.
+   *
+   * A STALE lease is reclaimed: a hard-killed process must never lock the
+   * operator out of their own arc.
+   */
+  /**
+   * Expiry alone is not enough. `arc run --until-done` kills its child and
+   * relaunches it in seconds, well inside any sane lease, so the successor
+   * would be locked out by its own dead predecessor. Ask the OS instead.
+   *
+   * A recycled pid makes a dead holder look alive, which refuses a run that
+   * could have proceeded — conservative, bounded by the lease expiry, and the
+   * right way round. `checkout-lock` recorded a start hint for exactly this and
+   * then never read it.
+   */
+  claimArc(arcId: string, leaseMs: number): boolean {
+    const row = this.db
+      .prepare(`SELECT lease_owner, lease_expires_at FROM arc WHERE id = ?`)
+      .get(arcId) as { lease_owner: string | null; lease_expires_at: number | null } | undefined
+    if (!row) return false
+    const heldByOther = Boolean(row.lease_owner)
+      && row.lease_owner !== this.owner
+      && Number(row.lease_expires_at ?? 0) > Date.now()
+      && holderMayBeAlive(row.lease_owner!)
+    if (heldByOther) return false
     this.db
-      .prepare(`UPDATE task SET lease_expires_at = ? WHERE arc_id = ? AND id = ?`)
-      .run(Date.now() + leaseMs, arcId, taskId)
+      .prepare(`UPDATE arc SET lease_owner = ?, lease_expires_at = ? WHERE id = ?`)
+      .run(this.owner, Date.now() + leaseMs, arcId)
+    return true
+  }
+
+  renewArcLease(arcId: string, leaseMs: number): void {
+    this.db
+      .prepare(`UPDATE arc SET lease_expires_at = ? WHERE id = ? AND lease_owner = ?`)
+      .run(Date.now() + leaseMs, arcId, this.owner)
+  }
+
+  releaseArc(arcId: string): void {
+    this.db
+      .prepare(`UPDATE arc SET lease_owner = NULL, lease_expires_at = NULL WHERE id = ? AND lease_owner = ?`)
+      .run(arcId, this.owner)
+  }
+
+  renewLease(arcId: string, taskId: string, leaseMs: number): void {
+    // Conditional on ownership. Any process could previously renew any task's
+    // lease, which makes it a TIMER rather than a lock — correct for the crash
+    // case it was designed for, and wrong the moment two processes share an arc.
+    this.db
+      .prepare(`UPDATE task SET lease_expires_at = ?, lease_owner = ?
+                WHERE arc_id = ? AND id = ? AND (lease_owner IS NULL OR lease_owner = ?)`)
+      .run(Date.now() + leaseMs, this.owner, arcId, taskId, this.owner)
   }
 
   setTaskWorkspace(arcId: string, taskId: string, wt: string, branch: string, baseSha: string): void {
@@ -843,14 +921,16 @@ export class Store {
     baseSha?: string
     briefArtifactId?: string
     effort?: string
+    /** Which budget this attempt spends. */
+    phase?: string
   }): string {
     const id = randomUUID()
     this.db
       .prepare(
-        `INSERT INTO attempt (id, arc_id, task_id, attempt_no, role, requested_model, cli, started_at, base_sha, brief_artifact_id, effort)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        `INSERT INTO attempt (id, arc_id, task_id, attempt_no, role, requested_model, cli, started_at, base_sha, brief_artifact_id, effort, phase)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
-      .run(id, a.arcId, a.taskId, a.attemptNo, a.role, a.requestedModel, a.cli, Date.now(), a.baseSha ?? null, a.briefArtifactId ?? null, a.effort ?? null)
+      .run(id, a.arcId, a.taskId, a.attemptNo, a.role, a.requestedModel, a.cli, Date.now(), a.baseSha ?? null, a.briefArtifactId ?? null, a.effort ?? null, a.phase ?? 'implement')
     this.appendEvent(a.arcId, 'attempt.start', { role: a.role, model: a.requestedModel, cli: a.cli }, a.taskId, id)
     return id
   }
@@ -964,6 +1044,52 @@ export class Store {
        HAVING runs >= ? AND passes > 0 AND fails > 0
        ORDER BY fails * (CAST(fails AS REAL) / runs) DESC`,
     ).all(minRuns) as any
+  }
+
+  /**
+   * The budgets a task has ALREADY spent, read from rows rather than from a
+   * stack frame.
+   *
+   * `capacityWaitMinutes` was durable — rebuilt by summing capacity.wait events
+   * — and every other budget was not. So a resume handed a task a fresh 90
+   * minutes, a fresh attempt counter, and an empty non-convergence history:
+   * `maxAttempts: 4` with a supervisor cap of 10 relaunches and a repair round
+   * that gets its own clock is, worst case, dozens of dispatches against a
+   * config that reads as if it means four. For a tool that just shipped
+   * `arc cost`, that is a money leak with no ceiling the operator can see.
+   *
+   * This is Temporal's Schedule-to-Close (the whole task, retries included) as
+   * opposed to Start-to-Close (one attempt). Arc had only the latter and was
+   * naming it the former.
+   */
+  spentBudget(arcId: string, taskId: string, role: string, phase = 'implement'): {
+    attempts: number
+    startedAt: number | null
+    signatures: string[]
+  } {
+    const attempts = this.db
+      .prepare(`SELECT COUNT(*) AS n, MIN(started_at) AS first_at FROM attempt
+                WHERE arc_id = ? AND task_id = ? AND role = ? AND phase = ?`)
+      .get(arcId, taskId, role, phase) as { n: number; first_at: number | null }
+    // The implement phase is bounded by the TASK's clock; a repair round gets
+    // its own, starting from its own first attempt.
+    const task = phase === 'implement'
+      ? this.db
+        .prepare(`SELECT started_at FROM task WHERE arc_id = ? AND id = ?`)
+        .get(arcId, taskId) as { started_at: number | null } | undefined
+      : { started_at: attempts?.first_at ?? null }
+    const signatures = this.db
+      .prepare(
+        `SELECT DISTINCT signature FROM gate_run
+         WHERE arc_id = ? AND task_id = ? AND verdict = 'fail' AND signature IS NOT NULL AND signature != ''
+         ORDER BY ran_at`,
+      )
+      .all(arcId, taskId) as Array<{ signature: string }>
+    return {
+      attempts: Number(attempts?.n ?? 0),
+      startedAt: task?.started_at ?? null,
+      signatures: signatures.map((r) => r.signature),
+    }
   }
 
   /** Every attempt in the arc, whatever task or role. The bench counts these. */
@@ -1245,5 +1371,20 @@ export class Store {
     return this.db
       .prepare(`SELECT * FROM pending_op WHERE arc_id = ? AND status = 'open' AND blocking = 1`)
       .all(arcId) as any
+  }
+}
+
+/** `<host>:<pid>:<epoch>` — alive only decidable on our OWN host. */
+function holderMayBeAlive(owner: string): boolean {
+  const [host, pid] = owner.split(':')
+  if (host !== hostname()) return true // another machine: assume alive, fail closed
+  const n = Number(pid)
+  if (!Number.isInteger(n) || n <= 0) return true
+  try {
+    process.kill(n, 0)
+    return true
+  } catch (error) {
+    // ESRCH: no such process. EPERM: it exists and belongs to someone else.
+    return (error as NodeJS.ErrnoException).code !== 'ESRCH'
   }
 }

@@ -208,9 +208,19 @@ async function superviseRun(
 ): Promise<number> {
   const crashes: Array<SupervisedExit & { event?: unknown }> = []
   const delay = Number(process.env.ARC_SUPERVISOR_BACKOFF_MS)
-  const relaunchDelayMs = Number.isFinite(delay) && delay >= 0 ? delay : 15_000
+  const baseDelayMs = Number.isFinite(delay) && delay >= 0 ? delay : 15_000
   let mode: 'run' | 'resume' = startMode
   let relaunches = 0
+  // What the cap SHOULD count. A crash loop burned all ten in 150 seconds; a
+  // laptop that slept four times overnight used four. Same counter, two
+  // entirely different failure shapes — and only one of them is a problem.
+  // Counting relaunches that produced no forward progress separates them, and
+  // the event log already answers the question.
+  let barren = 0
+  const progressMarkers = new Set(['land', 'attempt.end', 'task.state', 'criterion.tier'])
+  const progressCount = (): number =>
+    store.eventsSince(plan.arcId, 0).filter((e) => progressMarkers.has(String(e.kind))).length
+  let progressBefore = progressCount()
 
   for (;;) {
     const result = await launchSupervisedChild(mode, planPath, configPath)
@@ -223,10 +233,25 @@ async function superviseRun(
     console.error(C.yellow(`! run child ${result.signal ? `died on ${result.signal}` : `exited ${result.code ?? 'without a code'}`} while arc is still running${result.error ? ` — ${result.error}` : ''}`))
     if (last) console.error(C.dim(`  last event: ${last.kind} ${JSON.stringify(last.payload).slice(0, 300)}`))
 
-    if (relaunches >= 10) {
-      store.appendEvent(plan.arcId, 'arc.supervisor.exhausted', { relaunches, crashes })
+    // A deterministic startup failure — an invalid plan, a dirty repo, a config
+    // that will not parse — relaunches ten times to fail identically each time.
+    // The arc never even reached 'running' in those cases, which the check
+    // above already catches; what is left is a child that dies without ever
+    // moving the ledger.
+    const progressAfter = progressCount()
+    if (progressAfter > progressBefore) barren = 0
+    else barren++
+    progressBefore = progressAfter
+
+    if (barren >= 3 || relaunches >= 10) {
+      store.appendEvent(plan.arcId, 'arc.supervisor.exhausted', {
+        relaunches, barren, reason: barren >= 3 ? 'no forward progress' : 'relaunch cap',
+        crashes,
+      })
       store.closeArc(plan.arcId, 'incomplete')
-      console.error(C.red(`✗ relaunch cap reached after ${crashes.length} crash(es); arc is INCOMPLETE`))
+      console.error(C.red(barren >= 3
+        ? `✗ ${barren} relaunches produced no forward progress; arc is INCOMPLETE`
+        : `✗ relaunch cap reached after ${crashes.length} crash(es); arc is INCOMPLETE`))
       crashes.forEach((crash, index) => console.error(`  ${index + 1}. code=${crash.code ?? 'null'} signal=${crash.signal ?? 'none'} last=${JSON.stringify(crash.event ?? null)}`))
       const cost = formatCostSummary(store.costSummary(plan.arcId))
       console.error('  token bill — ' + (cost.lines.length > 0 ? 'provider receipts' : 'no attempts recorded'))
@@ -236,11 +261,16 @@ async function superviseRun(
     }
 
     relaunches++
+    // Exponential, capped at ten minutes. A fixed 15s means a crash loop spends
+    // its entire budget in under three minutes and never gets far enough apart
+    // for a transient cause (a provider outage, a full disk) to clear.
+    const relaunchDelayMs = Math.min(baseDelayMs * 2 ** (relaunches - 1), 600_000)
     store.appendEvent(plan.arcId, 'arc.supervisor.relaunch', {
-      relaunch: relaunches, delayMs: relaunchDelayMs,
+      relaunch: relaunches, barren, delayMs: relaunchDelayMs,
       code: result.code, signal: result.signal, lastEvent: last?.kind,
     })
-    console.error(C.dim(`  relaunching through resume in ${Math.round(relaunchDelayMs / 1000)}s (${relaunches}/10)`))
+    console.error(C.dim(`  relaunching through resume in ${Math.round(relaunchDelayMs / 1000)}s`
+      + ` (${relaunches}/10${barren > 0 ? `, ${barren} without progress` : ''})`))
     await new Promise((resolveDelay) => setTimeout(resolveDelay, relaunchDelayMs))
     mode = 'resume'
   }
@@ -599,7 +629,7 @@ async function main(): Promise<void> {
           die(`${live.length} task(s) still in flight (${live.map((t) => t.id).join(', ')}).\n` +
               `  If the process really is dead, re-run with --force.`)
         }
-        for (const t of plan.tasks) G.releaseTaskWorkspace(config.repo, store.root, t.id)
+        for (const t of plan.tasks) G.releaseTaskWorkspace(config.repo, store.root, `${plan.arcId}--${t.id}`)
         const integration = `arc/${arcId}-integration`
         if (argv.includes('--all')) {
           G.gitOk(config.repo, 'branch', '-D', integration)

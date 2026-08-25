@@ -64,6 +64,7 @@ export interface TaskProduct {
   noopReason?: string
 }
 
+const ARC_LEASE_MS = 90_000
 const LEASE_MS = 90_000
 
 /**
@@ -152,6 +153,12 @@ export async function runArc(o: RunOptions): Promise<void> {
     // A task left mid-flight by a crash holds no live worker. Release its
     // isolation and put it back on the queue — the frontier is a pure function
     // of rows, so everything else recomputes itself.
+    // NOTE: this loop no longer force-deletes a stuck task's branch. It used to,
+    // which meant every crash threw away committed work, passing gates and
+    // sometimes a finished review — and under `--until-done`, ten relaunches
+    // were ten opportunities to do it again. provisionWorktree now reuses a
+    // worktree whose head DESCENDS from the base, so the writer picks up where
+    // it stopped and the durable attempt budget stops it re-running forever.
     const stuck = store.allTasks(arcId).filter((t) => ['running', 'reviewing', 'landing'].includes(String(t.state)))
     let requeued = 0
     for (const t of stuck) {
@@ -165,11 +172,10 @@ export async function runArc(o: RunOptions): Promise<void> {
         log(`resume: ${t.id} was "${t.state}" but ${head.slice(0, 8)} is already on ${integrationBranch} — it landed`)
         store.setTaskState(arcId, String(t.id), 'landed')
         store.appendEvent(arcId, 'land.recovered', { headSha: head }, String(t.id))
-        G.releaseTaskWorkspace(repo, store.root, String(t.id))
+        G.releaseTaskWorkspace(repo, store.root, workspaceId(arcId, String(t.id)))
         continue
       }
-      log(`resume: ${t.id} was "${t.state}" with no live worker — releasing and requeueing`)
-      G.releaseTaskWorkspace(repo, store.root, String(t.id))
+      log(`resume: ${t.id} was "${t.state}" with no live worker — requeueing, keeping its branch`)
       store.setTaskState(arcId, String(t.id), 'pending')
       requeued++
     }
@@ -220,6 +226,19 @@ export async function runArc(o: RunOptions): Promise<void> {
     logCostSummary(o)
     return
   }
+
+  // One process per arc. Without this, two `arc resume` invocations both run,
+  // both provision worktrees, and collide nondeterministically.
+  if (!store.claimArc(arcId, ARC_LEASE_MS)) {
+    log(`✗ arc "${arcId}" is already being run by another process (its lease is live).`)
+    log('  If that process is gone, wait for the lease to expire and try again.')
+    return
+  }
+  const arcLease = setInterval(() => {
+    try { store.renewArcLease(arcId, ARC_LEASE_MS) } catch { /* transient DB busy */ }
+  }, Math.floor(ARC_LEASE_MS / 3))
+  // unref so a held interval can never keep the process alive past the run.
+  arcLease.unref?.()
 
   const heavy = new Semaphore(config.heavyGateLimit)
   // Agents and their local gates may run in parallel; rebasing/advancing the
@@ -273,6 +292,17 @@ export async function runArc(o: RunOptions): Promise<void> {
       const task = frontier.ready[i]
       if (!task) return
       const message = s.reason instanceof Error ? s.reason.message : String(s.reason)
+      // runTask sets `landed` and THEN calls propagateDeviations, which writes
+      // to the store and can throw — on SQLITE_BUSY, now reachable. Overwriting
+      // blindly rewrote a landed row to failed, so the operator saw a failed
+      // task whose work was merged on the integration branch and the arc went
+      // INCOMPLETE over it. Landing is terminal; a late throw is not.
+      const current = String(store.allTasks(arcId).find((t) => t.id === task.id)?.state ?? '')
+      if (current === 'landed') {
+        log(`✗ ${task.id}: threw AFTER landing — ${message} (the work is on the integration branch; state stays landed)`)
+        store.appendEvent(arcId, 'task.crashed', { message: message.slice(0, 400), afterLanding: true }, task.id)
+        return
+      }
       log(`✗ ${task.id}: crashed — ${message}`)
       store.appendEvent(arcId, 'task.crashed', { message: message.slice(0, 400) }, task.id)
       store.setTaskState(arcId, task.id, 'failed')
@@ -283,6 +313,8 @@ export async function runArc(o: RunOptions): Promise<void> {
   let integrationApproved = true
   if (landedCount === 0) log('nothing landed — skipping integration review')
   else integrationApproved = await finalReview(o, integrationBranch, baseSha)
+  clearInterval(arcLease)
+  store.releaseArc(arcId)
   const complete = report(o, integrationBranch, integrationApproved)
   // Delivery is part of being done. Closing the arc before pushing meant a
   // rejected push or a failed `gh pr create` still stored 'done', and `arc run`
@@ -424,20 +456,70 @@ async function finalize(
 
 // ---------------------------------------------------------------------------
 
+/**
+ * Measure the baseline AT THE BASE SHA, in a tree of its own.
+ *
+ * `baseSha` used to be passed as metadata only while the commands ran in the
+ * operator's shared checkout, at whatever HEAD it happened to be on — and the
+ * log said "on <baseSha>" while doing no such thing. An operator sitting on a
+ * WIP branch with three broken tests donated them to the baseline of an arc
+ * based on main, and every task was then measured against a tree the arc never
+ * built from. The reverse is worse: a green WIP branch over a red main turns
+ * pre-existing failures into task failures.
+ *
+ * The secondary damage was that a baseline gate ran in the operator's tree
+ * WITHOUT setupCommand, so a formatter or a snapshot updater left it dirty —
+ * and landBranch then runs `git checkout` in that same tree.
+ *
+ * review.ts already did exactly this. The pattern existed and was not used.
+ */
 async function measureBaselines(o: RunOptions, baseSha: string): Promise<Map<string, GateResult>> {
   const out = new Map<string, GateResult>()
   const needed = o.config.gates.filter((g) => g.baselineSubset)
   if (needed.length === 0) return out
   o.log(`measuring ${needed.length} gate baseline(s) on ${baseSha.slice(0, 8)} — in this run, not from memory`)
-  for (const g of needed) {
-    const r = await runGate(g, o.config.repo, baseSha, o.signal)
-    out.set(g.name, r)
-    o.store.recordGate({
-      arcId: o.plan.arcId, name: g.name, command: g.command, proves: g.proves,
-      exitCode: r.exitCode, baseSha, verdict: 'baseline', signature: r.signature,
-      durationMs: r.durationMs,
-    })
-    o.log(`  baseline ${g.name}: exit ${r.exitCode}`)
+
+  const workspaceId = `${o.plan.arcId}-baseline`
+  G.releaseTaskWorkspace(o.config.repo, o.store.root, workspaceId)
+  let baseTree: G.Worktree
+  try {
+    baseTree = G.provisionWorktree(o.config.repo, o.store.root, workspaceId, baseSha)
+  } catch (error) {
+    // Fail closed rather than silently measuring the wrong tree. Without a
+    // baseline, `baselineSubset` gates simply require green, which is stricter.
+    o.log(`! baseline isolation failed (${(error as Error).message}) — baselineSubset gates will require GREEN, not subset`)
+    o.store.addFinding({ arcId: o.plan.arcId, kind: 'risk', severity: 'medium',
+      text: `baseline worktree could not be provisioned: ${(error as Error).message}` })
+    return out
+  }
+
+  try {
+    if (o.config.setupCommand) {
+      const setup = await runGate({
+        name: 'baseline-setup', command: o.config.setupCommand,
+        proves: 'the detached base tree can run project checks',
+        cwd: '.', timeoutMs: 600_000, heavy: false, baselineSubset: false,
+      }, baseTree.path, baseSha, o.signal)
+      if (!setup.pass) {
+        // A bare tree fails for environmental reasons, not code reasons. Say so
+        // rather than letting it look like the base was red.
+        o.log(`  ! baseline setup failed (exit ${setup.exitCode}) — baseline comparisons are environment-unproven`)
+        o.store.addFinding({ arcId: o.plan.arcId, kind: 'risk', severity: 'medium',
+          text: `baseline setup failed in the detached base tree (${o.config.setupCommand}, exit ${setup.exitCode}) — subset comparisons are environment-unproven` })
+      }
+    }
+    for (const g of needed) {
+      const r = await runGate(g, baseTree.path, baseSha, o.signal)
+      out.set(g.name, r)
+      o.store.recordGate({
+        arcId: o.plan.arcId, name: g.name, command: g.command, proves: g.proves,
+        exitCode: r.exitCode, baseSha, verdict: 'baseline', signature: r.signature,
+        durationMs: r.durationMs,
+      })
+      o.log(`  baseline ${g.name}: exit ${r.exitCode}`)
+    }
+  } finally {
+    G.releaseTaskWorkspace(o.config.repo, o.store.root, workspaceId)
   }
   return out
 }
@@ -465,7 +547,7 @@ async function runTask(
     const baseSha = G.git(config.repo, 'rev-parse', integrationBranch)
     let wt: G.Worktree
     try {
-      wt = G.provisionWorktree(config.repo, store.root, task.id, baseSha)
+      wt = G.provisionWorktree(config.repo, store.root, workspaceId(arcId, task.id), baseSha)
     } catch (e) {
       // Fails CLOSED. No fallback into the shared checkout, ever.
       log(`✗ ${task.id}: ${(e as Error).message}`)
@@ -474,7 +556,13 @@ async function runTask(
       return
     }
     store.setTaskWorkspace(arcId, task.id, wt.path, wt.branch, wt.baseSha)
-    log(`▶ ${task.id} — ${task.title}  [${wt.branch} @ ${wt.baseSha.slice(0, 8)}]`)
+    if (wt.recovered) {
+      const commits = G.commitCount(wt.path, wt.baseSha)
+      log(`▶ ${task.id} — ${task.title}  [${wt.branch} @ ${wt.baseSha.slice(0, 8)}, RECOVERED with ${commits} commit(s)]`)
+      store.appendEvent(arcId, 'task.workspace.recovered', { commits, head: G.headSha(wt.path) }, task.id)
+    } else {
+      log(`▶ ${task.id} — ${task.title}  [${wt.branch} @ ${wt.baseSha.slice(0, 8)}]`)
+    }
 
     // A bare worktree cannot run the project's own checks (the first
     // self-arc died with `vitest: command not found` in every worktree).
@@ -511,7 +599,7 @@ async function runTask(
       }
       log(`  ✓ ${task.id} accepted as a no-op — criteria hold with no change`)
       store.setTaskState(arcId, task.id, 'landed')
-      G.releaseTaskWorkspace(config.repo, store.root, task.id)
+      G.releaseTaskWorkspace(config.repo, store.root, workspaceId(arcId, task.id))
       return
     }
 
@@ -530,7 +618,8 @@ async function runTask(
       store.setTaskState(arcId, task.id, 'running', LEASE_MS)
       const repairBaseSha = G.headSha(wt.path)
       const repaired = await implementLoop(o, task, wt, baselines, heavy,
-        `The reviewer requires changes. Fix ALL of these findings in your existing branch:\n${reviewFindings.join('\n')}`)
+        `The reviewer requires changes. Fix ALL of these findings in your existing branch:\n${reviewFindings.join('\n')}`,
+        'repair')
       if (repaired === 'ok') {
         store.setTaskState(arcId, task.id, 'reviewing', LEASE_MS)
         review = await reviewLoop(o, task, wt, {
@@ -563,7 +652,7 @@ async function runTask(
       propagateDeviations(o, task)
       // Merged into the integration branch, so the isolation has served its
       // purpose. Removing it here is what makes a re-run of the arc possible.
-      G.releaseTaskWorkspace(config.repo, store.root, task.id)
+      G.releaseTaskWorkspace(config.repo, store.root, workspaceId(arcId, task.id))
     }
   } finally {
     clearInterval(heartbeat)
@@ -610,6 +699,8 @@ interface DispatchStepOptions {
   attemptNo: number
   baseSha?: string
   briefArtifactId?: string
+  /** Which budget this attempt spends — 'implement' or 'repair'. */
+  phase?: string
   dispatch: Omit<DispatchOptions, 'role'>
   waitForCapacity?: boolean
 }
@@ -661,7 +752,7 @@ async function dispatchStep(o: RunOptions, step: DispatchStepOptions): Promise<D
       arcId: plan.arcId, taskId: step.taskId, attemptNo: step.attemptNo,
       role: step.roleName, cli: step.role.cli, requestedModel: step.role.model,
       baseSha: step.baseSha, briefArtifactId: step.briefArtifactId,
-      effort: step.role.effort,
+      effort: step.role.effort, phase: step.phase,
     })
     const result = await dispatch({ role: step.role, ...step.dispatch })
     const model = modelStatus(o, step.role, result, attemptId, step.taskId)
@@ -732,19 +823,34 @@ async function dispatchStep(o: RunOptions, step: DispatchStepOptions): Promise<D
 async function implementLoop(
   o: RunOptions, task: PlanTask, wt: G.Worktree, baselines: Map<string, GateResult>, heavy: Semaphore,
   initialFeedback = '',
+  phase: 'implement' | 'repair' = 'implement',
 ): Promise<ImplementOutcome> {
   const { store, plan, config, log } = o
   const arcId = plan.arcId
   const role = config.roles.implement
   if (!role) throw new Error('project.yaml defines no "implement" role')
 
-  const deadline = Date.now() + config.maxTaskMinutes * 60_000
-  const priorSignatures: string[] = []
+  // Every budget is derived from ROWS, so a resume continues one task rather
+  // than starting a fresh one wearing the same name. capacityWaitMinutes was
+  // already durable; nothing else was.
+  const spent = store.spentBudget(arcId, task.id, 'implement', phase)
+  const maxAttempts = phase === 'repair' ? config.maxRepairAttempts : config.maxAttempts
+  const budgetMinutes = phase === 'repair' ? config.maxRepairMinutes : config.maxTaskMinutes
+  const deadline = (spent.startedAt ?? Date.now()) + budgetMinutes * 60_000
+  const priorSignatures: string[] = [...spent.signatures]
+  const alreadySpent = spent.attempts
+  if (alreadySpent > 0) {
+    log(`  · ${task.id}: ${alreadySpent} ${phase} attempt(s) already spent, ` +
+      `${Math.max(0, Math.round((deadline - Date.now()) / 60_000))}min of wall clock left`)
+  }
   let feedback = initialFeedback
 
-  for (let attempt = 1; attempt <= config.maxAttempts; attempt++) {
+  for (let attempt = alreadySpent + 1; attempt <= maxAttempts; attempt++) {
     // Wall clock is checked BETWEEN attempts so nothing is abandoned half-done.
-    if (Date.now() > deadline) { log(`✗ ${task.id}: task wall clock exceeded`); return 'failed' }
+    if (Date.now() > deadline) {
+      log(`✗ ${task.id}: ${phase} budget (${budgetMinutes}min) exhausted across ${attempt - 1} attempt(s) — this budget survives resume`)
+      return 'failed'
+    }
 
     let brief
     try {
@@ -759,10 +865,10 @@ async function implementLoop(
     }
 
     const briefId = store.putArtifact(arcId, 'brief', brief.text)
-    log(`  · ${task.id} implement attempt ${attempt}/${config.maxAttempts} (${role.cli}/${role.model}, brief ${brief.bytes}B)`)
+    log(`  · ${task.id} ${phase} attempt ${attempt}/${maxAttempts} (${role.cli}/${role.model}, brief ${brief.bytes}B)`)
 
     const dispatched = await dispatchStep(o, {
-      roleName: 'implement', role, taskId: task.id, attemptNo: attempt,
+      roleName: 'implement', role, taskId: task.id, attemptNo: attempt, phase,
       baseSha: wt.baseSha, briefArtifactId: briefId,
       dispatch: {
         cwd: wt.path, prompt: brief.text, schema: TaskResult,
@@ -805,7 +911,7 @@ async function implementLoop(
       // burned every remaining attempt on feedback that could not possibly help.
       // The classifier existed, with a doc comment describing exactly this waste.
       if (!isRetryable(res.terminalReason)) {
-        log(`      "${res.terminalReason}" is not something a retry can fix — stopping instead of burning ${config.maxAttempts - attempt} more attempt(s)`)
+        log(`      "${res.terminalReason}" is not something a retry can fix — stopping instead of burning ${maxAttempts - attempt} more attempt(s)`)
         store.addFinding({ arcId, taskId: task.id, attemptId, kind: 'risk', severity: 'high',
           text: `implement ended "${res.terminalReason}", which no retry can fix` })
         return 'failed'
@@ -1040,6 +1146,19 @@ function failureExcerpt(output: string, head = 500, tail = 3_500): string {
   if (text.length <= head + tail) return text
   const elided = text.length - head - tail
   return `${text.slice(0, head)}\n\n[... ${elided} characters elided ...]\n\n${text.slice(-tail)}`
+}
+
+/**
+ * Worktree and branch names are scoped to the ARC, not just the task.
+ *
+ * Two concurrent arcs on one repo whose plans both contain a task called
+ * `task-1` collided on both the path and the branch. Unreachable today — Arc
+ * runs one mission at a time — but it is the FIRST bug concurrent missions
+ * would hit, long before any UI work becomes the bottleneck, and it costs a
+ * line now against a migration later.
+ */
+function workspaceId(arcId: string, taskId: string): string {
+  return `${arcId}--${taskId}`
 }
 
 async function runTaskGates(

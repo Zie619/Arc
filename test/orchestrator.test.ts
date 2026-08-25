@@ -376,7 +376,7 @@ describe('the orchestrator, end to end', () => {
       log, resume: true,
     })
 
-    expect(logs.join('\n')).toContain('releasing and requeueing')
+    expect(logs.join('\n')).toContain('requeueing, keeping its branch')
     expect(store.allTasks('e2e').map((row) => row.id)).toEqual(['stranded'])
     expect(store.allTasks('e2e')[0]!.state).toBe('landed')
     store.close()
@@ -403,6 +403,33 @@ describe('the orchestrator, end to end', () => {
     expect(logs.join('\n')).toContain('it landed')
     expect(logs.join('\n')).not.toContain('releasing and requeueing')
     expect(store.attemptsFor('e2e', 'half-landed')).toHaveLength(0)
+    store.close()
+  }, 60_000)
+
+  it('resume keeps the writer\'s commits instead of rebuilding from attempt one', async () => {
+    const store = new Store(home)
+    const p = plan([task('crashed')])
+    const base = sh(repo, 'rev-parse', 'main')
+    store.createArc(p, repo, base, 'arc/e2e-integration')
+    store.saveRunSnapshot('e2e', config())
+    sh(repo, 'branch', 'arc/e2e-integration', base)
+
+    // Simulate a process killed mid-task with work already committed.
+    const wt = G.provisionWorktree(repo, store.root, 'e2e--crashed', base)
+    writeFileSync(join(wt.path, 'half-done.ts'), 'export const x = 1\n')
+    sh(wt.path, 'add', '-A')
+    sh(wt.path, '-c', 'user.email=f@f.f', '-c', 'user.name=fake', 'commit', '-q', '-m', 'partial work')
+    const rescued = sh(wt.path, 'rev-parse', 'HEAD')
+    store.setTaskState('e2e', 'crashed', 'reviewing', 60_000)
+
+    await runArc({ store, plan: p, config: config(), log, resume: true })
+
+    // The commit survived. Before this, resume force-deleted the branch, so a
+    // task in `reviewing` — committed work, passing gates, possibly a finished
+    // review — started over from nothing on every relaunch.
+    expect(logs.join('\n')).toContain('RECOVERED with')
+    expect(sh(repo, 'log', '--format=%H', 'arc/e2e-integration')).toContain(rescued)
+    expect(store.allTasks('e2e')[0]!.state).toBe('landed')
     store.close()
   }, 60_000)
 
@@ -804,7 +831,7 @@ describe('the gate surface is not the writer\'s to move', () => {
     const store = new Store(home)
     const countingGate = {
       name: 'suite',
-      command: 'if [ -f alpha-generated.ts ]; then echo "Tests  5 passed (5)"; else echo "Tests  7 passed (7)"; fi',
+      command: 'if ls *-generated.ts >/dev/null 2>&1; then echo "Tests  5 passed (5)"; else echo "Tests  7 passed (7)"; fi',
       proves: 'the suite is green',
       baselineSubset: true,
     }

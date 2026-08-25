@@ -183,6 +183,14 @@ export const ProjectConfig = z.object({
    */
   reviewRiskPhase: z.boolean().default(true),
   /**
+   * What a CHANGES_REQUIRED repair round may spend. Explicit, because it used
+   * to acquire a full second copy of maxAttempts and maxTaskMinutes purely by
+   * re-entering the same function — so a config reading "4 attempts, 90
+   * minutes" could mean eight and a hundred and eighty.
+   */
+  maxRepairAttempts: z.number().int().positive().default(1),
+  maxRepairMinutes: z.number().int().positive().default(30),
+  /**
    * The surface a task may not quietly move, because it is what PROVES the
    * task. A writer that deletes an inconvenient test makes every gate strictly
    * greener, and the baseline comparison is structurally blind to it — a

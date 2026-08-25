@@ -2,6 +2,7 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest'
 import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { hostname } from 'node:os'
 import { Store } from '../src/store.ts'
 import { compileBrief } from '../src/brief.ts'
 import type { Plan } from '../src/types.ts'
@@ -311,5 +312,54 @@ describe('the two providers do not mean the same thing by "cached"', () => {
     // would double count.
     expect(codex.billed_input_tokens).toBe(1_000)
     expect(claude.reasoning_tokens).toBe(83)
+  })
+})
+
+describe('a lease is a lock, not a timer', () => {
+  it('refuses a second live claim, reclaims a dead one, and ignores a foreign renewal', () => {
+    const root = mkdtempSync(join(tmpdir(), 'arc-lease-'))
+    const a = new Store(root)
+    const b = new Store(root)
+    const p = { ...plan, arcId: 'leased' }
+    a.createArc(p, '/repo', 'base', 'arc/leased')
+
+    expect(a.claimArc('leased', 60_000)).toBe(true)
+    // Two `arc resume` invocations both ran, both provisioned worktrees, and
+    // collided nondeterministically. The second one refuses now.
+    expect(b.claimArc('leased', 60_000)).toBe(false)
+    // The holder may re-claim its own lease — a resume in the same process is
+    // not a conflict with itself.
+    expect(a.claimArc('leased', 60_000)).toBe(true)
+
+    a.releaseArc('leased')
+    expect(b.claimArc('leased', 60_000)).toBe(true)
+
+    // A lease held by a process that no longer exists is reclaimable even while
+    // unexpired: --until-done kills its child and relaunches within seconds,
+    // well inside any sane lease, so expiry alone would lock out the successor.
+    ;(b as any).db.prepare('UPDATE arc SET lease_owner = ?, lease_expires_at = ? WHERE id = ?')
+      .run(`${hostname()}:999999:dead`, Date.now() + 60_000, 'leased')
+    expect(a.claimArc('leased', 60_000)).toBe(true)
+
+    a.close(); b.close()
+    rmSync(root, { recursive: true, force: true })
+  })
+
+  it('will not let another process renew a task lease it does not hold', () => {
+    const root = mkdtempSync(join(tmpdir(), 'arc-tasklease-'))
+    const mine = new Store(root)
+    const theirs = new Store(root)
+    mine.createArc({ ...plan, arcId: 'own' }, '/repo', 'base', 'arc/own')
+    mine.setTaskState('own', 't1', 'running', 50_000)
+    mine.renewLease('own', 't1', 50_000)
+    const held = mine.allTasks('own')[0]!.lease_expires_at
+
+    theirs.renewLease('own', 't1', 999_000)
+    // No owner check meant any process could renew any task's lease, so two
+    // processes could both believe they owned the task and both keep renewing.
+    expect(mine.allTasks('own')[0]!.lease_expires_at).toBe(held)
+
+    mine.close(); theirs.close()
+    rmSync(root, { recursive: true, force: true })
   })
 })

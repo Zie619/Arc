@@ -78,6 +78,9 @@ export interface Worktree {
   path: string
   branch: string
   baseSha: string
+  /** True when an existing worktree was REUSED with the writer's commits still
+   *  on it, rather than created fresh. Only a resume produces this. */
+  recovered?: boolean
 }
 
 /**
@@ -102,8 +105,16 @@ export function provisionWorktree(repo: string, root: string, taskId: string, ba
     if (actual === branch) {
       const expectedBase = git(repo, 'rev-parse', `${baseSha}^{commit}`)
       const head = git(path, 'rev-parse', 'HEAD')
-      if (expectedBase !== head) throw new Error(`worktree path ${path} expected "${expectedBase}", actual "${head}" — refusing to reuse`)
-      return { path, branch, baseSha: head }
+      if (expectedBase === head) return { path, branch, baseSha: head }
+      // AHEAD of the base is the crash case, and it is the writer's committed
+      // work. Resume used to force-delete this branch and rebuild from attempt
+      // one — so a task caught in `reviewing`, with passing gates and possibly a
+      // finished review, lost all of it. Keep it: the base stays the ORIGINAL
+      // base so the diff still covers everything committed.
+      if (gitOk(repo, 'merge-base', '--is-ancestor', expectedBase, head)) {
+        return { path, branch, baseSha: expectedBase, recovered: true }
+      }
+      throw new Error(`worktree path ${path} is on "${head}", which does not descend from "${expectedBase}" — refusing to reuse`)
     }
     throw new Error(`worktree path ${path} exists but is on "${actual}", expected "${branch}" — refusing to reuse`)
   }
@@ -148,10 +159,13 @@ export function releaseTaskWorkspace(repo: string, root: string, taskId: string)
 export function arcBranches(repo: string, arcId: string): string[] {
   const out = git(repo, 'for-each-ref', '--format=%(refname:short)', 'refs/heads/arc/')
   const all = out ? out.split('\n').filter(Boolean) : []
+  // Task branches are `arc/<arcId>--<taskId>`, so this can now be exact.
+  // It used to sweep up every branch that did not LOOK like an integration
+  // branch, which meant another arc's task branches as well.
   return all.filter((b) =>
     b === `arc/${arcId}-integration` ||
     b === `arc/${arcId}-integration-review` ||
-    (!b.endsWith('-integration') && !b.endsWith('-integration-review')))
+    b.startsWith(`arc/${arcId}--`))
 }
 
 /**

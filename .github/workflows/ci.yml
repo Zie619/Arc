@@ -22,3 +22,6 @@ jobs:
       - run: pnpm install --frozen-lockfile
       - run: pnpm typecheck
       - run: pnpm test
+      # Arc grading Arc: 12 scenarios, seven of them attacks that must fail.
+      # Zero tokens, seconds to run, non-zero exit when an invariant slips.
+      - run: pnpm bench

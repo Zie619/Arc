@@ -82,7 +82,7 @@ export const SCENARIOS: Scenario[] = [
         name: 'suite',
         // Exits 0 both times. `result.pass` short-circuits every baseline
         // comparison, so only an executed-count check can see the deletion.
-        command: 'if [ -f alpha-generated.ts ]; then echo "Tests  5 passed (5)"; else echo "Tests  7 passed (7)"; fi',
+        command: 'if ls *-generated.ts >/dev/null 2>&1; then echo "Tests  5 passed (5)"; else echo "Tests  7 passed (7)"; fi',
         proves: 'the suite is green',
         baselineSubset: true,
       }],

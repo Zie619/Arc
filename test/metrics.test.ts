@@ -3,27 +3,13 @@ import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { Store } from '../src/store.ts'
-import { SCENARIOS } from '../bench/scenarios.ts'
-import { runBench } from '../src/bench.ts'
 
 /**
- * The self-benchmark runs in CI because a regression suite nobody runs is a
- * document. It costs no tokens and finishes in seconds, so there is no reason
- * for it to be optional.
+ * The self-benchmark itself runs as its own CI step (`pnpm bench`), not as a
+ * test file: it spawns a dozen full arcs and starved the other spawn-heavy
+ * suites of CPU when vitest ran them in parallel. Its own runner is the gate.
+ * What stays here is the reporting built on the same rows.
  */
-describe('arc grades arc', () => {
-  it('holds every invariant, including the ones under attack', async () => {
-    const results = await runBench(SCENARIOS)
-    const broken = results.filter((r) => !r.passed)
-    expect(broken.map((r) => `${r.id}: ${r.why.join('; ')}`)).toEqual([])
-    // Half of them must be attacks. A bench of happy paths measures only what
-    // Arc already does well, which is the failure mode a self-written benchmark
-    // is most prone to.
-    expect(results.filter((r) => r.defends.startsWith('ATTACK')).length)
-      .toBeGreaterThanOrEqual(Math.floor(results.length / 2))
-  }, 120_000)
-})
-
 describe('comparing two runs, and catching a gate that contradicts itself', () => {
   it('diffs one arc against another and proves flakiness rather than inferring it', () => {
     const home = mkdtempSync(join(tmpdir(), 'arcmetrics-'))

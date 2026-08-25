@@ -103,16 +103,24 @@ describe('unattended run process boundaries', () => {
     store.close()
   }, 30_000)
 
-  it('honors the ten-relaunch cap and leaves an actionable incomplete arc', () => {
+  it('stops a deterministic crash after three relaunches that changed nothing', () => {
+    // The cap used to be a flat ten relaunches, which counts the wrong thing: a
+    // crash loop burns all ten in 150 seconds while a laptop that slept four
+    // times overnight uses four. What matters is whether a relaunch moved the
+    // ledger, and the event log already answers that.
     const result = run({ ARC_TEST_CRASH_AFTER_START: 'repeatable crash' }, true)
     expect(result.status).toBe(2)
-    expect(result.stderr).toContain('relaunch cap reached after 11 crash(es)')
+    expect(result.stderr).toContain('produced no forward progress')
 
     const store = new Store(home)
     expect(store.getArc('unattended')?.status).toBe('incomplete')
     const exhausted = store.eventsSince('unattended', 0).at(-1)
     expect(exhausted?.kind).toBe('arc.supervisor.exhausted')
-    expect((exhausted?.payload as { crashes: unknown[] }).crashes).toHaveLength(11)
+    const payload = exhausted?.payload as { crashes: unknown[]; barren: number; reason: string }
+    expect(payload.reason).toBe('no forward progress')
+    expect(payload.barren).toBe(3)
+    // Every crash is still itemised, so the arc stays actionable.
+    expect(payload.crashes).toHaveLength(3)
     store.close()
   }, 30_000)
 

@@ -57,13 +57,31 @@ describe('worktree isolation FAILS CLOSED', () => {
     expect(() => G.provisionWorktree(repo, root, 'task-2', base)).toThrow(/refusing to reuse/)
   })
 
-  it('refuses to reuse a stale worktree and names expected vs actual sha', () => {
+  it('RECOVERS a worktree that is ahead of its base, because that is the writer\'s work', () => {
     const base = G.headSha(repo)
-    const wt = G.provisionWorktree(repo, root, 'stale-base', base)
-    const actual = commit(wt.path, 'partial.ts', 'partial\n', 'partial work')
+    const wt = G.provisionWorktree(repo, root, 'crashed', base)
+    const head = commit(wt.path, 'partial.ts', 'partial\n', 'partial work')
 
-    expect(() => G.provisionWorktree(repo, root, 'stale-base', base))
-      .toThrow(new RegExp(`expected.*${base}.*actual.*${actual}`))
+    // This used to throw, so resume force-deleted the branch and rebuilt from
+    // attempt one — a task caught in `reviewing` lost committed work, passing
+    // gates and possibly a finished review, ten times over under --until-done.
+    const again = G.provisionWorktree(repo, root, 'crashed', base)
+    expect(again.recovered).toBe(true)
+    // The base stays the ORIGINAL base, so the diff still covers everything
+    // committed. Returning `head` here would hide the recovered work from review.
+    expect(again.baseSha).toBe(base)
+    expect(G.headSha(again.path)).toBe(head)
+  })
+
+  it('still refuses a worktree whose head does not descend from the base', () => {
+    const base = G.headSha(repo)
+    G.provisionWorktree(repo, root, 'divergent', base)
+    const moved = commit(repo, 'elsewhere.txt', 'x\n', 'main moves on')
+
+    // Unrelated history is not recoverable work; it is a mismatch, and this
+    // still fails closed rather than reusing a tree it cannot explain.
+    expect(() => G.provisionWorktree(repo, root, 'divergent', moved))
+      .toThrow(/does not descend/)
   })
 
   it('pins every task in a wave to the SAME base, not to a racing HEAD', () => {
@@ -214,19 +232,24 @@ describe('cleanup makes a failed task re-runnable', () => {
 
   it('lists the branches an arc created', () => {
     const base = G.headSha(repo)
-    G.provisionWorktree(repo, root, 'b-one', base)
-    G.provisionWorktree(repo, root, 'b-two', base)
+    // Task workspaces are arc-scoped: `<arcId>--<taskId>`. Two concurrent arcs
+    // whose plans both contain "task-1" used to collide on the path AND the
+    // branch, which is the first bug concurrent missions would hit.
+    G.provisionWorktree(repo, root, 'myarc--b-one', base)
+    G.provisionWorktree(repo, root, 'myarc--b-two', base)
+    G.provisionWorktree(repo, root, 'otherarc--b-one', base)
     sh(repo, 'branch', 'arc/myarc-integration', base)
     sh(repo, 'branch', 'arc/myarc-integration-review', base)
     sh(repo, 'branch', 'arc/otherarc-integration', base)
     sh(repo, 'branch', 'arc/otherarc-integration-review', base)
     const branches = G.arcBranches(repo, 'myarc')
-    expect(branches).toContain('arc/b-one')
-    expect(branches).toContain('arc/b-two')
+    expect(branches).toContain('arc/myarc--b-one')
+    expect(branches).toContain('arc/myarc--b-two')
     expect(branches).toContain('arc/myarc-integration')
     expect(branches).toContain('arc/myarc-integration-review')
-    // Another arc's integration/review scratch branches are NOT this arc's
-    // task branches — misclassifying them invites cleanup to delete them.
+    // Another arc's branches are not this arc's, task branches included. The
+    // old rule swept up anything that did not LOOK like an integration branch.
+    expect(branches).not.toContain('arc/otherarc--b-one')
     expect(branches).not.toContain('arc/otherarc-integration')
     expect(branches).not.toContain('arc/otherarc-integration-review')
   })
