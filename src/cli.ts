@@ -171,7 +171,9 @@ interface SupervisedExit {
 }
 
 function supervisorArgs(mode: 'run' | 'resume', planPath: string, configPath?: string): string[] {
-  const args = [resolve(process.argv[1]!), mode, planPath]
+  const args = [resolve(process.argv[1]!), mode]
+  // A TUI-born arc has no plan file; resume reads its plan from the store.
+  if (planPath) args.push(planPath)
   if (configPath) args.push('--config', configPath)
   const repo = flag(process.argv.slice(2), '--repo')
   if (repo) args.push('--repo', resolve(repo))
@@ -202,12 +204,12 @@ async function launchSupervisedChild(
 }
 
 async function superviseRun(
-  store: Store, plan: Plan, planPath: string, configPath?: string,
+  store: Store, plan: Plan, planPath: string, configPath?: string, startMode: 'run' | 'resume' = 'run',
 ): Promise<number> {
   const crashes: Array<SupervisedExit & { event?: unknown }> = []
   const delay = Number(process.env.ARC_SUPERVISOR_BACKOFF_MS)
   const relaunchDelayMs = Number.isFinite(delay) && delay >= 0 ? delay : 15_000
-  let mode: 'run' | 'resume' = 'run'
+  let mode: 'run' | 'resume' = startMode
   let relaunches = 0
 
   for (;;) {
@@ -280,7 +282,7 @@ ${C.bold('Plumbing — arc "..." already runs all of these for you:')}
 
 Options:
   --danger        no approval stops: take every recommendation, run the plan
-  --until-done    supervise arc run, prevent sleep, and resume after crashes
+  --until-done    supervise arc run/resume, prevent sleep, relaunch after crashes
   --config <p>    use a specific config instead of auto-detection
   --id <name>     name the arc (default: derived from your brief)
   --version, -V   print the installed arc version
@@ -304,6 +306,18 @@ async function main(): Promise<void> {
   // Bare `arc` opens the app and you type there — same as `claude`. Anything
   // that is not a known subcommand is a brief.
   const cmd = first && SUBCOMMANDS.has(first) ? first : 'go'
+
+  // --until-done supervises a child process through crashes and sleep. Only the
+  // two commands that OWN a run can be relaunched that way; the design phase
+  // asks the operator questions, and a relaunch would restart the interview.
+  // Accepting the flag anywhere else printed it in --help and did nothing —
+  // which is precisely the silent no-op this tool exists to refuse.
+  if (argv.includes('--until-done') && cmd !== 'run' && cmd !== 'resume') {
+    die(`--until-done supervises \`arc run\` and \`arc resume\`, not \`arc ${cmd === 'go' ? '"<goal>"' : cmd}\`.\n`
+      + `  Get a plan first, then supervise the build:\n`
+      + `    arc "<goal>"                          # design + approve the plan\n`
+      + `    arc run plan.yaml --until-done        # walk away`)
+  }
 
   const ci = argv.indexOf('--config')
   const configPath = ci >= 0 ? resolve(argv[ci + 1]!) : undefined
@@ -521,10 +535,13 @@ async function main(): Promise<void> {
         // argument, resume the latest arc from its stored plan.
         // (First dogfood run: crash recovery was impossible without this.)
         let plan: Plan
+        let resumePlanPath = ''
         if (positional[0]) {
-          plan = loadPlan(resolve(positional[0]))
+          resumePlanPath = resolve(positional[0])
+          plan = loadPlan(resumePlanPath)
         } else if (existsSync(resolve('plan.yaml'))) {
-          plan = loadPlan(resolve('plan.yaml'))
+          resumePlanPath = resolve('plan.yaml')
+          plan = loadPlan(resumePlanPath)
         } else {
           const arcId = store.latestArcId()
           if (!arcId) die('no arcs yet')
@@ -533,6 +550,11 @@ async function main(): Promise<void> {
           plan = stored!
         }
         if (!store.getArc(plan.arcId)) die(`no arc "${plan.arcId}" to resume — use \`run\``)
+        if (argv.includes('--until-done') && process.env.ARC_UNTIL_DONE_CHILD !== '1') {
+          const code = await superviseRun(store, plan, resumePlanPath, configPath, 'resume')
+          if (code !== 0) { store.close(); process.exit(code) }
+          break
+        }
         beginActiveRun(store, plan.arcId)
         try {
           await runArc({ store, plan, config, log: (l) => console.log(l), resume: true, preflight: true })

@@ -68,7 +68,10 @@ function config(over: Partial<any> = {}) {
     name: 'test',
     repo,
     mainBranch: 'main',
-    landStrategy: 'push',
+    // 'none' by default: a test that is not ABOUT delivery must not silently
+    // exercise a push to an origin it never set up. The delivery suite sets its
+    // own strategy explicitly, and the arc's status now depends on delivery.
+    landStrategy: 'none',
     agentConcurrency: 3,
     heavyGateLimit: 1,
     maxAttempts: 1,
@@ -376,6 +379,30 @@ describe('the orchestrator, end to end', () => {
     expect(logs.join('\n')).toContain('releasing and requeueing')
     expect(store.allTasks('e2e').map((row) => row.id)).toEqual(['stranded'])
     expect(store.allTasks('e2e')[0]!.state).toBe('landed')
+    store.close()
+  }, 60_000)
+
+  it('resume sees a task that already landed and does not rebuild it', async () => {
+    const store = new Store(home)
+    const p = plan([task('half-landed')])
+    const base = sh(repo, 'rev-parse', 'main')
+    // landTask merges, THEN writes the state. A crash in that window leaves the
+    // row saying "landing" over work the integration branch already carries —
+    // and rebuilding it means rebasing a change onto itself, which conflicts,
+    // which reports a task that genuinely LANDED as failed.
+    const landedSha = sh(repo, 'commit-tree', sh(repo, 'rev-parse', 'main^{tree}'), '-p', base, '-m', 'landed work')
+    sh(repo, 'branch', 'arc/e2e-integration', landedSha)
+    store.createArc(p, repo, base, 'arc/e2e-integration')
+    store.saveRunSnapshot('e2e', config())
+    store.setTaskHead('e2e', 'half-landed', landedSha, [])
+    store.setTaskState('e2e', 'half-landed', 'landing', 60_000)
+
+    await runArc({ store, plan: p, config: config(), log, resume: true })
+
+    expect(store.allTasks('e2e')[0]!.state).toBe('landed')
+    expect(logs.join('\n')).toContain('it landed')
+    expect(logs.join('\n')).not.toContain('releasing and requeueing')
+    expect(store.attemptsFor('e2e', 'half-landed')).toHaveLength(0)
     store.close()
   }, 60_000)
 
@@ -995,6 +1022,19 @@ describe('delivery leaves ZERO local residue', () => {
     expect(logs.join('\n')).toContain('zero local residue')
     expect(sh(repo, 'for-each-ref', '--format=%(refname:short)', 'refs/heads/arc/')).toBe('')
     expect(sh(bare, 'rev-parse', 'main')).toBe(sh(repo, 'rev-parse', 'main'))
+    store.close()
+  }, 60_000)
+
+  it('push: a rejected push leaves the arc INCOMPLETE, never done', async () => {
+    const store = new Store(home)
+    sh(repo, 'remote', 'set-url', 'origin', join(home, 'no-such-remote.git'))
+    await runArc({ store, plan: plan([task('undelivered')]), config: config({ landStrategy: 'push' }), log })
+
+    // The arc used to be closed 'done' BEFORE delivery was attempted, so a
+    // rejected push still exited 0 and an unattended caller recorded success
+    // for work that never left the machine.
+    expect(logs.join('\n')).toContain('push rejected')
+    expect(store.getArc('e2e')?.status).toBe('incomplete')
     store.close()
   }, 60_000)
 

@@ -215,6 +215,20 @@ describe('dispatch parses a real-shaped event stream', () => {
 })
 
 describe('model drift detection', () => {
+  it('does not let a substring pass for a pinned version', () => {
+    // `gpt-5` normalises to a prefix of `gpt-5.6-sol`, so the substring test
+    // alone reported a 5.6 run as an ok 5 run — and did it in 'every' mode too,
+    // which exists precisely to catch a mid-session downgrade.
+    expect(checkModel('gpt-5', ['gpt-5.6-sol'], true)).toBe('drift')
+    expect(checkModel('gpt-5', ['gpt-5.6-sol'], true, 'every')).toBe('drift')
+    expect(auxiliaryModels('gpt-5', ['gpt-5.6-sol'])).toEqual(['gpt-5.6-sol'])
+  })
+
+  it('still treats a bare family word as an alias, and a date stamp as noise', () => {
+    expect(checkModel('opus', ['claude-opus-5'], true)).toBe('ok')
+    expect(checkModel('claude-opus-4-8', ['claude-opus-4-8-20260115'], true)).toBe('ok')
+  })
+
   it('accepts an alias that resolves to a dated model id', () => {
     // `opus` means "the latest Opus", so equality is the wrong comparison.
     expect(checkModel('opus', ['claude-opus-4-8-20260115'], true)).toBe('ok')

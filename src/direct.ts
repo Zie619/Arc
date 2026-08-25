@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os'
 import { join, relative, resolve } from 'node:path'
 import { dispatch, checkModel, modelCheckMode, sameModel, type DispatchOptions, type DispatchResult } from './harness.ts'
 import { git, headSha } from './git.ts'
-import { describe, isSubsetOfBaseline, runGate, selectGates, type GateResult } from './gates.ts'
+import { checkOutcome, describe, isSubsetOfBaseline, runGate, selectGates, type GateResult } from './gates.ts'
 import { signaturesMatch } from './classify.ts'
 import {
   RiskChecklist,
@@ -743,7 +743,10 @@ async function runDirectFrom(
       line: finding.line,
       claim: finding.claim,
       command: finding.checkCommand!,
-      ran: true,
+      // `ran` is FALSE when the command could not execute at all — a missing
+      // binary, a sandbox that refused to launch. That is not "did not
+      // reproduce"; it is no evidence either way.
+      ran: checkOutcome(result) !== 'could-not-run',
       reproduced: result.pass,
       result,
     })

@@ -1,4 +1,4 @@
-import { spawn } from 'node:child_process'
+import { spawn, spawnSync } from 'node:child_process'
 import { realpathSync } from 'node:fs'
 import { join, isAbsolute } from 'node:path'
 import { normalizeFailureSignature } from './classify.ts'
@@ -29,6 +29,9 @@ export interface GateResult {
   signature: string
   baseSha: string
   durationMs: number
+  /** Whether the deny-write profile ACTUALLY applied. A readOnly gate that ran
+   *  without one is not the same evidence, and must not be recorded as if it were. */
+  sandboxed: boolean
 }
 
 // Deny-write profile for reviewer-authored commands. Temp dirs and /dev stay
@@ -39,13 +42,31 @@ const READ_ONLY_PROFILE =
   '(version 1)(allow default)(deny file-write*)' +
   '(allow file-write* (subpath "/private/tmp") (subpath "/private/var/folders") (subpath "/dev"))'
 
-function gateArgv(gate: GateDef, dir: string): { bin: string; args: string[] } {
-  if (gate.readOnly && process.platform === 'darwin') {
+/**
+ * Seatbelt refuses to NEST — a profile cannot even tighten inside another one.
+ * `sandbox-exec` then exits 71 without ever running the command, which is
+ * indistinguishable from a check that failed to reproduce. That fires on every
+ * read-only gate whenever arc itself is invoked from inside a sandboxed agent
+ * session, so probe once and stop launching a sandbox that cannot apply.
+ */
+let sandboxProbe: boolean | undefined
+export function sandboxUsable(): boolean {
+  if (sandboxProbe !== undefined) return sandboxProbe
+  if (process.platform !== 'darwin') { sandboxProbe = false; return sandboxProbe }
+  const probe = spawnSync('/usr/bin/sandbox-exec',
+    ['-p', '(version 1)(allow default)(deny file-write*)', '/usr/bin/true'],
+    { stdio: 'ignore', timeout: 5_000 })
+  sandboxProbe = probe.status === 0
+  return sandboxProbe
+}
+
+function gateArgv(gate: GateDef, dir: string): { bin: string; args: string[]; sandboxed: boolean } {
+  if (gate.readOnly && sandboxUsable()) {
     const target = JSON.stringify(realpathSync(dir))
     const profile = `${READ_ONLY_PROFILE}(deny file-write* (subpath ${target}))`
-    return { bin: '/usr/bin/sandbox-exec', args: ['-p', profile, 'bash', '-c', gate.command] }
+    return { bin: '/usr/bin/sandbox-exec', args: ['-p', profile, 'bash', '-c', gate.command], sandboxed: true }
   }
-  return { bin: 'bash', args: ['-c', gate.command] }
+  return { bin: 'bash', args: ['-c', gate.command], sandboxed: false }
 }
 
 export async function runGate(
@@ -56,7 +77,7 @@ export async function runGate(
 ): Promise<GateResult> {
   const started = Date.now()
   const dir = isAbsolute(gate.cwd) ? gate.cwd : join(cwd, gate.cwd)
-  const { bin, args } = gateArgv(gate, dir)
+  const { bin, args, sandboxed } = gateArgv(gate, dir)
   return await new Promise<GateResult>((resolve) => {
     let output = ''
     let timedOut = false
@@ -91,7 +112,7 @@ export async function runGate(
         exitCode, pass, timedOut,
         output: trimmed.slice(-20_000),
         signature: normalizeFailureSignature(trimmed),
-        baseSha, durationMs: Date.now() - started,
+        baseSha, durationMs: Date.now() - started, sandboxed,
       })
     }
     const abort = (): void => { kill() }
@@ -112,19 +133,51 @@ export async function runGate(
  * task may not introduce a failure the baseline did not already have.
  */
 export function isSubsetOfBaseline(result: GateResult, baseline: GateResult): boolean {
+  // A run that did not FINISH proved nothing. Its signature is empty or partial,
+  // so every comparison below would be vacuous — and `[].every()` is true, which
+  // would report a timed-out gate as within baseline.
+  if (result.timedOut || result.exitCode === null) return false
   if (result.pass) return true
   if (baseline.pass) return false // baseline was green, we are red: genuinely ours
 
-  const baseLines = new Set(failureLines(baseline.signature))
   const newLines = failureLines(result.signature)
+  // Fail closed. A red gate whose output we could not parse into failure lines
+  // is not a PROVEN subset of anything; accepting it is the vacuous-truth hole
+  // that let ordinary `2 failed | 5 passed` runner output through untouched.
+  if (newLines.length === 0) return false
+  const baseLines = new Set(failureLines(baseline.signature))
   return newLines.every((l) => baseLines.has(l))
 }
 
+/**
+ * Classify, never detect (see the header). Deliberately NO trailing `\b`: the
+ * word is `failed`, `failure`, `errors` far more often than it is bare `fail`,
+ * and a trailing boundary makes the pattern miss every one of them. Over-matching
+ * is the safe direction — an extra line the baseline lacks fails the gate.
+ */
 function failureLines(signature: string): string[] {
   return signature
     .split('\n')
-    .filter((l) => /\b(fail|error|✗|✕|FAIL|ERR!)\b/i.test(l))
+    .filter((l) => /(fail|error|✗|✕|err!)/i.test(l))
     .map((l) => l.trim())
+}
+
+export type CheckOutcome = 'reproduced' | 'refuted' | 'could-not-run'
+
+/**
+ * Three outcomes, not two. A command that could not RUN — missing binary,
+ * a sandbox that refused to launch, a timeout — proved nothing in either
+ * direction. Calling that "did not reproduce" silently deletes the reviewer's
+ * evidence, which is the one thing this system exists not to do.
+ */
+export function checkOutcome(r: GateResult): CheckOutcome {
+  if (r.pass) return 'reproduced'
+  // 126/127: not executable / not found. 71: sandbox-exec could not apply its
+  // profile, so the command never ran at all.
+  if (r.timedOut || r.exitCode === null) return 'could-not-run'
+  if (r.exitCode === 126 || r.exitCode === 127) return 'could-not-run'
+  if (r.sandboxed && r.exitCode === 71) return 'could-not-run'
+  return 'refuted'
 }
 
 export function selectGates(all: GateDef[], names: string[]): GateDef[] {

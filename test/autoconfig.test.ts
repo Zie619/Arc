@@ -185,3 +185,18 @@ describe('a stale config pointing at another repo', () => {
     } finally { rmSync(other, { recursive: true, force: true }) }
   })
 })
+
+describe('the reviewer gets a read-only git', () => {
+  it('never hands review or integrate a git glob that can move the operator refs', () => {
+    const detected = detectProject(repo).config
+    for (const name of ['review', 'integrate'] as const) {
+      const tools = String((detected.roles as any)[name]?.tools ?? '')
+      // `Bash(git *)` included reset --hard, checkout, branch -D and push — in a
+      // worktree whose .git IS the operator's repository, with no OS sandbox
+      // under it on the claude lane.
+      expect(tools).not.toContain('Bash(git *)')
+      expect(tools).toContain('Bash(git diff:*)')
+      expect(tools).not.toMatch(/push|reset|checkout|branch/)
+    }
+  })
+})

@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { dispatch, checkModel, modelCheckMode } from './harness.ts'
 import { captureDirectSnapshot, type DirectTranscript, type DirectFindingCheck, type LaneAttemptObserver } from './direct.ts'
-import { describe, isSubsetOfBaseline, runGate, type GateResult } from './gates.ts'
+import { checkOutcome, describe, isSubsetOfBaseline, runGate, type GateResult } from './gates.ts'
 import { RiskChecklist, ReviewVerdict, type ProjectConfig, type RoleBinding } from './types.ts'
 
 export interface ReviewLaneResult {
@@ -165,9 +165,12 @@ export async function runReviewLane(options: {
         baselineSubset: false,
         readOnly: true,
       }, config.repo, before.head, signal)
+      if (!result.sandboxed) {
+        caveats.push(`the check for ${finding.file}:${finding.line} ran with NO write sandbox — this platform has none available, and the command was model-authored`)
+      }
       findingChecks.push({
         file: finding.file, line: finding.line, claim: finding.claim,
-        command: finding.checkCommand!, ran: true, reproduced: result.pass, result,
+        command: finding.checkCommand!, ran: checkOutcome(result) !== 'could-not-run', reproduced: result.pass, result,
       })
     }
     const after = captureDirectSnapshot(config.repo)

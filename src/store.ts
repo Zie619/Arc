@@ -299,6 +299,12 @@ export class Store {
     mkdirSync(join(root, 'artifacts'), { recursive: true })
     this.db = new DatabaseSync(join(root, 'arc.db'))
     this.db.exec('PRAGMA journal_mode = WAL')
+    // WAL lets a reader and a writer coexist; it does NOT serialize two writers
+    // — the second gets SQLITE_BUSY immediately without this. `arc run
+    // --until-done` keeps a Store open in the supervisor while its child opens
+    // the same file, so contention is now reachable, and a throw here becomes a
+    // crash and a relaunch.
+    this.db.exec('PRAGMA busy_timeout = 5000')
     this.db.exec('PRAGMA foreign_keys = ON')
     for (const m of MIGRATIONS) this.db.exec(m)
     // Columns added after a table shipped. CREATE IF NOT EXISTS cannot alter
@@ -1108,12 +1114,16 @@ export class Store {
     artifactId: string
     command: string
     exitCode: number | null
-    verdict: 'pass' | 'fail'
+    // 'inconclusive' is a THIRD outcome: the command could not run, so it
+    // refuted nothing. Collapsing it into 'fail' is what deleted evidence.
+    verdict: 'pass' | 'fail' | 'inconclusive'
+    caveat?: string
   }): void {
     this.db.prepare(
       `INSERT INTO finding_evidence (finding_id, artifact_id, command, exit_code, verdict, created_at)
        VALUES (?, ?, ?, ?, ?, ?)`,
-    ).run(findingId, evidence.artifactId, evidence.command, evidence.exitCode, evidence.verdict, Date.now())
+    ).run(findingId, evidence.artifactId, evidence.command, evidence.exitCode,
+          evidence.caveat ? `${evidence.verdict} (${evidence.caveat})` : evidence.verdict, Date.now())
   }
 
   evidenceForFinding(findingId: string): Array<Record<string, any>> {

@@ -261,3 +261,14 @@ describe('the token bill', () => {
     expect(rows.find((r) => r.role === 'review')!.receipted).toBe(0)
   })
 })
+
+describe('two writers wait instead of throwing', () => {
+  it('sets a busy timeout, because the supervisor opens the db twice', () => {
+    const store = new Store(mkdtempSync(join(tmpdir(), 'arc-busy-')))
+    // WAL lets a reader and a writer coexist; it does NOT serialize two
+    // writers. Without this, a contended setTaskState throws SQLITE_BUSY
+    // immediately, which under --until-done becomes a crash and a relaunch.
+    expect((store as any).db.prepare('PRAGMA busy_timeout').get().timeout).toBe(5000)
+    store.close()
+  })
+})

@@ -4,7 +4,7 @@ import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { GateDef } from '../src/types.ts'
-import { runGate } from '../src/gates.ts'
+import { runGate, isSubsetOfBaseline, checkOutcome, type GateResult } from '../src/gates.ts'
 
 function gate(command: string, timeoutMs = 2_000, envAllowlist?: string[]) {
   return GateDef.parse({ name: 'probe', command, proves: 'the probe', timeoutMs, envAllowlist })
@@ -99,5 +99,56 @@ describe('async gates', () => {
     expect(result.pass).toBe(false)
     expect(result.exitCode).toBeNull()
     expect(result.durationMs).toBeLessThan(1_000)
+  })
+})
+
+function result(over: Partial<GateResult> = {}): GateResult {
+  return {
+    name: 'probe', command: 'x', proves: 'y', exitCode: 1, pass: false, timedOut: false,
+    output: '', signature: '', baseSha: 'base', durationMs: 1, sandboxed: false, ...over,
+  }
+}
+
+describe('baseline comparison fails closed', () => {
+  // The trailing \b in the old pattern meant `failed`, `errors` and `failure`
+  // never matched — so `.every()` ran over an EMPTY list and every red gate
+  // from a normal runner was accepted as "within baseline".
+  const vitestRed = 'Tests  2 failed | 5 passed\nFAIL  src/a.test.ts > does the thing'
+
+  it('sees the failure lines a real runner prints', () => {
+    const baseline = result({ signature: 'Tests  1 failed | 6 passed' })
+    expect(isSubsetOfBaseline(result({ signature: vitestRed }), baseline)).toBe(false)
+  })
+
+  it('refuses a red result whose output yields no failure line at all', () => {
+    // Unparseable is not proven-equivalent. Vacuous truth is how a red gate
+    // walked through this function untouched.
+    expect(isSubsetOfBaseline(result({ signature: 'exited oddly' }), result({ signature: 'exited oddly too' })))
+      .toBe(false)
+  })
+
+  it('refuses a run that never finished, however green the baseline looked', () => {
+    expect(isSubsetOfBaseline(result({ timedOut: true, exitCode: null }), result({ signature: 'FAIL a' })))
+      .toBe(false)
+    expect(isSubsetOfBaseline(result({ exitCode: null, pass: false }), result({ signature: 'FAIL a' })))
+      .toBe(false)
+  })
+
+  it('still accepts a genuine subset of the same failures', () => {
+    const baseline = result({ signature: 'FAIL a\nFAIL b' })
+    expect(isSubsetOfBaseline(result({ signature: 'FAIL a' }), baseline)).toBe(true)
+  })
+})
+
+describe('a check that could not RUN refuted nothing', () => {
+  it('separates refuted from could-not-run', () => {
+    expect(checkOutcome(result({ pass: true, exitCode: 0 }))).toBe('reproduced')
+    expect(checkOutcome(result({ exitCode: 1 }))).toBe('refuted')
+    expect(checkOutcome(result({ exitCode: 127 }))).toBe('could-not-run')   // no such command
+    expect(checkOutcome(result({ exitCode: 126 }))).toBe('could-not-run')   // not executable
+    expect(checkOutcome(result({ timedOut: true, exitCode: null }))).toBe('could-not-run')
+    // sandbox-exec exits 71 when Seatbelt refuses to nest: the command never ran.
+    expect(checkOutcome(result({ exitCode: 71, sandboxed: true }))).toBe('could-not-run')
+    expect(checkOutcome(result({ exitCode: 71, sandboxed: false }))).toBe('refuted')
   })
 })

@@ -7,7 +7,7 @@ import {
   type DispatchOptions, type DispatchResult,
 } from './harness.ts'
 import { computeFrontier } from './scheduler.ts'
-import { runGate, selectGates, isSubsetOfBaseline, describe, type GateResult } from './gates.ts'
+import { runGate, selectGates, isSubsetOfBaseline, describe, checkOutcome, type CheckOutcome, type GateResult } from './gates.ts'
 import { signaturesMatch, signatureSimilarity } from './classify.ts'
 import * as G from './git.ts'
 import { formatCostSummary } from './cost.ts'
@@ -145,13 +145,28 @@ export async function runArc(o: RunOptions): Promise<void> {
     // isolation and put it back on the queue — the frontier is a pure function
     // of rows, so everything else recomputes itself.
     const stuck = store.allTasks(arcId).filter((t) => ['running', 'reviewing', 'landing'].includes(String(t.state)))
+    let requeued = 0
     for (const t of stuck) {
+      // The merge and the state write are two operations; a crash between them
+      // leaves the row saying "landing" over work that IS already merged. Ask
+      // git, which is the only thing that actually knows. Rebuilding the task
+      // would re-derive a change the integration branch already carries, and
+      // then fail its own rebase and report a LANDED task as failed.
+      const head = String(t.head_sha ?? '')
+      if (head && G.gitOk(repo, 'merge-base', '--is-ancestor', head, integrationBranch)) {
+        log(`resume: ${t.id} was "${t.state}" but ${head.slice(0, 8)} is already on ${integrationBranch} — it landed`)
+        store.setTaskState(arcId, String(t.id), 'landed')
+        store.appendEvent(arcId, 'land.recovered', { headSha: head }, String(t.id))
+        G.releaseTaskWorkspace(repo, store.root, String(t.id))
+        continue
+      }
       log(`resume: ${t.id} was "${t.state}" with no live worker — releasing and requeueing`)
       G.releaseTaskWorkspace(repo, store.root, String(t.id))
       store.setTaskState(arcId, String(t.id), 'pending')
+      requeued++
     }
-    store.appendEvent(arcId, 'arc.resume', { requeued: stuck.length })
-    log(`resuming arc ${arcId} from persisted base ${baseSha.slice(0, 8)} — ${stuck.length} task(s) requeued`)
+    store.appendEvent(arcId, 'arc.resume', { requeued, recovered: stuck.length - requeued })
+    log(`resuming arc ${arcId} from persisted base ${baseSha.slice(0, 8)} — ${requeued} task(s) requeued`)
   } else {
     integrationBranch = `arc/${arcId}-integration`
     // Branch off the CONFIGURED main branch, not whatever happens to be checked
@@ -250,7 +265,16 @@ export async function runArc(o: RunOptions): Promise<void> {
   if (landedCount === 0) log('nothing landed — skipping integration review')
   else integrationApproved = await finalReview(o, integrationBranch, baseSha)
   const complete = report(o, integrationBranch, integrationApproved)
-  await finalize(o, integrationBranch, baseSha, complete)
+  // Delivery is part of being done. Closing the arc before pushing meant a
+  // rejected push or a failed `gh pr create` still stored 'done', and `arc run`
+  // exited 0 — a false success for an unattended caller, which is the exact
+  // thing the exit code exists to prevent.
+  const delivered = await finalize(o, integrationBranch, baseSha, complete)
+  if (complete && !delivered) {
+    log('')
+    log('  NOT DELIVERED — the work is green but never left this machine. The arc is INCOMPLETE.')
+  }
+  store.closeArc(arcId, complete && delivered ? 'done' : 'incomplete')
 }
 
 async function preflightCapacity(o: RunOptions): Promise<boolean> {
@@ -300,18 +324,21 @@ async function preflightCapacity(o: RunOptions): Promise<boolean> {
  * worse pushing it at a protected branch, is exactly the false-completion
  * failure this engine exists to prevent.
  */
+/** Returns whether the work was actually DELIVERED — pushed, or a PR opened.
+ *  The caller gates the arc's stored status on this: a green build that never
+ *  left the machine is not done. */
 async function finalize(
   o: RunOptions, integrationBranch: string, baseSha: string, complete: boolean,
-): Promise<void> {
+): Promise<boolean> {
   const { config, log, store, plan } = o
   const head = G.git(config.repo, 'rev-parse', integrationBranch)
-  if (head === baseSha) return   // nothing landed; nothing to deliver
+  if (head === baseSha) return true   // nothing landed; nothing to deliver
 
   if (!complete) {
     log('')
     log(`arc is INCOMPLETE — not ${config.landStrategy === 'pr' ? 'opening a PR' : 'pushing'}.`)
     log(`Work is on "${integrationBranch}" (${head.slice(0, 8)}). Inspect it, then re-run or resume.`)
-    return
+    return false
   }
 
   const landed = store.allTasks(plan.arcId).filter((t) => t.state === 'landed')
@@ -334,7 +361,7 @@ async function finalize(
     log(`✓ done, and left on "${integrationBranch}" (${head.slice(0, 8)}) as configured.`)
     log(`  Look at it:  git -C ${config.repo} log --oneline ${baseSha.slice(0, 8)}..${integrationBranch}`)
     log(`  Take it:     git -C ${config.repo} merge --ff-only ${integrationBranch}`)
-    return
+    return true
   }
 
   if (config.landStrategy === 'pr') {
@@ -353,7 +380,7 @@ async function finalize(
     } else {
       log(`  ✗ ${r.message}\n  Work is safe on "${integrationBranch}" — open the PR by hand.`)
     }
-    return
+    return r.ok
   }
 
   // landStrategy: push — direct to the main branch. Asserts the ref moved,
@@ -362,15 +389,17 @@ async function finalize(
   log(`pushing ${integrationBranch} → ${config.mainBranch}`)
   const lr = G.landBranch(config.repo, config.mainBranch, integrationBranch)
   store.appendEvent(plan.arcId, 'push', lr)
-  if (!lr.ok) { log(`  ✗ ${lr.message}`); return }
+  if (!lr.ok) { log(`  ✗ ${lr.message}`); return false }
   try {
     G.git(config.repo, 'push', 'origin', config.mainBranch)
     log(`  ✓ ${config.mainBranch} ${lr.before.slice(0, 8)} → ${lr.after.slice(0, 8)}`)
     // Merged and pushed: the integration branch is fully contained in main.
     if (G.gitOk(config.repo, 'branch', '-d', integrationBranch)) log(`  ✓ local "${integrationBranch}" removed — zero local residue`)
+    return true
   } catch (e) {
     log(`  ✗ push rejected: ${(e as Error).message.slice(0, 200)}`)
     log(`  The merge is local only. If "${config.mainBranch}" is protected, set landStrategy: pr.`)
+    return false
   }
 }
 
@@ -1110,8 +1139,8 @@ async function runReviewFindingCheck(
   baseSha: string,
   attemptId: string,
   taskId?: string,
-): Promise<{ keep: boolean; artifactId?: string; exitCode?: number | null }> {
-  if (!finding.checkCommand) return { keep: true }
+): Promise<{ keep: boolean; outcome: CheckOutcome | 'no-command'; caveat?: string; artifactId?: string; exitCode?: number | null }> {
+  if (!finding.checkCommand) return { keep: true, outcome: 'no-command' }
   const name = `${taskId ? `review:${taskId}` : 'integration-review'}:${finding.file}:${finding.line}`
   const result = await runGate({
     name,
@@ -1137,8 +1166,28 @@ async function runReviewFindingCheck(
     signature: result.signature,
     artifactId,
   })
-  o.log(`    ${name}: ${result.pass ? 'reproduced' : 'did not reproduce'} (exit ${result.exitCode ?? 'timeout'})`)
-  return { keep: result.pass, artifactId, exitCode: result.exitCode }
+  // Three outcomes, not two. `keep: result.pass` treated "the command could not
+  // run" as "the defect is not real" and DELETED the finding — so a reviewer
+  // that attached a real reproduction to a real bug lost it to a missing binary
+  // or a sandbox that refused to launch, while a reviewer that attached nothing
+  // was believed unconditionally. Silence is not agreement.
+  const outcome = checkOutcome(result)
+  const caveats: string[] = []
+  if (outcome === 'could-not-run') {
+    caveats.push(`the check could not run (exit ${result.exitCode ?? 'none'}${result.timedOut ? ', timed out' : ''}) — this finding is UNVERIFIED, not refuted`)
+  }
+  if (!result.sandboxed) {
+    caveats.push('ran without an OS sandbox — model-authored shell had write access to the tree it was grading')
+  }
+  for (const caveat of caveats) o.log(`    ! ${name}: ${caveat}`)
+  o.log(`    ${name}: ${outcome} (exit ${result.exitCode ?? 'timeout'})`)
+  return {
+    keep: outcome !== 'refuted',
+    outcome,
+    caveat: caveats.length > 0 ? caveats.join('; ') : undefined,
+    artifactId,
+    exitCode: result.exitCode,
+  }
 }
 
 /**
@@ -1311,7 +1360,8 @@ async function reviewLoop(
         artifactId: check.artifactId,
         command: f.checkCommand,
         exitCode: check.exitCode ?? null,
-        verdict: 'pass',
+        verdict: check.outcome === 'reproduced' ? 'pass' : 'inconclusive',
+        caveat: check.caveat,
       })
     }
   }
@@ -1335,6 +1385,14 @@ async function reviewLoop(
     if (blockers.length > 0) {
       log(`  ✗ ${task.id}: ${blockers.length} critical/major finding(s) remain after repair`)
       return { status: 'fail', verdict: verdict.verdict, findings: findings.map((finding) => finding.claim) }
+    }
+    // CHANGES_REQUIRED with no blocker left is a PASS by design: a repair round
+    // ends on the surviving findings, and a finding that a check REFUTED is not
+    // a finding. What made that unsafe was collapsing "the check could not run"
+    // into "refuted" — fixed in runReviewFindingCheck, which now keeps an
+    // unverifiable finding rather than deleting it. Say which one happened.
+    if (verdict.verdict === 'CHANGES_REQUIRED') {
+      log(`  · ${task.id}: CHANGES_REQUIRED, but no critical/major finding survived its check — landing`)
     }
     return { status: 'pass', verdict: verdict.verdict, findings: findings.map((finding) => finding.claim) }
   }
@@ -1519,7 +1577,8 @@ async function reviewIntegrationHead(
         artifactId: check.artifactId,
         command: f.checkCommand,
         exitCode: check.exitCode ?? null,
-        verdict: 'pass',
+        verdict: check.outcome === 'reproduced' ? 'pass' : 'inconclusive',
+        caveat: check.caveat,
       })
     }
   }
@@ -1584,7 +1643,6 @@ function report(o: RunOptions, integrationBranch: string, integrationApproved: b
   log(`  ${complete ? 'COMPLETE — every criterion has evidence' : 'INCOMPLETE — see above. Nothing merged to your main branch.'}`)
   log('════════════════════════════════════════════')
 
-  store.closeArc(arcId, complete ? 'done' : 'incomplete')
   return complete
 }
 

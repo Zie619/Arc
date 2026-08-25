@@ -651,15 +651,25 @@ export function modelCheckMode(cli: 'codex' | 'claude'): 'present' | 'every' {
   return cli === 'codex' ? 'every' : 'present'
 }
 
+/** Version digits, ignoring a trailing date stamp: `claude-opus-4-8-20260115`
+ *  IS `claude-opus-4-8`, but `gpt-5.6-sol` is NOT `gpt-5`. */
+function versionDigits(s: string): string[] {
+  return (s.match(/\d+/g) ?? []).filter((d) => d.length < 6)
+}
+
 /** `opus` is an alias for "the latest Opus", so this is a family match. */
 export function sameModel(requested: string, observed: string): boolean {
+  // Version digits decide FIRST. The substring test below is what makes `opus`
+  // an alias, but it also makes `gpt-5` match `gpt-5.6-sol` — so a run that
+  // executed on 5.6 reported ok against a request pinned to 5, which is exactly
+  // the silent version downgrade drift detection exists to catch.
+  const rd = versionDigits(requested)
+  const od = versionDigits(observed)
+  if (rd.length > 0 && od.length > 0 && rd.join('.') !== od.join('.')) return false
   const norm = (s: string) => s.toLowerCase().replace(/[^a-z0-9.]/g, '')
   const r = norm(requested)
   const o = norm(observed)
   if (o.includes(r) || r.includes(o)) return true
-  const requestedDigits = requested.match(/\d+/g)
-  const observedDigits = observed.match(/\d+/g)
-  if (requestedDigits && observedDigits && requestedDigits.join('.') !== observedDigits.join('.')) return false
   // Compare the DISTINGUISHING word, which is the last one: `gpt-5.6-sol` and
   // `gpt-5.6-luna` share their prefix and are different models, so matching on
   // the first token would call a luna run an ok sol run.

@@ -71,6 +71,15 @@ export function findRepos(dir: string, depth = 2): string[] {
   return out.sort()
 }
 
+/**
+ * The reviewer runs with cwd inside a worktree whose `.git` IS the operator's
+ * real repository, and (on the claude lane) with no OS sandbox underneath. So
+ * `Bash(git *)` handed it `reset --hard`, `checkout`, `branch -D` and `push`.
+ * These are the subcommands that only READ. Treat it as a speed bump, never as
+ * a guarantee — a permission glob is bypassable, the OS sandbox is the fence.
+ */
+const READ_ONLY_GIT = 'Bash(git diff:*),Bash(git log:*),Bash(git show:*),Bash(git status:*),Bash(git rev-parse:*),Bash(git ls-files:*),Bash(git blame:*)'
+
 export function detectProject(cwd: string, repoOverride?: string): Detected {
   const repo = repoOverride ? repoRoot(repoOverride) : repoRoot(cwd)
   const notes: string[] = []
@@ -134,11 +143,11 @@ export function detectProject(cwd: string, repoOverride?: string): Detected {
       implement: { cli: 'codex', model: 'gpt-5.6-sol', effort: 'high', sandbox: 'workspace-write',
                    timeoutMs: 2_700_000, stallMs: 420_000 },
       review:    { cli: 'claude', model: 'opus', effort: 'high', sandbox: 'read-only',
-                   tools: 'Read,Grep,Glob,Bash(git *)', timeoutMs: 1_800_000, stallMs: 300_000 },
+                   tools: `Read,Grep,Glob,${READ_ONLY_GIT}`, timeoutMs: 1_800_000, stallMs: 300_000 },
       scout:     { cli: 'codex', model: 'gpt-5.6-sol', effort: 'medium', sandbox: 'read-only',
                    timeoutMs: 900_000, stallMs: 240_000 },
       integrate: { cli: 'claude', model: 'opus', effort: 'high', sandbox: 'read-only',
-                   tools: 'Read,Grep,Glob,Bash(git *)', timeoutMs: 2_400_000, stallMs: 300_000 },
+                   tools: `Read,Grep,Glob,${READ_ONLY_GIT}`, timeoutMs: 2_400_000, stallMs: 300_000 },
     },
   })
 
