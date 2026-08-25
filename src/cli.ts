@@ -17,6 +17,7 @@ import { runInterview, runScouts, runPlanner, type Ask } from './design.ts'
 import { createInterface } from 'node:readline/promises'
 import { doctorProviders } from './provider-runtime.ts'
 import { formatCostSummary } from './cost.ts'
+import { buildDigest } from './digest.ts'
 
 const C = {
   dim: (s: string) => `\x1b[2m${s}\x1b[0m`,
@@ -312,10 +313,12 @@ ${C.bold('Plumbing — arc "..." already runs all of these for you:')}
   arc bench                         run Arc against itself — invariants, no tokens spent
   arc diff <arcA> <arcB>            compare two runs: attempts, tokens, tiers, wall clock
   arc flaky                         gates that gave different answers on the same commit
+  arc digest [--since last-seen]    what happened while you were away, and what needs you
 
 Options:
   --danger        no approval stops: take every recommendation, run the plan
   --until-done    supervise arc run/resume, prevent sleep, relaunch after crashes
+  --no-gates      run even though nothing can verify the work (say it out loud)
   --config <p>    use a specific config instead of auto-detection
   --id <name>     name the arc (default: derived from your brief)
   --version, -V   print the installed arc version
@@ -325,7 +328,7 @@ const SUBCOMMANDS = new Set([
   'interview', 'scout', 'plan', 'validate', 'run', 'resume', 'clean', 'status',
   'ui', 'watch', 'criteria', 'findings', 'show', 'init', 'go', 'cost',
   'setup-terminal', 'keys',
-  'doctor', 'bench', 'diff', 'flaky',
+  'doctor', 'bench', 'diff', 'flaky', 'digest',
 ])
 
 async function main(): Promise<void> {
@@ -503,6 +506,7 @@ async function main(): Promise<void> {
           await runArc({
             store, plan, config, log: (l) => console.log(l), preflight: true,
             waitForPreflightCapacity: process.env.ARC_UNTIL_DONE_CHILD === '1',
+            allowNoGates: argv.includes('--no-gates'),
           })
         } catch (error) {
           recordActiveCrash(error)
@@ -607,7 +611,10 @@ async function main(): Promise<void> {
         }
         beginActiveRun(store, plan.arcId)
         try {
-          await runArc({ store, plan, config, log: (l) => console.log(l), resume: true, preflight: true })
+          await runArc({
+            store, plan, config, log: (l) => console.log(l), resume: true, preflight: true,
+            allowNoGates: argv.includes('--no-gates'),
+          })
         } catch (error) {
           recordActiveCrash(error)
           throw error
@@ -721,6 +728,23 @@ async function main(): Promise<void> {
         }
         console.log(C.dim(''))
         console.log(C.dim('  A genuinely broken gate looks flaky for a while. This surfaces them; it never suppresses one.'))
+        break
+      }
+
+      case 'digest': {
+        // A fold over the event table, which already carried the whole
+        // narrative. What was missing was anyone reading it back.
+        const arcId = positional[0] ?? store.latestArcId()
+        if (!arcId) die('no arcs yet')
+        const since = argv.includes('--since') && flag(argv, '--since') === 'last-seen'
+          ? store.lastSeenSeq(arcId)
+          : 0
+        const digest = buildDigest(store, arcId, { sinceSeq: since })
+        for (const line of digest.lines) console.log(line)
+        store.setLastSeenSeq(arcId, digest.lastSeq)
+        // Exit non-zero when a human is actually blocking something, so
+        // `arc run … ; arc digest || notify-me` composes.
+        if (digest.needsYou > 0) process.exitCode = 3
         break
       }
 

@@ -449,8 +449,12 @@ describe('the orchestrator, end to end', () => {
     // task in `reviewing` — committed work, passing gates, possibly a finished
     // review — started over from nothing on every relaunch.
     expect(logs.join('\n')).toContain('RECOVERED with')
-    expect(sh(repo, 'log', '--format=%H', 'arc/e2e-integration')).toContain(rescued)
+    // The sha changes — landing rebases and stamps task trailers — so assert on
+    // the WORK, which is the thing that used to be deleted.
+    expect(sh(repo, 'log', '--format=%s', 'arc/e2e-integration')).toContain('partial work')
+    expect(sh(repo, 'show', `arc/e2e-integration:half-done.ts`)).toBe('export const x = 1')
     expect(store.allTasks('e2e')[0]!.state).toBe('landed')
+    void rescued
     store.close()
   }, 60_000)
 
@@ -1139,7 +1143,12 @@ describe('delivery leaves ZERO local residue', () => {
 
     expect(logs.join('\n')).toContain('zero local residue')
     expect(sh(repo, 'for-each-ref', '--format=%(refname:short)', 'refs/heads/arc/')).toBe('')
-    expect(sh(bare, 'rev-parse', 'main')).toBe(sh(repo, 'rev-parse', 'main'))
+    // "push" means the REMOTE's main has the work. Landing locally first meant
+    // checking out main — usually THE checked-out branch — and hoping to restore
+    // afterwards. The operator's checkout is now never touched, so local main
+    // stays where they left it and the delivery still happened.
+    expect(sh(bare, 'rev-parse', 'main')).not.toBe(sh(repo, 'rev-parse', 'main'))
+    expect(logs.join('\n')).toContain(`local "main" left alone`)
     store.close()
   }, 60_000)
 

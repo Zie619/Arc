@@ -11,6 +11,7 @@ import { runGate, selectGates, isSubsetOfBaseline, describe, testsVanished, matc
 import { checkReviewFinding, type FindingOutcome } from './finding-check.ts'
 import { assembleDiff } from './diff.ts'
 import { dryRunProofs } from './dry-run.ts'
+import { notify, clearTerminal } from './notify.ts'
 
 /** Byte budgets for what a reviewer is shown. Deliberately named rather than
  *  inlined: they used to be three unrelated magic numbers, and the implement
@@ -35,6 +36,9 @@ import {
  */
 
 export interface RunOptions {
+  /** Proceed with no gates. Explicit only: a gate-less arc proves nothing, so
+   *  it must be something the operator SAID, never something inferred. */
+  allowNoGates?: boolean
   store: Store
   plan: Plan
   config: ProjectConfig
@@ -220,6 +224,17 @@ export async function runArc(o: RunOptions): Promise<void> {
     throw new Error(process.env.ARC_TEST_CRASH_AFTER_START)
   }
 
+  // A gate-less run is a CATEGORY ERROR, not a warning. This system's thesis is
+  // that nothing counts as done without evidence on disk, and an arc with no
+  // gates cannot prove anything by construction — the README already argues
+  // this position; the code should hold it.
+  if (config.gates.length === 0 && !o.allowNoGates) {
+    log('✗ this project declares NO gates, so this arc cannot prove anything.')
+    log('  Add a typecheck/test/build gate to arc.yaml, or pass --no-gates to say you mean it.')
+    store.closeArc(arcId, 'incomplete')
+    return
+  }
+
   // Validate the plan AGAINST THIS CONFIG before spending anything. A task
   // naming a gate the project does not declare used to throw from selectGates
   // at task runtime — after the implement dispatch had already been billed.
@@ -274,6 +289,11 @@ export async function runArc(o: RunOptions): Promise<void> {
     }
   }
 
+  // Sibling tasks share a base and often a hot file, so they hit the identical
+  // conflict against the integration head and each pays full price for it.
+  // rr-cache lives in the common dir, so it is shared across every worktree.
+  G.enableRerere(repo)
+
   const heavy = new Semaphore(config.heavyGateLimit)
   // Agents and their local gates may run in parallel; rebasing/advancing the
   // one integration ref is a serial transaction. Synchronous gates used to
@@ -317,6 +337,15 @@ export async function runArc(o: RunOptions): Promise<void> {
     if (frontier.ready.length > 1) {
       log(`▶ ${frontier.ready.length} tasks in parallel: ${frontier.ready.map((t) => t.id).join(', ')}`)
     }
+    // The window title and the tab progress ring, on every transition. Free,
+    // passive, and the only thing that makes a six-hour run legible from across
+    // the room.
+    const landedSoFar = store.allTasks(arcId).filter((t) => t.state === 'landed').length
+    notify({
+      kind: 'progress', arcId,
+      message: `${landedSoFar}/${plan.tasks.length} · ${frontier.ready.map((t) => t.id).join(', ') || 'waiting'}`,
+      percent: (landedSoFar / Math.max(1, plan.tasks.length)) * 100,
+    }, { command: config.notifyCommand })
     // allSettled, not all: one task crashing must not detach its siblings
     // mid-flight or leave its own row 'running' until a lease expiry.
     const settled = await Promise.allSettled(
@@ -359,7 +388,18 @@ export async function runArc(o: RunOptions): Promise<void> {
     log('')
     log('  NOT DELIVERED — the work is green but never left this machine. The arc is INCOMPLETE.')
   }
-  store.closeArc(arcId, complete && delivered ? 'done' : 'incomplete')
+  const finalStatus = complete && delivered ? 'done' : 'incomplete'
+  store.closeArc(arcId, finalStatus)
+  const landedNow = store.allTasks(arcId).filter((t) => t.state === 'landed').length
+  notify({
+    kind: finalStatus === 'done' ? 'done' : 'failed',
+    arcId,
+    message: finalStatus === 'done'
+      ? `done — ${landedNow}/${plan.tasks.length} landed and delivered`
+      : `INCOMPLETE — ${landedNow}/${plan.tasks.length} landed`,
+    percent: 100,
+  }, { command: config.notifyCommand })
+  clearTerminal()
 }
 
 async function preflightCapacity(o: RunOptions): Promise<boolean> {
@@ -428,18 +468,7 @@ async function finalize(
 
   const landed = store.allTasks(plan.arcId).filter((t) => t.state === 'landed')
   const title = `arc(${plan.arcId}): ${landed.length} task(s)`
-  const body = [
-    `Produced by arc-executor. Every acceptance criterion below carries evidence.`,
-    ``,
-    `## Goal`,
-    plan.charter.goal.trim(),
-    ``,
-    `## Landed`,
-    ...landed.map((t) => `- \`${t.id}\` ${t.title}`),
-    ``,
-    `## Evidence`,
-    ...store.allCriteria(plan.arcId).map((c) => `- [${c.tier}] \`${c.task_id}/${c.id}\` ${c.text}`),
-  ].join('\n')
+  const body = buildPullRequestBody(o, integrationBranch, baseSha, head, landed)
 
   if (config.landStrategy === 'none') {
     log('')
@@ -468,24 +497,35 @@ async function finalize(
     return r.ok
   }
 
-  // landStrategy: push — direct to the main branch. Asserts the ref moved,
-  // same as every other land in this system.
+  // landStrategy: push — the REMOTE's main branch is what "push" means, and it
+  // is reachable without touching the operator's checkout at all. Landing
+  // locally first meant checking out main (usually THE checked-out branch) and
+  // hoping to restore afterwards, which is the whole parked-checkout failure
+  // class that landBranch now refuses to create.
   log('')
   log(`pushing ${integrationBranch} → ${config.mainBranch}`)
-  const lr = G.landBranch(config.repo, config.mainBranch, integrationBranch)
-  store.appendEvent(plan.arcId, 'push', lr)
-  if (!lr.ok) { log(`  ✗ ${lr.message}`); return false }
   try {
-    G.git(config.repo, 'push', 'origin', config.mainBranch)
-    log(`  ✓ ${config.mainBranch} ${lr.before.slice(0, 8)} → ${lr.after.slice(0, 8)}`)
-    // Merged and pushed: the integration branch is fully contained in main.
-    if (G.gitOk(config.repo, 'branch', '-d', integrationBranch)) log(`  ✓ local "${integrationBranch}" removed — zero local residue`)
-    return true
+    G.git(config.repo, 'push', 'origin', `${integrationBranch}:${config.mainBranch}`)
   } catch (e) {
     log(`  ✗ push rejected: ${(e as Error).message.slice(0, 200)}`)
-    log(`  The merge is local only. If "${config.mainBranch}" is protected, set landStrategy: pr.`)
+    log(`  Nothing was merged locally either. If "${config.mainBranch}" is protected, set landStrategy: pr.`)
+    store.appendEvent(plan.arcId, 'push', { ok: false, message: (e as Error).message.slice(0, 400) })
     return false
   }
+  log(`  ✓ origin/${config.mainBranch} → ${head.slice(0, 8)}`)
+
+  // Fast-forward the LOCAL main too, but only when it is checked out nowhere.
+  // Moving a ref out from under a working tree desyncs its index against a head
+  // it never produced.
+  const local = G.landBranch(config.repo, config.mainBranch, integrationBranch)
+  store.appendEvent(plan.arcId, 'push', local)
+  if (local.ok) log(`  ✓ local ${config.mainBranch} ${local.before.slice(0, 8)} → ${local.after.slice(0, 8)}`)
+  else log(`  · local "${config.mainBranch}" left alone — ${local.message}`)
+
+  if (G.gitOk(config.repo, 'branch', '-D', integrationBranch)) {
+    log(`  ✓ local "${integrationBranch}" removed — zero local residue`)
+  }
+  return true
 }
 
 // ---------------------------------------------------------------------------
@@ -507,6 +547,85 @@ async function finalize(
  *
  * review.ts already did exactly this. The pattern existed and was not used.
  */
+/**
+ * The PR body a human can actually review.
+ *
+ * The old one was a task-id list and a flat criterion dump, over a diff ordered
+ * alphabetically — which correlates with nothing. Four changes, none of which
+ * touch git semantics:
+ *
+ *   1. LEAD with what is unusual. `TaskResult.deviations` — what the writer did
+ *      differently from the spec, and what it affects — is arguably the single
+ *      highest-value field for a human reviewer, and it never reached the PR at
+ *      all.
+ *   2. Group by task, using the Arc-Task trailers, with each task's spec as its
+ *      cover letter. Review effectiveness degrades sharply with size, and
+ *      comprehension rather than defect-spotting is the reviewer's bottleneck.
+ *   3. Name a review ORDER, risk first. File position materially affects defect
+ *      detection, and Arc knows which files are risky when nothing else does.
+ *   4. Put the evidence next to the criterion, so the human verifies rather
+ *      than re-derives.
+ */
+function buildPullRequestBody(
+  o: RunOptions, integrationBranch: string, baseSha: string, head: string,
+  landed: Array<Record<string, unknown>>,
+): string {
+  const { store, plan } = o
+  const arcId = plan.arcId
+  const byTask = G.commitsByTask(o.config.repo, `${baseSha}..${head}`)
+  const findings = store.findingsFor(arcId)
+  const criteria = store.allCriteria(arcId)
+
+  const deviations = findings.filter((f) => f.kind === 'deviation')
+  const risky = findings.filter((f) => f.severity === 'high' || f.severity === 'critical')
+
+  const lines: string[] = [
+    `Produced by arc-executor. Every acceptance criterion below carries evidence,`,
+    `and anything that could not be proved says so.`,
+    ``,
+    `## Goal`,
+    plan.charter.goal.trim(),
+  ]
+
+  if (deviations.length > 0) {
+    lines.push('', '## Read this first — what differs from the plan')
+    for (const d of deviations) lines.push(`- **${d.task_id ?? 'arc'}**: ${d.text}`)
+  }
+  if (risky.length > 0) {
+    lines.push('', '## Open findings at high severity')
+    for (const f of risky) lines.push(`- \`${f.task_id ?? 'arc'}\` ${f.text}`)
+  }
+
+  lines.push('', '## Suggested review order')
+  const affected = new Set(findings.flatMap((f) => JSON.parse(String(f.affects ?? '[]')) as string[]))
+  if (affected.size > 0) {
+    lines.push('Files a finding already touched — read these first:')
+    for (const file of affected) lines.push(`1. \`${file}\``)
+  } else {
+    lines.push('No findings name a specific file; read the tasks in the order below.')
+  }
+
+  for (const task of landed) {
+    const id = String(task.id)
+    const spec = plan.tasks.find((t) => t.id === id)?.spec ?? ''
+    const commits = byTask.get(id) ?? []
+    lines.push('', `## \`${id}\` ${task.title}`)
+    if (spec) lines.push('', spec.trim())
+    if (commits.length > 0) {
+      lines.push('', `Commits: ${commits.map((c) => c.slice(0, 8)).join(', ')}`)
+    }
+    for (const c of criteria.filter((row) => row.task_id === id)) {
+      const mark = c.tier === 'observed' || c.tier === 'checked' ? '✓' : '·'
+      lines.push(`- ${mark} **[${c.tier}]** ${c.text}`)
+      if (c.proof_command) lines.push(`  - proof: \`${c.proof_command}\``)
+      if (c.evidence) lines.push(`  - evidence: ${String(c.evidence).slice(0, 300)}`)
+    }
+  }
+
+  lines.push('', `---`, `Branch \`${integrationBranch}\` · ${baseSha.slice(0, 8)}..${head.slice(0, 8)}`)
+  return lines.join('\n')
+}
+
 async function measureBaselines(o: RunOptions, baseSha: string): Promise<Map<string, GateResult>> {
   const out = new Map<string, GateResult>()
   const needed = o.config.gates.filter((g) => g.baselineSubset)
@@ -1796,6 +1915,17 @@ async function landTask(
   const arcId = o.plan.arcId
   const onto = G.git(config.repo, 'rev-parse', integrationBranch)
 
+  // Ask BEFORE the destructive attempt. `git merge-tree --write-tree` answers
+  // without touching a working tree, so a conflict becomes a non-destructive
+  // probe rather than a failed rebase to clean up after. Textual only — it will
+  // not see "A deletes the only writer of a field, B adds a reader", which is
+  // what integration review is for.
+  const predicted = G.conflictsWith(config.repo, onto, G.headSha(wt.path))
+  if (predicted !== null) {
+    log(`  ! ${task.id}: merge-tree predicts conflicts in ${predicted.join(', ')} — attempting the rebase anyway`)
+    store.appendEvent(arcId, 'land.conflict.predicted', { files: predicted }, task.id)
+  }
+
   const rb = G.rebaseOnto(wt.path, wt.baseSha, onto)
   if (!rb.ok) {
     log(`  ✗ ${task.id}: rebase failed — ${rb.message}`)
@@ -1812,11 +1942,17 @@ async function landTask(
     return false
   }
 
+  // Stamp before the rebase, so provenance survives it. After landing, nothing
+  // on the integration branch said which commit came from which task.
+  // `onto`, not wt.baseSha: the branch has just been rebased onto the
+  // integration head, so that is where its commits now start.
+  const model = config.roles.implement.model
+  if (!G.stampTaskTrailers(wt.path, onto, arcId, task.id, model)) {
+    log(`  ! ${task.id}: could not stamp task trailers — provenance will be missing from the integration branch`)
+  }
+
   const lr = G.landBranch(config.repo, integrationBranch, wt.branch)
   store.appendEvent(arcId, 'land', lr, task.id)
-  if (lr.restoreFailed) {
-    log(`  ⚠ ${task.id}: your checkout was left on "${integrationBranch}" — restoring your branch failed`)
-  }
   if (!lr.ok) {
     log(`  ✗ ${task.id}: land failed — ${lr.message}`)
     return false

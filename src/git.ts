@@ -1,4 +1,4 @@
-import { execFileSync } from 'node:child_process'
+import { execFileSync, spawnSync } from 'node:child_process'
 import { existsSync } from 'node:fs'
 import { join } from 'node:path'
 
@@ -288,50 +288,145 @@ export interface LandResult {
   after: string
   expected: string
   message: string
-  /**
-   * Landing checks out the integration branch in the operator's shared
-   * checkout. If restoring their original branch then fails, the operator is
-   * parked somewhere they did not choose — that must be loud, never swallowed.
-   */
-  restoreFailed: boolean
+}
+
+/** Where a branch is checked out, if anywhere. `git update-ref` will happily
+ *  move a branch that IS checked out, leaving that worktree's index desynced
+ *  against a head it never produced — verified by direct experiment. */
+export function checkedOutAt(repo: string, branch: string): string | null {
+  const out = git(repo, 'worktree', 'list', '--porcelain')
+  let path: string | null = null
+  for (const line of out.split('\n')) {
+    if (line.startsWith('worktree ')) path = line.slice('worktree '.length)
+    if (line === `branch refs/heads/${branch}`) return path
+  }
+  return null
 }
 
 /**
- * Land, then ASSERT THE REF MOVED.
+ * Land by COMPARE-AND-SWAP. Never check anything out.
  *
- * Never trust a command's own report of success. The three-sha check is the
- * only thing that distinguishes "landed" from "the command exited 0 and
- * nothing happened".
+ * This used to `git checkout` the integration branch in the operator's own
+ * working checkout, merge, and try to put their branch back. The blast radius
+ * is visible in the vocabulary that decision required: a `restoreFailed` flag,
+ * a "parked" message builder, a "your checkout was left on…" warning, and three
+ * dedicated tests. It was also a read-then-write race — nothing stopped the
+ * operator running `git checkout` in between.
+ *
+ * `git update-ref refs/heads/<branch> <new> <old>` is atomic and REFUSES a
+ * stale old-value, which is strictly stronger than the read-then-compare it
+ * replaces, and it deletes the entire parked-checkout failure class rather than
+ * asserting against it.
+ *
+ * One hazard, easy to miss and verified by experiment: update-ref will happily
+ * move a branch that IS checked out somewhere, leaving that worktree's index
+ * desynced against a head it never produced. So this asserts the target is
+ * checked out NOWHERE and fails closed if it is.
  */
 export function landBranch(repo: string, integrationBranch: string, taskBranch: string): LandResult {
   const before = git(repo, 'rev-parse', integrationBranch)
   const expected = git(repo, 'rev-parse', taskBranch)
-  // Whatever branch you were on is yours. Landing must not move your working
-  // tree out from under you — and when arc is editing its OWN repo, leaving it
-  // parked on the integration branch is worse than untidy.
-  const wasOn = git(repo, 'rev-parse', '--abbrev-ref', 'HEAD')
-  const restore = (): boolean => wasOn === integrationBranch || gitOk(repo, 'checkout', '-q', wasOn)
-  const parked = (restored: boolean): string =>
-    restored ? '' : ` — AND the operator checkout is parked on "${integrationBranch}"; checkout back to "${wasOn}" failed`
+  const fail = (message: string): LandResult => ({ ok: false, before, after: before, expected, message })
 
-  try {
-    git(repo, 'checkout', '-q', integrationBranch)
-    git(repo, 'merge', '--ff-only', taskBranch)
-  } catch (e) {
-    const restored = restore()
-    return { ok: false, before, after: git(repo, 'rev-parse', integrationBranch), expected, restoreFailed: !restored, message: `${(e as Error).message.slice(0, 400)}${parked(restored)}` }
+  const heldBy = checkedOutAt(repo, integrationBranch)
+  if (heldBy !== null) {
+    return fail(`"${integrationBranch}" is checked out at ${heldBy} — refusing to move a ref out from under a working tree`)
+  }
+  // Prove the fast-forward is legal before claiming one. `merge --ff-only`
+  // decided this implicitly; saying it out loud is what lets us skip the
+  // checkout entirely.
+  if (!gitOk(repo, 'merge-base', '--is-ancestor', before, expected)) {
+    return fail(`not a fast-forward: "${taskBranch}" (${expected.slice(0, 8)}) does not descend from "${integrationBranch}" (${before.slice(0, 8)})`)
+  }
+  if (before === expected) return fail('ref did not move — land reported success but nothing changed')
+
+  // Atomic, and refuses if someone else moved the ref since `before` was read.
+  if (!gitOk(repo, 'update-ref', `refs/heads/${integrationBranch}`, expected, before)) {
+    const now = git(repo, 'rev-parse', integrationBranch)
+    return fail(`"${integrationBranch}" moved to ${now.slice(0, 8)} while landing (expected ${before.slice(0, 8)}) — nothing was merged`)
   }
 
   const after = git(repo, 'rev-parse', integrationBranch)
-  const restored = restore()
-  if (after === before) {
-    return { ok: false, before, after, expected, restoreFailed: !restored, message: `ref did not move — land reported success but nothing changed${parked(restored)}` }
+  if (after !== expected) return fail(`ref moved to ${after.slice(0, 8)}, expected ${expected.slice(0, 8)}`)
+  return { ok: true, before, after, expected, message: '' }
+}
+
+/**
+ * Would merging these two produce conflicts, and in which files?
+ *
+ * `git merge-tree --write-tree` (git 2.38+) answers without touching a working
+ * tree at all: a tree sha on a clean merge, exit 1 plus the conflicted paths
+ * otherwise. Proactive conflict detection is an old idea (Brun et al., FSE
+ * 2011) that never shipped widely because it needed a background merge server;
+ * this made it a local one-liner.
+ *
+ * TEXTUAL ONLY. It will not catch "task A deletes the only writer of a field,
+ * task B adds a reader" — which is exactly what integration review exists for.
+ * A clean result here is never licence to skip that.
+ */
+export function conflictsWith(repo: string, ours: string, theirs: string): string[] | null {
+  const result = spawnSync('git', ['merge-tree', '--write-tree', '--name-only', ours, theirs],
+    { cwd: repo, encoding: 'utf8' })
+  if (result.status === 0) return null
+  // stdout is: <tree-sha>\n<conflicted path>\n<conflicted path>...
+  const lines = (result.stdout ?? '').split('\n').filter(Boolean)
+  return lines.slice(1)
+}
+
+/**
+ * Remember conflict resolutions across worktrees.
+ *
+ * `.git/rr-cache` lives in the COMMON dir, so it IS shared across every
+ * worktree of one repo — which makes Arc's N-worktrees-off-one-repo shape the
+ * ideal case for rerere, by accident. Sibling tasks share a base and often a
+ * hot file, so they hit the identical conflict and each would otherwise pay
+ * full price for it.
+ *
+ * Deliberately NOT `rerere.autoUpdate`: auto-staging a replayed resolution is
+ * silent-success behaviour of exactly the species this system exists to
+ * eliminate. Resolutions are applied but left unstaged, and the existing
+ * post-rebase re-gate is the proof — which also covers rerere replaying a stale
+ * resolution into a context where it is wrong.
+ */
+export function enableRerere(repo: string): void {
+  gitOk(repo, 'config', 'rerere.enabled', 'true')
+  gitOk(repo, 'config', 'rerere.autoUpdate', 'false')
+}
+
+/**
+ * Stamp every commit in a range with the task that produced it.
+ *
+ * `setTaskHead` records a sha that the land-time rebase invalidates minutes
+ * later, so after landing nothing on the integration branch said which commit
+ * came from which task: the integration review saw one flat undifferentiated
+ * diff and the PR body listed task ids that linked to nothing.
+ *
+ * Trailers survive rebase; `git notes` do NOT, because they are keyed by sha.
+ * Every stacked-diff tool converged on trailers independently (Gerrit's
+ * Change-Id, ghstack's ghstack-source-id, spr's Commit-UID) for exactly that
+ * reason. Done HERE rather than by asking the agent, because writers author
+ * their own commit messages and would be unreliable about it.
+ */
+export function stampTaskTrailers(wt: string, baseSha: string, arcId: string, taskId: string, model: string): boolean {
+  const trailers = [
+    `--trailer=Arc-Task=${taskId}`,
+    `--trailer=Arc-Arc=${arcId}`,
+    `--trailer=Arc-Model=${model}`,
+  ]
+  return gitOk(wt, 'rebase', baseSha, '--exec',
+    `git commit --amend --no-edit ${trailers.map((t) => `'${t}'`).join(' ')}`)
+}
+
+/** Commits on `range` grouped by the task that produced them. */
+export function commitsByTask(repo: string, range: string): Map<string, string[]> {
+  const out = git(repo, 'log', '--format=%H%x1f%(trailers:key=Arc-Task,valueonly)%x1e', range)
+  const byTask = new Map<string, string[]>()
+  for (const entry of out.split('\x1e')) {
+    const [sha, task] = entry.trim().split('\x1f')
+    if (!sha || !task) continue
+    const id = task.trim()
+    if (!id) continue
+    byTask.set(id, [...(byTask.get(id) ?? []), sha])
   }
-  if (after !== expected) {
-    return { ok: false, before, after, expected, restoreFailed: !restored, message: `ref moved to ${after.slice(0, 8)}, expected ${expected.slice(0, 8)}${parked(restored)}` }
-  }
-  return {
-    ok: true, before, after, expected, restoreFailed: !restored,
-    message: restored ? '' : `landed, but the operator checkout is parked on "${integrationBranch}" — checkout back to "${wasOn}" failed`,
-  }
+  return byTask
 }

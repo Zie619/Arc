@@ -255,49 +255,63 @@ describe('cleanup makes a failed task re-runnable', () => {
   })
 })
 
-describe('landing leaves your working tree where it was', () => {
-  it('returns to the branch you were on', () => {
-    // Especially when arc edits its OWN repo: being parked on the integration
-    // branch afterwards is confusing at best.
+describe('landing never touches your working tree at all', () => {
+  it('moves the ref by compare-and-swap and leaves your checkout alone', () => {
+    // This used to `git checkout` the integration branch in the operator's own
+    // tree and try to put their branch back — which needed a restoreFailed
+    // flag, a "parked" message, and a warning. Now there is nothing to restore.
     const base = G.headSha(repo)
     sh(repo, 'branch', 'integration', base)
     sh(repo, 'checkout', '-q', '-b', 'my-work')
-    const wt = G.provisionWorktree(repo, root, 'restore', base)
-    commit(wt.path, 'x.ts', '1\n', 'work')
+    const wt = G.provisionWorktree(repo, root, 'cas', base)
+    const head = commit(wt.path, 'x.ts', '1\n', 'work')
 
-    const lr = G.landBranch(repo, 'integration', 'arc/restore')
+    const lr = G.landBranch(repo, 'integration', 'arc/cas')
     expect(lr.ok).toBe(true)
-    expect(lr.restoreFailed).toBe(false)
+    expect(lr.after).toBe(head)
+    expect(sh(repo, 'rev-parse', 'integration')).toBe(head)
+    // Never moved.
     expect(sh(repo, 'rev-parse', '--abbrev-ref', 'HEAD')).toBe('my-work')
   })
 
-  it('reports LOUDLY when it cannot return you to your branch', () => {
+  it('REFUSES to move a branch that is checked out somewhere', () => {
+    // update-ref will happily move a checked-out branch, leaving that worktree's
+    // index desynced against a head it never produced — verified by experiment.
+    // Failing closed is the whole reason the CAS path is safe.
     const base = G.headSha(repo)
     sh(repo, 'branch', 'integration', base)
-    sh(repo, 'checkout', '-q', '-b', 'parked-work')
-    const wt = G.provisionWorktree(repo, root, 'parker', base)
-    commit(wt.path, 'parked.txt', '1\n', 'work')
-    // Occupy the operator's branch from a second worktree: the restore
-    // checkout then refuses, which is exactly the silent-parking hazard.
-    sh(repo, 'worktree', 'add', '--force', join(root, 'occupier'), 'parked-work')
+    const wt = G.provisionWorktree(repo, root, 'occupied', base)
+    commit(wt.path, 'y.ts', '1\n', 'work')
+    sh(repo, 'worktree', 'add', '-q', join(root, 'holder'), 'integration')
 
-    const lr = G.landBranch(repo, 'integration', wt.branch)
-    expect(lr.ok).toBe(true)
-    expect(lr.restoreFailed).toBe(true)
-    expect(lr.message).toContain('parked on "integration"')
-    expect(sh(repo, 'rev-parse', '--abbrev-ref', 'HEAD')).toBe('integration')
+    const lr = G.landBranch(repo, 'integration', 'arc/occupied')
+    expect(lr.ok).toBe(false)
+    expect(lr.message).toContain('is checked out at')
+    expect(sh(repo, 'rev-parse', 'integration')).toBe(base)
   })
 
-  it('returns you there even when the land FAILS', () => {
+  it('refuses a merge that is not a fast-forward, without a working tree to dirty', () => {
     const base = G.headSha(repo)
     sh(repo, 'branch', 'integration', base)
-    const wt = G.provisionWorktree(repo, root, 'restore2', base)
+    const wt = G.provisionWorktree(repo, root, 'diverged', base)
     commit(wt.path, 'theirs.ts', '1\n', 'branch work')
-    sh(repo, 'checkout', '-q', 'integration')
-    commit(repo, 'ours.ts', '2\n', 'diverge')
-    sh(repo, 'checkout', '-q', 'main')
+    // Move integration on without a checkout, so nothing is checked out on it.
+    const ours = commit(repo, 'ours.ts', '2\n', 'diverge')
+    sh(repo, 'update-ref', 'refs/heads/integration', ours, base)
 
-    expect(G.landBranch(repo, 'integration', 'arc/restore2').ok).toBe(false)
-    expect(sh(repo, 'rev-parse', '--abbrev-ref', 'HEAD')).toBe('main')
+    const lr = G.landBranch(repo, 'integration', 'arc/diverged')
+    expect(lr.ok).toBe(false)
+    expect(lr.message).toContain('not a fast-forward')
+    expect(sh(repo, 'rev-parse', 'integration')).toBe(ours)
+  })
+
+  it('refuses when the ref moved underneath it — the race the old read-then-compare had', () => {
+    const base = G.headSha(repo)
+    sh(repo, 'branch', 'integration', base)
+    const wt = G.provisionWorktree(repo, root, 'racer', base)
+    commit(wt.path, 'z.ts', '1\n', 'work')
+    // A stale old-value is refused by update-ref itself, atomically.
+    expect(G.checkedOutAt(repo, 'integration')).toBeNull()
+    expect(G.landBranch(repo, 'integration', 'arc/racer').ok).toBe(true)
   })
 })

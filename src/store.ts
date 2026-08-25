@@ -30,6 +30,7 @@ const MIGRATIONS: string[] = [
      status TEXT NOT NULL DEFAULT 'running',
      lease_owner TEXT,
      lease_expires_at INTEGER,
+     last_seen_seq INTEGER,
      created_at INTEGER NOT NULL,
      closed_at INTEGER
    )`,
@@ -345,6 +346,9 @@ export class Store {
     // exists — which is what an arc lease is for.
     this.ensureColumn('task', 'lease_owner', 'TEXT')
     this.ensureColumn('task', 'worker_pgid', 'INTEGER')
+    // Where `arc digest --since last-seen` resumes from. What makes a digest
+    // useful on the SECOND return rather than only the first.
+    this.ensureColumn('arc', 'last_seen_seq', 'INTEGER')
     this.ensureColumn('arc', 'lease_owner', 'TEXT')
     this.ensureColumn('arc', 'lease_expires_at', 'INTEGER')
   }
@@ -887,6 +891,17 @@ export class Store {
     this.db
       .prepare(`UPDATE task SET worker_pgid = ? WHERE arc_id = ? AND id = ?`)
       .run(pgid, arcId, taskId)
+  }
+
+  /** How far the operator has already read. */
+  lastSeenSeq(arcId: string): number {
+    const row = this.db.prepare(`SELECT last_seen_seq FROM arc WHERE id = ?`).get(arcId) as
+      { last_seen_seq: number | null } | undefined
+    return Number(row?.last_seen_seq ?? 0)
+  }
+
+  setLastSeenSeq(arcId: string, seq: number): void {
+    this.db.prepare(`UPDATE arc SET last_seen_seq = ? WHERE id = ?`).run(seq, arcId)
   }
 
   renewLease(arcId: string, taskId: string, leaseMs: number): void {

@@ -124,6 +124,17 @@ Every provider call can be reconstructed from disk. If Arc can't measure somethi
 
 The last several features in this repo — including the premise-reopen flow, the stall watchdog, and capability-gated provider flags — were **built by Arc running on its own repository**: one model as head and reviewer, the other writing. Its scouts refuted its operator's specs five times (correctly, every time), its integration reviewer blocked a cross-task design contradiction, and its failures surfaced engine bugs that are now regression-tested. The commit history is the receipt.
 
+## Walking away
+
+`arc run plan.yaml --until-done` supervises the run: it prevents sleep,
+relaunches through `arc resume` after a crash, keeps your committed work, and
+stops when relaunching stops producing progress. Your terminal title and tab
+progress ring track it; `notifyCommand` in `arc.yaml` sends the three moments
+that want a human anywhere you like. When you come back, `arc digest` says what
+happened and what needs you.
+
+**[docs/unattended.md](docs/unattended.md)** is the full guide.
+
 ## Honest limits
 
 - Alpha. One heavy dogfooding campaign, not years of daily use.

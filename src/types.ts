@@ -187,6 +187,13 @@ export const ProjectConfig = z.object({
    *  worktree and a few seconds; catches the failure static analysis cannot. */
   dryRunProofs: z.boolean().default(true),
   /**
+   * Command run on the moments that want a human — needs-input, done, failed.
+   * The JSON event is appended as the final argument. Spawned detached with
+   * stdio null and a short timeout, and a notifier failure NEVER fails the arc:
+   * an arc must not die because a webhook was down.
+   */
+  notifyCommand: z.array(z.string()).optional(),
+  /**
    * What a CHANGES_REQUIRED repair round may spend. Explicit, because it used
    * to acquire a full second copy of maxAttempts and maxTaskMinutes purely by
    * re-entering the same function — so a config reading "4 attempts, 90
