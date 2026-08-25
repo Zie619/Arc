@@ -128,6 +128,8 @@ The last several features in this repo — including the premise-reopen flow, th
 
 - Alpha. One heavy dogfooding campaign, not years of daily use.
 - macOS-first: the read-only command sandbox and clipboard image paste use macOS facilities; on Linux both degrade gracefully (post-hoc mutation detection remains).
+- **`readOnly` is enforced by the OS on macOS and by a recorded caveat everywhere else.** Reviewer-authored `checkCommand`s are model-authored shell that Arc executes on purpose, and only macOS Seatbelt applies the deny-write profile. On Linux there is no kernel sandbox under them — and Seatbelt refuses to nest, so the same is true when Arc itself runs inside a sandboxed agent session. Arc probes for this once and, when there is no sandbox, still runs the check but attaches a caveat saying it ran unprotected. Set `sandboxPolicy: refuse` to skip such checks entirely instead; the finding is then kept and marked unverified rather than being silently dropped.
+- `role.sandbox` means different things per lane: on the **codex** lane it becomes a kernel-enforced `--sandbox` flag, on the **claude** lane it is enforced only by the tool allowlist and the minimized environment. Treat a permission glob as a speed bump, not a fence.
 - Currently drives two provider CLIs: `claude` and `codex`. The seams for more exist; the adapters don't yet.
 - A deep mission costs real model turns. Arc spends them on verification because unverified work costs more.
 

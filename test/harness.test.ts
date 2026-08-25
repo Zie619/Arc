@@ -16,7 +16,7 @@ import { TaskResult, type RoleBinding } from '../src/types.ts'
 const FIXTURES = resolve(import.meta.dirname, 'fixtures')
 const originalPath = process.env.PATH
 
-const FAKE_VARS = ['ARC_FAKE_PAYLOAD', 'ARC_FAKE_MODEL', 'ARC_FAKE_ERROR', 'ARC_FAKE_NOINIT', 'ARC_FAKE_HANG', 'ARC_FAKE_ERRTEXT', 'ARC_FAKE_HELP_OMIT', 'ARC_FAKE_HELP_FAIL', 'ARC_FAKE_QUEUE']
+const FAKE_VARS = ['ARC_FAKE_PAYLOAD', 'ARC_FAKE_MODEL', 'ARC_FAKE_ERROR', 'ARC_FAKE_NOINIT', 'ARC_FAKE_HANG', 'ARC_FAKE_ERRTEXT', 'ARC_FAKE_HELP_OMIT', 'ARC_FAKE_HELP_FAIL', 'ARC_FAKE_QUEUE', 'ARC_FAKE_NO_MODEL_USAGE']
 
 beforeAll(() => { process.env.PATH = `${FIXTURES}:${originalPath}` })
 // Unconditional cleanup: a test that times out never reaches its own inline
@@ -500,4 +500,56 @@ describe('the project setup travels with the delegate', () => {
     }
   })
 
+})
+
+describe('the receipt is read the way the provider actually writes it', () => {
+  it('takes thinking tokens and the cache TTL split from the aggregate', async () => {
+    process.env.ARC_FAKE_PAYLOAD = JSON.stringify({ status: 'done', noop: true, noopReason: 'x' })
+    const r = await dispatch({ role: claudeRole, cwd: process.cwd(), prompt: 'go', schema: TaskResult })
+
+    // `modelUsage` carries no reasoning field at all — reading
+    // `reasoning_output_tokens` off it meant `arc cost` printed "reasoning —"
+    // for every Claude attempt, permanently. It lives on the aggregate.
+    expect(r.usage[0]).toMatchObject({
+      provider: 'claude', usageSemantics: 'additive',
+      inputTokens: 11, cachedInputTokens: 22, cacheWriteInputTokens: 33, outputTokens: 44,
+      reasoningOutputTokens: 12, cacheWrite1hTokens: 30, cacheWrite5mTokens: 3,
+    })
+  })
+
+  it('keeps Anthropic cache buckets on the snake_case fallback', async () => {
+    // This path had NO fixture. It reads `cached_input_tokens` /
+    // `cache_write_input_tokens` if you copy OpenAI's names — which are simply
+    // absent from an Anthropic receipt, so the whole cache bill silently
+    // vanished: $0.000455 recorded against $0.042415 billed on a measured call.
+    process.env.ARC_FAKE_PAYLOAD = JSON.stringify({ status: 'done', noop: true, noopReason: 'x' })
+    process.env.ARC_FAKE_NO_MODEL_USAGE = '1'
+    const r = await dispatch({ role: claudeRole, cwd: process.cwd(), prompt: 'go', schema: TaskResult })
+
+    expect(r.usage[0]).toMatchObject({
+      provider: 'claude', usageSemantics: 'additive',
+      inputTokens: 11, cachedInputTokens: 22, cacheWriteInputTokens: 33,
+      outputTokens: 44, reasoningOutputTokens: 12,
+    })
+  })
+
+  it('reconciles a REAL captured receipt to six decimal places', () => {
+    // Captured from a live `claude -p --output-format json` run and committed
+    // verbatim. This is the whole cost model asserted at once: the buckets are
+    // ADDITIVE (input_tokens excludes cache), and a 1-hour cache write is 2.0x
+    // base input — assuming the 5-minute 1.25x gives $0.027360 instead.
+    const receipt = JSON.parse(readFileSync(
+      join(FIXTURES, 'receipts', 'claude-haiku-4-5.json'), 'utf8'))
+    const u = receipt.usage
+    const PER_MTOK = { input: 1.0, output: 5.0, cacheRead: 0.10, cacheWrite1h: 2.0 }
+    const computed =
+      u.input_tokens * PER_MTOK.input / 1e6 +
+      u.output_tokens * PER_MTOK.output / 1e6 +
+      u.cache_read_input_tokens * PER_MTOK.cacheRead / 1e6 +
+      u.cache_creation.ephemeral_1h_input_tokens * PER_MTOK.cacheWrite1h / 1e6
+
+    expect(computed).toBeCloseTo(receipt.total_cost_usd, 6)
+    // and thinking is a SUBSET of output, so adding them double-counts
+    expect(u.output_tokens_details.thinking_tokens).toBeLessThan(u.output_tokens)
+  })
 })

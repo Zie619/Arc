@@ -8,7 +8,7 @@ import { tmpdir, homedir } from 'node:os'
 import { randomBytes } from 'node:crypto'
 import { Store } from './store.ts'
 import { ArcService, runThreadCommand } from './service.ts'
-import { runDirect, type LaneAttemptObserver } from './direct.ts'
+import { runDirect, DEFAULT_DEPENDENCIES, type LaneAttemptObserver } from './direct.ts'
 import { runReviewLane } from './review.ts'
 import { runTriage, quickTriage, runInterview, runScouts, runPlanner, runResearchSynthesis, Cancelled, type Ask } from './design.ts'
 import { runArc, type TaskProduct } from './orchestrator.ts'
@@ -1031,6 +1031,22 @@ export function App({ store, config, danger, initialBrief, version = '0.2.0' }: 
                   'The reviewer wants to run its finding checks in your checkout.',
                   commands.slice(0, 6))
               : undefined,
+          }, {
+            ...DEFAULT_DEPENDENCIES,
+            // The direct lane already shares the attempt ledger through the
+            // observer; gate runs were the one thing it dropped, which is what
+            // a flake ledger and any cross-lane accounting need most.
+            runGate: async (gate, cwd, baseSha, signal) => {
+              const r = await DEFAULT_DEPENDENCIES.runGate(gate, cwd, baseSha, signal)
+              try {
+                store.recordGate({
+                  arcId: id, name: r.name, command: r.command, proves: r.proves,
+                  exitCode: r.exitCode, baseSha: r.baseSha, durationMs: r.durationMs,
+                  verdict: r.pass ? 'pass' : 'fail', signature: r.signature,
+                })
+              } catch { /* the ledger is best-effort; the lane run is not */ }
+              return r
+            },
           })
           sweepAttempts()
           if (result.ok) for (const row of steering) { try { store.applyIntervention(String(row.id)) } catch { /* stays pending */ } }

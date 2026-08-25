@@ -119,9 +119,25 @@ export const ProviderUsage = z.object({
   inputTokens: z.number().int().nonnegative().optional(),
   cachedInputTokens: z.number().int().nonnegative().optional(),
   cacheWriteInputTokens: z.number().int().nonnegative().optional(),
+  // The TTL split, because they are priced differently: a 1-hour cache write is
+  // 2.0x base input and a 5-minute one is 1.25x. Claude Code defaults to 1 hour
+  // and cache writes are usually the DOMINANT term, so collapsing the two is a
+  // 1.6x error on the biggest number in the bill.
+  cacheWrite5mTokens: z.number().int().nonnegative().optional(),
+  cacheWrite1hTokens: z.number().int().nonnegative().optional(),
   outputTokens: z.number().int().nonnegative().optional(),
   reasoningOutputTokens: z.number().int().nonnegative().optional(),
   costUsd: z.number().nonnegative().optional(),
+  /**
+   * Whether `cachedInputTokens` is INSIDE `inputTokens` or beside it. The two
+   * providers disagree, so one column cannot mean one thing:
+   *   - 'subset'   (OpenAI/codex): input_tokens already contains the cached ones
+   *   - 'additive' (Anthropic):    input, cache-read and cache-write are three
+   *                                separate, separately-priced buckets
+   * Without this discriminator any single formula over attempt_usage is wrong
+   * for one of the two providers.
+   */
+  usageSemantics: z.enum(['additive', 'subset']),
   raw: z.record(z.string(), z.unknown()),
 })
 export type ProviderUsage = z.infer<typeof ProviderUsage>
@@ -141,6 +157,18 @@ export const ProjectConfig = z.object({
    *  the right default for a repo with no remote, and the safe choice for a
    *  first run anywhere. */
   landStrategy: z.enum(['push', 'pr', 'none']).default('pr'),
+  /**
+   * What to do when a `readOnly` command has no OS sandbox to run under.
+   * Reviewer-authored `checkCommand`s are model-authored shell that Arc
+   * executes by design, and only macOS Seatbelt enforces the deny-write
+   * profile — on Linux, and inside another sandbox where Seatbelt refuses to
+   * nest, there is nothing underneath.
+   *
+   *   'caveat' — run it and record that it ran unprotected (default: an
+   *              unverified finding is worse than an unsandboxed check)
+   *   'refuse' — do not run it; the finding stays unverified and says why
+   */
+  sandboxPolicy: z.enum(['caveat', 'refuse']).default('caveat'),
   gates: z.array(GateDef).default([]),
   /**
    * Run once in every freshly provisioned worktree before agents or checks

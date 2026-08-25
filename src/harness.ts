@@ -79,25 +79,63 @@ function numeric(o: Record<string, unknown>, key: string): number | undefined {
   return typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value : undefined
 }
 
+/** One level down, for the receipt fields the providers nest. */
+function nested(o: Record<string, unknown>, outer: string, key: string): number | undefined {
+  const inner = o[outer]
+  if (!inner || typeof inner !== 'object' || Array.isArray(inner)) return undefined
+  return numeric(inner as Record<string, unknown>, key)
+}
+
+/**
+ * Anthropic and OpenAI disagree on the NAME and on the MEANING of every cache
+ * field, and each verified against a live receipt from the shipped CLI:
+ *
+ *   claude, camelCase (`modelUsage[model]`)
+ *     inputTokens · cacheReadInputTokens · cacheCreationInputTokens · outputTokens
+ *     and NO reasoning field at all — thinking tokens are not present here.
+ *   claude, snake_case (the aggregate `usage` object)
+ *     input_tokens · cache_read_input_tokens · cache_creation_input_tokens ·
+ *     output_tokens · output_tokens_details.thinking_tokens ·
+ *     cache_creation.{ephemeral_5m,ephemeral_1h}_input_tokens
+ *   codex, snake_case
+ *     input_tokens · cached_input_tokens · cache_write_input_tokens ·
+ *     output_tokens · reasoning_output_tokens
+ *
+ * Reading OpenAI's names off an Anthropic receipt is not a near miss: a measured
+ * call reported 10 input and 89 output while 38,213 cache tokens vanished —
+ * $0.000455 recorded against $0.042415 actually billed.
+ */
 function exactUsage(
   provider: 'claude' | 'codex', raw: unknown, model?: string, costUsd?: number,
   style: 'camel' | 'snake' = provider === 'claude' ? 'camel' : 'snake',
 ): ProviderUsage | null {
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null
   const r = raw as Record<string, unknown>
-  const inputTokens = numeric(r, style === 'camel' ? 'inputTokens' : 'input_tokens')
-  const cachedInputTokens = numeric(r, style === 'camel' ? 'cacheReadInputTokens' : 'cached_input_tokens')
-  const cacheWriteInputTokens = numeric(r, style === 'camel' ? 'cacheCreationInputTokens' : 'cache_write_input_tokens')
-  const outputTokens = numeric(r, style === 'camel' ? 'outputTokens' : 'output_tokens')
+  const snakeCacheRead = provider === 'claude' ? 'cache_read_input_tokens' : 'cached_input_tokens'
+  const snakeCacheWrite = provider === 'claude' ? 'cache_creation_input_tokens' : 'cache_write_input_tokens'
+  const pick = (camel: string, snake: string) => numeric(r, style === 'camel' ? camel : snake)
+
+  const inputTokens = pick('inputTokens', 'input_tokens')
+  const cachedInputTokens = pick('cacheReadInputTokens', snakeCacheRead)
+  const cacheWriteInputTokens = pick('cacheCreationInputTokens', snakeCacheWrite)
+  const outputTokens = pick('outputTokens', 'output_tokens')
+  // codex reports reasoning flat; Anthropic nests it, and only on the aggregate.
   const reasoningOutputTokens = numeric(r, 'reasoning_output_tokens')
+    ?? nested(r, 'output_tokens_details', 'thinking_tokens')
+  const cacheWrite5mTokens = nested(r, 'cache_creation', 'ephemeral_5m_input_tokens')
+  const cacheWrite1hTokens = nested(r, 'cache_creation', 'ephemeral_1h_input_tokens')
+
   if ([inputTokens, cachedInputTokens, cacheWriteInputTokens, outputTokens,
     reasoningOutputTokens, costUsd].every(value => value === undefined)) return null
   const candidate = {
     provider,
+    usageSemantics: provider === 'claude' ? 'additive' : 'subset',
     ...(model === undefined ? {} : { model }),
     ...(inputTokens === undefined ? {} : { inputTokens }),
     ...(cachedInputTokens === undefined ? {} : { cachedInputTokens }),
     ...(cacheWriteInputTokens === undefined ? {} : { cacheWriteInputTokens }),
+    ...(cacheWrite5mTokens === undefined ? {} : { cacheWrite5mTokens }),
+    ...(cacheWrite1hTokens === undefined ? {} : { cacheWrite1hTokens }),
     ...(outputTokens === undefined ? {} : { outputTokens }),
     ...(reasoningOutputTokens === undefined ? {} : { reasoningOutputTokens }),
     ...(costUsd === undefined ? {} : { costUsd }),
@@ -294,6 +332,25 @@ export async function dispatch(o: DispatchOptions): Promise<DispatchResult> {
             if (row) usage.push(row)
           }
           modelVerified = observed.size > 0
+          // Thinking tokens and the cache-write TTL split exist ONLY on the
+          // aggregate `usage` object, never in the per-model map — verified
+          // against a live receipt. With one model they unambiguously belong to
+          // it. With several nobody can attribute them, so they stay off rather
+          // than being invented.
+          // ponytail: single-model attribution only; split them per model if a
+          // multi-model attempt ever needs an exact per-model bill.
+          if (usage.length === 1 && d.usage && typeof d.usage === 'object') {
+            const agg = d.usage as Record<string, unknown>
+            const only = usage[0]!
+            const detail = {
+              reasoningOutputTokens: nested(agg, 'output_tokens_details', 'thinking_tokens'),
+              cacheWrite5mTokens: nested(agg, 'cache_creation', 'ephemeral_5m_input_tokens'),
+              cacheWrite1hTokens: nested(agg, 'cache_creation', 'ephemeral_1h_input_tokens'),
+            }
+            for (const [key, value] of Object.entries(detail)) {
+              if (value !== undefined) (only as Record<string, unknown>)[key] = value
+            }
+          }
         }
         // Older Claude Code results may omit the per-model map. Its aggregate
         // uses snake_case, so preserve that exact receipt without inventing a

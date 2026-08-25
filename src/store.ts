@@ -62,7 +62,8 @@ const MIGRATIONS: string[] = [
      base_sha TEXT,
      head_sha TEXT,
      brief_artifact_id TEXT,
-     transcript_artifact_id TEXT
+     transcript_artifact_id TEXT,
+     effort TEXT
    )`,
   `CREATE TABLE IF NOT EXISTS criterion (
      arc_id TEXT NOT NULL,
@@ -123,6 +124,7 @@ const MIGRATIONS: string[] = [
      verdict TEXT NOT NULL,
      signature TEXT,
      artifact_id TEXT,
+     duration_ms INTEGER,
      ran_at INTEGER NOT NULL
    )`,
   `CREATE TABLE IF NOT EXISTS pending_op (
@@ -146,6 +148,9 @@ const MIGRATIONS: string[] = [
      cache_write_input_tokens INTEGER,
      output_tokens INTEGER,
      reasoning_output_tokens INTEGER,
+     cache_write_5m_tokens INTEGER,
+     cache_write_1h_tokens INTEGER,
+     usage_semantics TEXT NOT NULL DEFAULT 'subset',
      cost_usd REAL,
      raw_json TEXT NOT NULL,
      recorded_at INTEGER NOT NULL
@@ -313,6 +318,17 @@ export class Store {
     // Arc↔thread linkage used to exist only inside a lane.start event payload.
     this.ensureColumn('arc', 'thread_id', 'TEXT')
     this.ensureColumn('design', 'thread_id', 'TEXT')
+    // A 1-hour cache write is 2.0x base input and a 5-minute one is 1.25x, and
+    // the two providers disagree about whether cached tokens sit inside
+    // input_tokens or beside it. One column cannot carry either fact.
+    this.ensureColumn('attempt_usage', 'cache_write_5m_tokens', 'INTEGER')
+    this.ensureColumn('attempt_usage', 'cache_write_1h_tokens', 'INTEGER')
+    this.ensureColumn('attempt_usage', 'usage_semantics', `TEXT NOT NULL DEFAULT 'subset'`)
+    // effort lived only in RoleBinding and the frozen config blob, which made
+    // "is xhigh worth it?" unanswerable from the data.
+    this.ensureColumn('attempt', 'effort', 'TEXT')
+    // runGate already computes this and recordGate threw it away.
+    this.ensureColumn('gate_run', 'duration_ms', 'INTEGER')
   }
 
   private ensureColumn(table: string, column: string, decl: string): void {
@@ -879,14 +895,15 @@ export class Store {
     requestedModel: string
     baseSha?: string
     briefArtifactId?: string
+    effort?: string
   }): string {
     const id = randomUUID()
     this.db
       .prepare(
-        `INSERT INTO attempt (id, arc_id, task_id, attempt_no, role, requested_model, cli, started_at, base_sha, brief_artifact_id)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        `INSERT INTO attempt (id, arc_id, task_id, attempt_no, role, requested_model, cli, started_at, base_sha, brief_artifact_id, effort)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
-      .run(id, a.arcId, a.taskId, a.attemptNo, a.role, a.requestedModel, a.cli, Date.now(), a.baseSha ?? null, a.briefArtifactId ?? null)
+      .run(id, a.arcId, a.taskId, a.attemptNo, a.role, a.requestedModel, a.cli, Date.now(), a.baseSha ?? null, a.briefArtifactId ?? null, a.effort ?? null)
     this.appendEvent(a.arcId, 'attempt.start', { role: a.role, model: a.requestedModel, cli: a.cli }, a.taskId, id)
     return id
   }
@@ -921,13 +938,16 @@ export class Store {
       this.db.prepare(
         `INSERT INTO attempt_usage
            (id, arc_id, attempt_id, provider, model, input_tokens, cached_input_tokens,
-            cache_write_input_tokens, output_tokens, reasoning_output_tokens, cost_usd,
+            cache_write_input_tokens, cache_write_5m_tokens, cache_write_1h_tokens,
+            usage_semantics, output_tokens, reasoning_output_tokens, cost_usd,
             raw_json, recorded_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       ).run(
         randomUUID(), arcId, attemptId, row.provider, row.model ?? null,
         row.inputTokens ?? null, row.cachedInputTokens ?? null,
-        row.cacheWriteInputTokens ?? null, row.outputTokens ?? null,
+        row.cacheWriteInputTokens ?? null,
+        row.cacheWrite5mTokens ?? null, row.cacheWrite1hTokens ?? null,
+        row.usageSemantics, row.outputTokens ?? null,
         row.reasoningOutputTokens ?? null, row.costUsd ?? null,
         JSON.stringify(row.raw), Date.now(),
       )
@@ -966,11 +986,22 @@ export class Store {
               SUM(CASE WHEN u.attempt_id IS NOT NULL THEN 1 ELSE 0 END) receipted,
               SUM(COALESCE(u.inp, 0)) input_tokens,
               SUM(COALESCE(u.cin, 0)) cached_input_tokens,
+              SUM(COALESCE(u.cwr, 0)) cache_write_tokens,
+              SUM(COALESCE(u.billed, 0)) billed_input_tokens,
               SUM(COALESCE(u.out, 0)) output_tokens,
               SUM(COALESCE(u.rsn, 0)) reasoning_tokens,
               SUM(u.cost) cost_usd
        FROM attempt a
        LEFT JOIN (SELECT attempt_id, SUM(input_tokens) inp, SUM(cached_input_tokens) cin,
+                         SUM(cache_write_input_tokens) cwr,
+                         -- 'additive' (Anthropic): input, cache-read and cache-write
+                         -- are three separate buckets. 'subset' (OpenAI): the cached
+                         -- ones are already inside input_tokens. Summing one column
+                         -- across both providers is wrong for one of them.
+                         SUM(CASE WHEN usage_semantics = 'additive'
+                                  THEN COALESCE(input_tokens, 0) + COALESCE(cached_input_tokens, 0)
+                                       + COALESCE(cache_write_input_tokens, 0)
+                                  ELSE COALESCE(input_tokens, 0) END) billed,
                          SUM(output_tokens) out, SUM(reasoning_output_tokens) rsn, SUM(cost_usd) cost
                   FROM attempt_usage GROUP BY attempt_id) u ON u.attempt_id = a.id
        WHERE a.arc_id = ?
@@ -1174,15 +1205,17 @@ export class Store {
     verdict: 'pass' | 'fail' | 'baseline'
     signature?: string
     artifactId?: string
+    durationMs?: number
   }): void {
     this.db
       .prepare(
-        `INSERT INTO gate_run (id, arc_id, task_id, attempt_id, name, command, proves, exit_code, base_sha, verdict, signature, artifact_id, ran_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        `INSERT INTO gate_run (id, arc_id, task_id, attempt_id, name, command, proves, exit_code, base_sha, verdict, signature, artifact_id, duration_ms, ran_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         randomUUID(), g.arcId, g.taskId ?? null, g.attemptId ?? null, g.name, g.command, g.proves,
-        g.exitCode, g.baseSha, g.verdict, g.signature ?? null, g.artifactId ?? null, Date.now(),
+        g.exitCode, g.baseSha, g.verdict, g.signature ?? null, g.artifactId ?? null,
+        g.durationMs ?? null, Date.now(),
       )
     this.appendEvent(g.arcId, 'gate', { name: g.name, verdict: g.verdict, exitCode: g.exitCode, proves: g.proves }, g.taskId, g.attemptId)
   }

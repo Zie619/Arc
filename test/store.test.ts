@@ -198,7 +198,7 @@ describe('provider usage receipts', () => {
     store.finishAttempt('arc1', attemptId, {
       terminalReason: 'ok', exitCode: 0, observedModel: 'gpt-5.6-sol',
       usage: [{
-        provider: 'codex', inputTokens: 101, cachedInputTokens: 51,
+        provider: 'codex', usageSemantics: 'subset' as const, inputTokens: 101, cachedInputTokens: 51,
         outputTokens: 13, raw: { input_tokens: 101, cached_input_tokens: 51, output_tokens: 13 },
       }],
     })
@@ -206,7 +206,7 @@ describe('provider usage receipts', () => {
     const rows = store.usageForAttempt(attemptId)
     expect(rows).toHaveLength(1)
     expect(rows[0]).toMatchObject({
-      arc_id: 'arc1', provider: 'codex', input_tokens: 101,
+      arc_id: 'arc1', provider: 'codex', usage_semantics: 'subset', input_tokens: 101,
       cached_input_tokens: 51, output_tokens: 13, cost_usd: null,
     })
     expect(JSON.parse(rows[0]!.raw_json)).toEqual({
@@ -235,7 +235,7 @@ describe('the token bill', () => {
     store.finishAttempt('arc1', withReceipt, {
       terminalReason: 'ok', exitCode: 0, observedModel: 'gpt-5.6-sol',
       usage: [{
-        provider: 'codex', inputTokens: 1000, cachedInputTokens: 600,
+        provider: 'codex', usageSemantics: 'subset' as const, inputTokens: 1000, cachedInputTokens: 600,
         outputTokens: 50, raw: {},
       }],
     })
@@ -270,5 +270,46 @@ describe('two writers wait instead of throwing', () => {
     // immediately, which under --until-done becomes a crash and a relaunch.
     expect((store as any).db.prepare('PRAGMA busy_timeout').get().timeout).toBe(5000)
     store.close()
+  })
+})
+
+describe('the two providers do not mean the same thing by "cached"', () => {
+  it('bills Anthropic additively and OpenAI as a subset, in one summary', () => {
+    const anthropic = store.startAttempt({
+      arcId: 'arc1', taskId: 't1', attemptNo: 1, role: 'review',
+      cli: 'claude', requestedModel: 'opus', effort: 'high',
+    })
+    store.finishAttempt('arc1', anthropic, {
+      terminalReason: 'ok', exitCode: 0, observedModel: 'opus',
+      usage: [{
+        provider: 'claude', usageSemantics: 'additive' as const,
+        inputTokens: 10, cachedInputTokens: 18_140, cacheWriteInputTokens: 20_073,
+        cacheWrite1hTokens: 20_073, cacheWrite5mTokens: 0,
+        outputTokens: 89, reasoningOutputTokens: 83, raw: {},
+      }],
+    })
+    const openai = store.startAttempt({
+      arcId: 'arc1', taskId: 't1', attemptNo: 1, role: 'implement',
+      cli: 'codex', requestedModel: 'gpt-5.6-sol',
+    })
+    store.finishAttempt('arc1', openai, {
+      terminalReason: 'ok', exitCode: 0, observedModel: 'gpt-5.6-sol',
+      usage: [{
+        provider: 'codex', usageSemantics: 'subset' as const,
+        inputTokens: 1_000, cachedInputTokens: 600, outputTokens: 50, raw: {},
+      }],
+    })
+
+    const rows = store.costSummary('arc1')
+    const claude = rows.find((r) => r.role === 'review')!
+    const codex = rows.find((r) => r.role === 'implement')!
+
+    // Anthropic: input_tokens EXCLUDES cache, so the bill is the sum of three
+    // buckets. Reporting input_tokens alone showed 10 against 38,223 real.
+    expect(claude.billed_input_tokens).toBe(10 + 18_140 + 20_073)
+    // OpenAI: cached tokens are already inside input_tokens. Adding them again
+    // would double count.
+    expect(codex.billed_input_tokens).toBe(1_000)
+    expect(claude.reasoning_tokens).toBe(83)
   })
 })

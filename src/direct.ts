@@ -147,7 +147,7 @@ export interface DirectDependencies {
   ) => GateResult | Promise<GateResult>
 }
 
-const DEFAULT_DEPENDENCIES: DirectDependencies = { dispatch, runGate }
+export const DEFAULT_DEPENDENCIES: DirectDependencies = { dispatch, runGate }
 const MAX_PATCH_CHARS = 2 * 1024 * 1024
 
 interface ParsedStatus {

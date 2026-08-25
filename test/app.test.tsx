@@ -591,7 +591,7 @@ describe('local controls', () => {
     })
     store.finishAttempt('usage-arc', claudeAttempt, {
       terminalReason: 'ok', exitCode: 0, observedModel: 'opus',
-      usage: [{ provider: 'claude', model: 'opus', inputTokens: 11, outputTokens: 44,
+      usage: [{ provider: 'claude', usageSemantics: 'additive' as const, model: 'opus', inputTokens: 11, outputTokens: 44,
         costUsd: 0.0123, raw: { inputTokens: 11, outputTokens: 44, costUSD: 0.0123 } }],
     })
     const codexAttempt = store.startAttempt({
@@ -600,7 +600,7 @@ describe('local controls', () => {
     })
     store.finishAttempt('usage-arc', codexAttempt, {
       terminalReason: 'ok', exitCode: 0, observedModel: 'gpt-5.6-sol',
-      usage: [{ provider: 'codex', inputTokens: 101, outputTokens: 13,
+      usage: [{ provider: 'codex', usageSemantics: 'subset' as const, inputTokens: 101, outputTokens: 13,
         raw: { input_tokens: 101, output_tokens: 13 } }],
     })
     const app = render(<App store={store} config={detectProject(repo).config} danger={false} />, {

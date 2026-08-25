@@ -94,7 +94,7 @@ async function callAgent<T>(
   const briefId = store.putArtifact(arcId, 'brief', prompt)
   const attemptId = store.startAttempt({
     arcId, taskId: null, attemptNo: 1, role: agentRole,
-    cli: r.cli, requestedModel: r.model, briefArtifactId: briefId,
+    cli: r.cli, requestedModel: r.model, briefArtifactId: briefId, effort: r.effort,
   })
   log(`  · ${label} (${r.cli}/${r.model}, ${Math.round(prompt.length / 1000)}k prompt)`)
   o.progress?.(label, `${r.cli === 'codex' ? 'Sol' : 'Opus'} · ${r.model}`)

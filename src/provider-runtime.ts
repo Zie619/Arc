@@ -68,6 +68,8 @@ const RUNTIME_ENV = new Set([
   'http_proxy', 'https_proxy', 'all_proxy', 'no_proxy',
   'SSL_CERT_FILE', 'SSL_CERT_DIR', 'NODE_EXTRA_CA_CERTS',
   'XDG_CONFIG_HOME', 'XDG_DATA_HOME', 'XDG_CACHE_HOME', 'XDG_RUNTIME_DIR',
+  // NOTE: OTEL_* is deliberately NOT here. It reaches a child only when the
+  // operator sets ARC_TELEMETRY=1 — see buildProviderChildEnv.
 ])
 
 const PROVIDER_ENV: Record<ProviderName, ReadonlySet<string>> = {
@@ -107,6 +109,18 @@ export function buildProviderChildEnv(
   // the operator's own memory files regardless of it. Set last so neither the
   // parent environment nor a role allowlist can switch it back on.
   if (provider === 'claude') env.CLAUDE_CODE_DISABLE_AUTO_MEMORY = '1'
+  // Claude Code emits OpenTelemetry of its own — per-tool spans, per-request
+  // timing, permission waits — which is the entire INSIDE of an attempt that
+  // Arc otherwise sees as a black box with a final answer. OTEL_* is
+  // deliberately absent from RUNTIME_ENV so nothing leaks by accident, so this
+  // requires the operator to have opted in on THIS process. It sends data
+  // somewhere: never infer the opt-in.
+  if (provider === 'claude' && source.ARC_TELEMETRY === '1') {
+    env.CLAUDE_CODE_ENABLE_TELEMETRY = '1'
+    for (const key of Object.keys(source)) {
+      if (key.startsWith('OTEL_') && source[key] !== undefined) env[key] = source[key]
+    }
+  }
   return env
 }
 

@@ -7,7 +7,7 @@ import {
   type DispatchOptions, type DispatchResult,
 } from './harness.ts'
 import { computeFrontier } from './scheduler.ts'
-import { runGate, selectGates, isSubsetOfBaseline, describe, checkOutcome, type CheckOutcome, type GateResult } from './gates.ts'
+import { runGate, selectGates, isSubsetOfBaseline, describe, checkOutcome, sandboxUsable, type CheckOutcome, type GateResult } from './gates.ts'
 import { signaturesMatch, signatureSimilarity } from './classify.ts'
 import * as G from './git.ts'
 import { formatCostSummary } from './cost.ts'
@@ -416,6 +416,7 @@ async function measureBaselines(o: RunOptions, baseSha: string): Promise<Map<str
     o.store.recordGate({
       arcId: o.plan.arcId, name: g.name, command: g.command, proves: g.proves,
       exitCode: r.exitCode, baseSha, verdict: 'baseline', signature: r.signature,
+      durationMs: r.durationMs,
     })
     o.log(`  baseline ${g.name}: exit ${r.exitCode}`)
   }
@@ -637,6 +638,7 @@ async function dispatchStep(o: RunOptions, step: DispatchStepOptions): Promise<D
       arcId: plan.arcId, taskId: step.taskId, attemptNo: step.attemptNo,
       role: step.roleName, cli: step.role.cli, requestedModel: step.role.model,
       baseSha: step.baseSha, briefArtifactId: step.briefArtifactId,
+      effort: step.role.effort,
     })
     const result = await dispatch({ role: step.role, ...step.dispatch })
     const model = modelStatus(o, step.role, result, attemptId, step.taskId)
@@ -890,6 +892,7 @@ async function runRefreshCommands(
       name, command: refresh.command, proves: result.proves,
       exitCode: result.exitCode, baseSha: wt.baseSha,
       verdict: result.pass ? 'pass' : 'fail', signature: result.signature, artifactId,
+      durationMs: result.durationMs,
     })
     if (!result.pass) {
       const tail = result.output.slice(-800)
@@ -920,6 +923,7 @@ async function setupWorktree(o: RunOptions, wt: G.Worktree, taskId?: string): Pr
     exitCode: setup.exitCode, baseSha: wt.baseSha,
     verdict: setup.pass ? 'pass' : 'fail', signature: setup.signature,
     artifactId: store.putArtifact(o.plan.arcId, 'gate-output', setup.output),
+    durationMs: setup.durationMs,
   })
   if (!setup.pass) {
     log(`  ✗ ${taskId ?? wt.branch}: worktree setup failed — ${setup.output.slice(-300)}`)
@@ -950,6 +954,7 @@ async function runTaskGates(
       proves: g.proves, exitCode: r.exitCode, baseSha: wt.baseSha,
       verdict: ok ? 'pass' : 'fail', signature: r.signature,
       artifactId: o.store.putArtifact(o.plan.arcId, 'gate-output', r.output, attemptId),
+      durationMs: r.durationMs,
     })
     o.log(`    ${describe(r)}${ok && !r.pass ? ' (within baseline)' : ''}`)
     out.push({ ok, result: r })
@@ -1142,6 +1147,16 @@ async function runReviewFindingCheck(
 ): Promise<{ keep: boolean; outcome: CheckOutcome | 'no-command'; caveat?: string; artifactId?: string; exitCode?: number | null }> {
   if (!finding.checkCommand) return { keep: true, outcome: 'no-command' }
   const name = `${taskId ? `review:${taskId}` : 'integration-review'}:${finding.file}:${finding.line}`
+  // sandboxPolicy: 'refuse' — an operator who would rather have no finding than
+  // an unsandboxed one. The finding is KEPT and says why it is unverified.
+  if (o.config.sandboxPolicy === 'refuse' && !sandboxUsable()) {
+    o.log(`    ! ${name}: refused — no OS write sandbox on this platform (sandboxPolicy: refuse)`)
+    return {
+      keep: true,
+      outcome: 'could-not-run',
+      caveat: 'not run: sandboxPolicy is "refuse" and this platform has no OS write sandbox',
+    }
+  }
   const result = await runGate({
     name,
     command: finding.checkCommand,
@@ -1165,6 +1180,7 @@ async function runReviewFindingCheck(
     verdict: result.pass ? 'pass' : 'fail',
     signature: result.signature,
     artifactId,
+    durationMs: result.durationMs,
   })
   // Three outcomes, not two. `keep: result.pass` treated "the command could not
   // run" as "the defect is not real" and DELETED the finding — so a reviewer

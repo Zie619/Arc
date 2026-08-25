@@ -61,5 +61,22 @@ if [ -n "$ARC_FAKE_ERROR" ]; then
   echo "{\"type\":\"result\",\"subtype\":\"error\",\"is_error\":true,\"modelUsage\":{\"$REPORTED\":{}},\"result\":\"${ARC_FAKE_ERRTEXT:-}\"}"
   exit 1
 fi
-printf '{"type":"result","subtype":"success","is_error":false,"modelUsage":{"%s":{"inputTokens":11,"cacheReadInputTokens":22,"cacheCreationInputTokens":33,"outputTokens":44,"costUSD":0.0123}},"result":%s}\n' \
-  "$REPORTED" "$(printf '%s' "$PAYLOAD" | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read()))')"
+# The receipt shape below is COPIED FROM A LIVE `claude -p --output-format json`
+# run, not invented. Three parser bugs survived for months because the fixture
+# emitted only the camelCase map, which is the one path that already worked:
+#   - `modelUsage` carries NO reasoning field at all
+#   - thinking tokens live at usage.output_tokens_details.thinking_tokens
+#   - the aggregate is snake_case and uses Anthropic's names
+#     (cache_read_input_tokens / cache_creation_input_tokens), not OpenAI's
+#   - cache_creation splits by TTL, and the two TTLs are priced differently
+RESULT_TEXT="$(printf '%s' "$PAYLOAD" | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read()))')"
+AGGREGATE='"usage":{"input_tokens":11,"cache_read_input_tokens":22,"cache_creation_input_tokens":33,"output_tokens":44,"output_tokens_details":{"thinking_tokens":12},"cache_creation":{"ephemeral_1h_input_tokens":30,"ephemeral_5m_input_tokens":3}},"total_cost_usd":0.0123'
+# Older Claude Code omits the per-model map entirely and reports only the
+# snake_case aggregate. That fallback had NO fixture at all, and it was the path
+# that dropped 99.5% of a real bill.
+if [ -n "$ARC_FAKE_NO_MODEL_USAGE" ]; then
+  printf '{"type":"result","subtype":"success","is_error":false,%s,"result":%s}\n' "$AGGREGATE" "$RESULT_TEXT"
+  exit 0
+fi
+printf '{"type":"result","subtype":"success","is_error":false,"modelUsage":{"%s":{"inputTokens":11,"cacheReadInputTokens":22,"cacheCreationInputTokens":33,"outputTokens":44,"costUSD":0.0123}},%s,"result":%s}\n' \
+  "$REPORTED" "$AGGREGATE" "$RESULT_TEXT"
