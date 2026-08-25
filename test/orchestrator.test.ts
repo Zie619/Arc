@@ -86,12 +86,33 @@ function config(over: Partial<any> = {}) {
 function task(id: string, over: Partial<any> = {}) {
   return {
     id, title: id, spec: 'do it',
-    dependsOn: [], footprint: [], contractsMutated: [], contractsRead: [],
+    // Each fixture task declares the file it will actually create. `['.']` is
+    // the honest "may touch anything", and it serialises against everything —
+    // which is correct, and no use for the parallelism tests.
+    dependsOn: [], footprint: [`e2e--${id}-generated.ts`], contractsMutated: ['none'], contractsRead: [],
     gates: ['always-green'],
-    acceptance: [{ id: 'c1', text: 'it ran', proofKind: 'command', proofCommand: 'true', requiredTier: 'checked' }],
+    // A REAL discriminating proof: it fails at the base commit and passes once
+    // the writer has created the file. `proofCommand: 'true'` was vacuous — it
+    // passed before the work existed, which is precisely what the dry-run now
+    // refuses, and what would otherwise put a green tick beside nothing.
+    acceptance: [{
+      id: 'c1', text: 'it ran', proofKind: 'command',
+      proofCommand: `test -f e2e--${id}-generated.ts`, requiredTier: 'checked',
+    }],
     ...over,
   }
 }
+
+/**
+ * A criterion that is honestly INVARIANT: it holds before and after. For tasks
+ * whose fixture writes somewhere other than the default generated file, or
+ * writes nothing at all — a discriminating proof about a file that never
+ * appears would be a lie, and the dry-run correctly refuses one.
+ */
+const INVARIANT_CRITERION = [{
+  id: 'c1', text: 'the tree still works', proofKind: 'command',
+  proofCommand: 'true', polarity: 'invariant', requiredTier: 'checked',
+}]
 
 function plan(tasks: any[]): Plan {
   return { arcId: 'e2e', charter: { goal: 'ship it', objectives: [], nonGoals: [] }, tasks } as Plan
@@ -189,7 +210,7 @@ describe('the orchestrator, end to end', () => {
       implement: { cli: 'claude', model: 'opus', sandbox: 'workspace-write', timeoutMs: 20000, stallMs: 15000 },
     }
     const store = new Store(home)
-    await runArc({ store, plan: plan([task('discard-impostor')]), config: config({ landStrategy: 'none', roles }), log })
+    await runArc({ store, plan: plan([task('discard-impostor', { acceptance: INVARIANT_CRITERION })]), config: config({ landStrategy: 'none', roles }), log })
 
     expect(store.allTasks('e2e')[0]!.state).toBe('landed')
     expect(sh(repo, 'show', 'arc/e2e-integration:generated.ts')).toContain('x = 2')
@@ -242,7 +263,7 @@ describe('the orchestrator, end to end', () => {
     }
     const store = new Store(home)
     await runArc({
-      store, plan: plan([task('starts-after-wait')]),
+      store, plan: plan([task('starts-after-wait', { acceptance: INVARIANT_CRITERION })]),
       config: config({ landStrategy: 'none', roles }), log,
       preflight: true, waitForPreflightCapacity: true,
     })
@@ -297,7 +318,7 @@ describe('the orchestrator, end to end', () => {
       status: 'done', noop: true, noopReason: 'already correct',
     })
     const store = new Store(home)
-    await runArc({ store, plan: plan([task('nothing-to-do')]), config: config(), log })
+    await runArc({ store, plan: plan([task('nothing-to-do', { acceptance: INVARIANT_CRITERION })]), config: config(), log })
     expect(logs.join('\n')).toContain('accepted as a no-op')
     expect(store.allTasks('e2e')[0]!.state).toBe('landed')
     store.close()
@@ -616,8 +637,9 @@ describe('the orchestrator, end to end', () => {
       store,
       plan: plan([task('unclaimed', {
         acceptance: [
-          { id: 'c1', text: 'it ran', proofKind: 'command', proofCommand: 'true', requiredTier: 'checked' },
-          { id: 'c2', text: 'the generated file exists', proofKind: 'command', proofCommand: 'ls | grep -q generated', requiredTier: 'checked' },
+          { id: 'c1', text: 'it ran', proofKind: 'command', proofCommand: 'true', polarity: 'invariant', requiredTier: 'checked' },
+          // Discriminating and honest: no generated file exists at base.
+          { id: 'c2', text: 'the generated file exists', proofKind: 'command', proofCommand: 'test -n "$(echo *-generated.ts)" && test -f $(echo *-generated.ts)', requiredTier: 'checked' },
         ],
       })]),
       config: config(), log,
@@ -814,7 +836,10 @@ describe('the gate surface is not the writer\'s to move', () => {
   it('allows it when the task declares WHY, and records the exception', async () => {
     process.env.ARC_FAKE_WRITE = 'thing.test.ts'
     const store = new Store(home)
-    const p = plan([{ ...task('honest'), touchesGateSurface: 'this task adds the missing tests for the importer' }])
+    const p = plan([{
+      ...task('honest', { acceptance: INVARIANT_CRITERION }),
+      touchesGateSurface: 'this task adds the missing tests for the importer',
+    }])
     await runArc({ store, plan: p, config: config(), log })
 
     expect(store.allTasks('e2e')[0]!.state).toBe('landed')

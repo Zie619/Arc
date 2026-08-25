@@ -182,6 +182,10 @@ export const ProjectConfig = z.object({
    * its author either.
    */
   reviewRiskPhase: z.boolean().default(true),
+  /** Execute every proofCommand at the base commit before dispatching, and
+   *  refuse a plan whose proofs cannot tell done from not-done. Costs one
+   *  worktree and a few seconds; catches the failure static analysis cannot. */
+  dryRunProofs: z.boolean().default(true),
   /**
    * What a CHANGES_REQUIRED repair round may spend. Explicit, because it used
    * to acquire a full second copy of maxAttempts and maxTaskMinutes purely by
@@ -397,6 +401,29 @@ export const AcceptanceCriterion = z.object({
    * plan with bad-envelope. (Found in the first dogfood run.)
    */
   proofCommand: z.string().nullish(),
+  /**
+   * What the proof should do BEFORE the work exists.
+   *
+   *   'discriminating' — the work makes it true, so it MUST FAIL at the base
+   *                      commit. This is the default and the interesting case.
+   *   'invariant'      — the work must not break it, so it MUST PASS at base.
+   *
+   * This exists because a proof can be VACUOUS: portable, runs fine, and proves
+   * nothing because it already passed before anything was written.
+   * `test -f src/cost.ts` on a file that already exists. `npm test` as the proof
+   * of one specific criterion. Static analysis cannot catch that; execution
+   * against the base commit catches it totally.
+   *
+   * And vacuity is more dangerous than fragility: a fragile proof fails loudly,
+   * while a vacuous one grants `checked` and puts a green tick beside a
+   * criterion nothing established — laundering a wish into evidence inside the
+   * one subsystem whose entire value is that it does not do that.
+   *
+   * Declaring polarity turns the dry-run from a heuristic into a TOTAL
+   * function: every criterion carries a mandatory, checkable assertion about
+   * its behaviour at base. There is no "can't tell" bucket.
+   */
+  polarity: z.enum(['discriminating', 'invariant']).default('discriminating'),
   /** The tier this criterion must reach before its task may be called done. */
   requiredTier: ClaimTier.default('checked'),
 })
@@ -424,6 +451,14 @@ export const PlanTask = z.object({
   contractsRead: z.array(z.string()).default([]),
   /** Gate names from project.yaml. Empty ⇒ all non-heavy gates. */
   gates: z.array(z.string()).default([]),
+  /**
+   * Which charter objectives this task advances. Arc had ZERO traceability
+   * between the thing the operator approved and the work that got planned: an
+   * objective could be dropped silently, and a task could exist for no stated
+   * reason at all. Optional for now so existing plans still parse; validated
+   * when present.
+   */
+  covers: z.array(z.string()).default([]),
   /**
    * Why this task is allowed to change the thing that PROVES it — a test file,
    * a CI config, a runner script. Absent, touching `protectedGatePaths` is a

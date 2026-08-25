@@ -180,7 +180,7 @@ describe('scouts verify premises against real code', () => {
 
     enqueue({ scouts: [{ id: 's1', area: 'memory layer writes', brief: 'find write paths', engine: 'codex' }] })
     enqueue({
-      area: 'memory layer writes', findings: [], filesToTouch: [], contractsMutated: [], contractsRead: [],
+      area: 'memory layer writes', findings: [], filesToTouch: [], contractsMutated: ['none'], contractsRead: [],
       risks: [], proposedWork: [],
       premiseVerdicts: [{ id: 'p1', verdict: 'refuted', evidence: 'lib/memory layer.ts:41 writes on every run' }],
     })
@@ -227,7 +227,7 @@ describe('scouts verify premises against real code', () => {
 
     enqueue({ scouts: [{ id: 's1', area: 'memory layer', brief: 'look', engine: 'codex' }] })
     enqueue({
-      area: 'memory layer', findings: [], filesToTouch: [], contractsMutated: [], contractsRead: [],
+      area: 'memory layer', findings: [], filesToTouch: [], contractsMutated: ['none'], contractsRead: [],
       risks: [], proposedWork: [],
       premiseVerdicts: [{
         id: 'p1', verdict: 'corrected', evidence: 'lib/ has 22 collections, not 21',
@@ -239,7 +239,7 @@ describe('scouts verify premises against real code', () => {
 
     enqueue({ tasks: [{
       id: 't1', title: 'add a writer', spec: 'write rows',
-      dependsOn: [], footprint: ['lib/memory layer.ts'], contractsMutated: [], contractsRead: [],
+      dependsOn: [], footprint: ['lib/memory layer.ts'], contractsMutated: ['none'], contractsRead: [],
       gates: ['cheap'],
       acceptance: [{ id: 'c1', text: 'rows appear', proofKind: 'command', proofCommand: 'true', requiredTier: 'checked' }],
     }] })
@@ -259,7 +259,7 @@ describe('scouts verify premises against real code', () => {
     // Round one: a genuine stop. This is the check doing its job.
     enqueue({ scouts: [{ id: 's1', area: 'memory layer', brief: 'look', engine: 'codex' }] })
     enqueue({
-      area: 'memory layer', findings: [], filesToTouch: [], contractsMutated: [], contractsRead: [],
+      area: 'memory layer', findings: [], filesToTouch: [], contractsMutated: ['none'], contractsRead: [],
       risks: [], proposedWork: [],
       premiseVerdicts: [{ id: 'p1', verdict: 'refuted', evidence: 'lib/memory layer.ts:41 writes on every run' }],
     })
@@ -269,7 +269,7 @@ describe('scouts verify premises against real code', () => {
     // stop the same design again. Contested premises carry as corrections.
     enqueue({ scouts: [{ id: 's1', area: 'memory layer', brief: 'look again', engine: 'codex' }] })
     enqueue({
-      area: 'memory layer', findings: [], filesToTouch: [], contractsMutated: [], contractsRead: [],
+      area: 'memory layer', findings: [], filesToTouch: [], contractsMutated: ['none'], contractsRead: [],
       risks: [], proposedWork: [], premiseVerdicts: [],
     })
     expect(await runScouts({ store, config: config(), arcId: 'a1', log })).toBe(true)
@@ -293,7 +293,7 @@ describe('scouts verify premises against real code', () => {
 
     enqueue({ scouts: [{ id: 's1', area: 'memory layer', brief: 'look', engine: 'codex' }] })
     enqueue({
-      area: 'memory layer', findings: [], filesToTouch: [], contractsMutated: [], contractsRead: [],
+      area: 'memory layer', findings: [], filesToTouch: [], contractsMutated: ['none'], contractsRead: [],
       risks: [], proposedWork: [], premiseVerdicts: [],
     })
     await runScouts({ store, config: config(), arcId: 'a1', log })
@@ -327,7 +327,7 @@ describe('the planner', () => {
     enqueue({ scouts: [{ id: 's1', area: 'memory layer', brief: 'look', engine: 'codex' }] })
     enqueue({
       area: 'memory layer', findings: [], filesToTouch: ['lib/memory layer.ts'],
-      contractsMutated: [], contractsRead: [], risks: [], proposedWork: [],
+      contractsMutated: ['none'], contractsRead: [], risks: [], proposedWork: [],
       premiseVerdicts: [{ id: 'p1', verdict: 'confirmed', evidence: 'ok' }],
     })
     await runScouts({ store, config: config(), arcId: 'a1', log })
@@ -424,8 +424,8 @@ describe('deviation propagation', () => {
     const store = new Store(home)
     const plan: Plan = {
       arcId: 'steered', charter: { goal: 'g', objectives: [], nonGoals: [], constraints: [] },
-      tasks: [{ id: 'one', title: 'one', spec: 'work', dependsOn: [], footprint: [],
-        contractsMutated: [], contractsRead: [], gates: [], acceptance: [] }],
+      tasks: [{ id: 'one', title: 'one', spec: 'work', dependsOn: [], footprint: ['x.ts'],
+        contractsMutated: ['none'], contractsRead: [], gates: [], acceptance: [] }],
     }
     store.createArc(plan, repo, 'sha', 'arc/steered-integration')
     const thread = store.createThread({ repo, title: 'thread' })

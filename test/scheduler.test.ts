@@ -5,7 +5,10 @@ import type { Plan, PlanTask } from '../src/types.ts'
 function task(id: string, over: Partial<PlanTask> = {}): PlanTask {
   return {
     id, title: id, spec: 'do it',
-    dependsOn: [], footprint: [], contractsMutated: [], contractsRead: [], gates: [],
+    // A per-task footprint, because an EMPTY one now collides with everything:
+    // "the model did not say" is not "touches nothing", and the scheduler must
+    // not read it as "impose no constraint".
+    dependsOn: [], footprint: [`${id}.ts`], contractsMutated: ['none'], contractsRead: [], gates: [],
     acceptance: [{ id: 'c1', text: 'works', proofKind: 'command', proofCommand: 'true', requiredTier: 'checked' }],
     ...over,
   }
@@ -175,5 +178,28 @@ describe('validatePlan', () => {
 
   it('accepts a well-formed plan', () => {
     expect(validatePlan(plan(task('a'), task('b', { dependsOn: ['a'] })))).toEqual([])
+  })
+
+  it('refuses a task that declares neither what it touches nor what it changes', () => {
+    // `footprint: []` collapsed three meanings into one value the scheduler read
+    // as "no constraint": the model did not say, it touches no files, and it may
+    // touch anything. Contracts are worse — there is no measured counterpart to
+    // measuredFootprint anywhere, so an undeclared one is never caught at all.
+    const errors = validatePlan(plan(task('a', { footprint: [], contractsMutated: [] })))
+    expect(errors.join('\n')).toContain('declares no footprint')
+    expect(errors.join('\n')).toContain('declares no contractsMutated')
+    // And the fix is IN the message: the degenerate value becomes inexpressible
+    // rather than merely discouraged.
+    expect(errors.join('\n')).toContain('["."]')
+    expect(errors.join('\n')).toContain('["none"]')
+  })
+
+  it('serialises an undeclared footprint against everything, as a second line of defence', () => {
+    // A plan that reached the scheduler without validation must still fail
+    // closed. `[].find(...)` is undefined, so this used to be schedulable
+    // alongside anything at all.
+    const p = plan(task('vague', { footprint: [] }), task('specific', { footprint: ['b.ts'] }))
+    const f = computeFrontier({ plan: p, runtime: {}, now: NOW, agentConcurrency: 3 })
+    expect(f.ready.map((t) => t.id)).toEqual(['vague'])
   })
 })

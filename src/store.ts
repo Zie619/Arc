@@ -41,6 +41,7 @@ const MIGRATIONS: string[] = [
      state TEXT NOT NULL DEFAULT 'pending',
      lease_expires_at INTEGER,
      lease_owner TEXT,
+     worker_pgid INTEGER,
      base_sha TEXT,
      head_sha TEXT,
      branch TEXT,
@@ -343,6 +344,7 @@ export class Store {
     // and both keep renewing. Cheap now, expensive to retrofit once concurrency
     // exists — which is what an arc lease is for.
     this.ensureColumn('task', 'lease_owner', 'TEXT')
+    this.ensureColumn('task', 'worker_pgid', 'INTEGER')
     this.ensureColumn('arc', 'lease_owner', 'TEXT')
     this.ensureColumn('arc', 'lease_expires_at', 'INTEGER')
   }
@@ -877,6 +879,14 @@ export class Store {
     this.db
       .prepare(`UPDATE arc SET lease_owner = NULL, lease_expires_at = NULL WHERE id = ? AND lease_owner = ?`)
       .run(arcId, this.owner)
+  }
+
+  /** Record the provider process group currently working this task, so a
+   *  resume can find an orphan rather than racing one. */
+  setTaskWorker(arcId: string, taskId: string, pgid: number | null): void {
+    this.db
+      .prepare(`UPDATE task SET worker_pgid = ? WHERE arc_id = ? AND id = ?`)
+      .run(pgid, arcId, taskId)
   }
 
   renewLease(arcId: string, taskId: string, leaseMs: number): void {

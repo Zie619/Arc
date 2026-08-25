@@ -10,6 +10,7 @@ import { computeFrontier, validatePlan } from './scheduler.ts'
 import { runGate, selectGates, isSubsetOfBaseline, describe, testsVanished, matchesGlob, type GateResult } from './gates.ts'
 import { checkReviewFinding, type FindingOutcome } from './finding-check.ts'
 import { assembleDiff } from './diff.ts'
+import { dryRunProofs } from './dry-run.ts'
 
 /** Byte budgets for what a reviewer is shown. Deliberately named rather than
  *  inlined: they used to be three unrelated magic numbers, and the implement
@@ -175,6 +176,16 @@ export async function runArc(o: RunOptions): Promise<void> {
         G.releaseTaskWorkspace(repo, store.root, workspaceId(arcId, String(t.id)))
         continue
       }
+      // "No live worker" was an assumption. A SIGKILL to arc runs none of its
+      // handlers, so the provider CLI and everything it spawned survive,
+      // reparented to init — and then a resume works in a tree an orphan is
+      // still writing to. Ask the OS before believing the row.
+      const pgid = Number(t.worker_pgid ?? 0)
+      if (pgid > 0 && killGroupIfAlive(pgid)) {
+        log(`resume: ${t.id} left an ORPHANED provider (pgid ${pgid}) still running — killed it before reclaiming`)
+        store.appendEvent(arcId, 'task.orphan.killed', { pgid }, String(t.id))
+      }
+      store.setTaskWorker(arcId, String(t.id), null)
       log(`resume: ${t.id} was "${t.state}" with no live worker — requeueing, keeping its branch`)
       store.setTaskState(arcId, String(t.id), 'pending')
       requeued++
@@ -239,6 +250,29 @@ export async function runArc(o: RunOptions): Promise<void> {
   }, Math.floor(ARC_LEASE_MS / 3))
   // unref so a held interval can never keep the process alive past the run.
   arcLease.unref?.()
+
+  // Every proof command executed at the base commit BEFORE anything is
+  // dispatched. A vacuous proof — one that already passes — would otherwise
+  // grant `checked` and put a green tick beside a criterion nothing
+  // established, which is the one thing this system exists not to do.
+  if (!o.resume && config.dryRunProofs) {
+    const dry = await dryRunProofs(plan, config, store.root, baseSha, o.signal, log)
+    if (!dry.ran) {
+      log(`! proof dry-run could not run (${dry.reason}) — criteria are unproven-at-base, not proven-discriminating`)
+      store.addFinding({ arcId, kind: 'risk', severity: 'medium',
+        text: `proof dry-run did not run: ${dry.reason}` })
+    }
+    for (const f of dry.findings) {
+      log(`  ✗ ${f.taskId}/${f.criterionId}: ${f.message}`)
+      store.addFinding({ arcId, taskId: f.taskId, kind: 'risk', severity: 'high',
+        text: `${f.criterionId} (${f.polarity}) — ${f.message}` })
+    }
+    if (dry.findings.length > 0) {
+      store.closeArc(arcId, 'incomplete')
+      log(`INCOMPLETE — ${dry.findings.length} criterion/criteria cannot distinguish done from not-done. Nothing was dispatched.`)
+      return
+    }
+  }
 
   const heavy = new Semaphore(config.heavyGateLimit)
   // Agents and their local gates may run in parallel; rebasing/advancing the
@@ -645,6 +679,21 @@ async function runTask(
       return
     }
 
+    // Footprint drift was recorded as a `medium` finding and the task landed
+    // anyway — a declaration the scheduler trusted for its collision analysis,
+    // then found to be false, and then ignored. Re-check the MEASURED footprint
+    // against what is still in flight before landing, and serialise on a real
+    // collision instead of merging into it.
+    const drifted = driftedIntoInflight(o, task)
+    if (drifted.length > 0) {
+      log(`  ✗ ${task.id}: touched ${drifted.join(', ')} — files an in-flight task declared. Not landing into a collision.`)
+      store.addFinding({ arcId, taskId: task.id, kind: 'risk', severity: 'high',
+        text: `undeclared footprint collides with an in-flight task: ${drifted.join(', ')}`,
+        affects: drifted })
+      store.setTaskState(arcId, task.id, 'failed')
+      return
+    }
+
     store.setTaskState(arcId, task.id, 'landing', LEASE_MS)
     const landed = await landing.run(() => landTask(o, task, wt, integrationBranch, baselines, heavy))
     store.setTaskState(arcId, task.id, landed ? 'landed' : 'failed')
@@ -754,7 +803,16 @@ async function dispatchStep(o: RunOptions, step: DispatchStepOptions): Promise<D
       baseSha: step.baseSha, briefArtifactId: step.briefArtifactId,
       effort: step.role.effort, phase: step.phase,
     })
-    const result = await dispatch({ role: step.role, ...step.dispatch })
+    const result = await dispatch({
+      role: step.role,
+      ...step.dispatch,
+      onSpawn: step.taskId ? (pgid) => {
+        try { store.setTaskWorker(plan.arcId, step.taskId!, pgid) } catch { /* best effort */ }
+      } : undefined,
+    })
+    if (step.taskId) {
+      try { store.setTaskWorker(plan.arcId, step.taskId, null) } catch { /* best effort */ }
+    }
     const model = modelStatus(o, step.role, result, attemptId, step.taskId)
     store.finishAttempt(plan.arcId, attemptId, {
       terminalReason: model === 'drift' ? 'model-drift' : result.terminalReason,
@@ -1157,6 +1215,44 @@ function failureExcerpt(output: string, head = 500, tail = 3_500): string {
  * would hit, long before any UI work becomes the bottleneck, and it costs a
  * line now against a migration later.
  */
+/**
+ * Kill a process group if it still exists. Returns whether it did.
+ *
+ * `killTree` only ever ran from arc's own signal handlers, and a SIGKILL
+ * executes none of them, so the orphan outlives the process that spawned it.
+ */
+function killGroupIfAlive(pgid: number): boolean {
+  try {
+    process.kill(-pgid, 0)
+  } catch {
+    return false
+  }
+  try { process.kill(-pgid, 'SIGKILL') } catch { /* it exited between the probe and the kill */ }
+  return true
+}
+
+/**
+ * Files this task actually touched that another IN-FLIGHT task declared.
+ *
+ * The scheduler let these two run together on the strength of declarations that
+ * turned out to be wrong. Measuring afterwards is the only correction available,
+ * and it is worth nothing if the answer is a note.
+ */
+function driftedIntoInflight(o: RunOptions, task: PlanTask): string[] {
+  const measured = JSON.parse(
+    String(o.store.allTasks(o.plan.arcId).find((t) => t.id === task.id)?.footprint_measured ?? '[]'),
+  ) as string[]
+  const undeclared = measured.filter((f) => !task.footprint.some((d) => f === d || f.startsWith(`${d}/`) || f === d))
+  if (undeclared.length === 0) return []
+  const inflight = o.store.allTasks(o.plan.arcId)
+    .filter((t) => t.id !== task.id && ['running', 'reviewing', 'landing'].includes(String(t.state)))
+    .map((t) => String(t.id))
+  const claimed = new Set(
+    o.plan.tasks.filter((t) => inflight.includes(t.id)).flatMap((t) => t.footprint),
+  )
+  return undeclared.filter((f) => [...claimed].some((c) => f === c || f.startsWith(`${c}/`) || c.startsWith(`${f}/`)))
+}
+
 function workspaceId(arcId: string, taskId: string): string {
   return `${arcId}--${taskId}`
 }

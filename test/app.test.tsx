@@ -177,8 +177,8 @@ describe('inline terminal history', () => {
         plan: {
           arcId: 'ui-history', charter: { goal: 'keep history', objectives: [], nonGoals: [] },
           tasks: [{
-            id: 'scrollback', title: 'Use the normal terminal buffer', spec: 's', dependsOn: [], footprint: [],
-            contractsMutated: [], contractsRead: [], gates: [],
+            id: 'scrollback', title: 'Use the normal terminal buffer', spec: 's', dependsOn: [], footprint: ['x.ts'],
+            contractsMutated: ['none'], contractsRead: [], gates: [],
             acceptance: [{ id: 'a', text: 'history survives', proofKind: 'human-observation', requiredTier: 'observed' }],
           }],
         },
@@ -282,8 +282,8 @@ describe('interview recommendation default', () => {
     const plan = {
       arcId: 'approval', charter: { goal: 'g', objectives: [], nonGoals: [] },
       tasks: [{
-        id: 'one', title: 'Build the thing', spec: 's', dependsOn: [], footprint: [],
-        contractsMutated: [], contractsRead: [], gates: [],
+        id: 'one', title: 'Build the thing', spec: 's', dependsOn: [], footprint: ['x.ts'],
+        contractsMutated: ['none'], contractsRead: [], gates: [],
         acceptance: [{ id: 'a', text: 'works', proofKind: 'command' as const, proofCommand: 'true', requiredTier: 'checked' as const }],
       }],
     }
@@ -552,7 +552,7 @@ describe('local controls', () => {
     const plan = {
       arcId: 'delivery', charter: { goal: 'g', objectives: [], nonGoals: [] },
       tasks: [{
-        id: 'one', title: 'one', spec: 's', dependsOn: [], footprint: [], contractsMutated: [],
+        id: 'one', title: 'one', spec: 's', dependsOn: [], footprint: ['x.ts'], contractsMutated: [],
         contractsRead: [], gates: [], acceptance: [{
           id: 'a', text: 'works', proofKind: 'command' as const, proofCommand: 'true', requiredTier: 'checked' as const,
         }],
@@ -580,8 +580,8 @@ describe('local controls', () => {
     const usagePlan = {
       arcId: 'usage-arc', charter: { goal: 'show usage', objectives: [], nonGoals: [] },
       tasks: [{
-        id: 'one', title: 'one', spec: 'one', dependsOn: [], footprint: [],
-        contractsMutated: [], contractsRead: [], gates: [], acceptance: [],
+        id: 'one', title: 'one', spec: 'one', dependsOn: [], footprint: ['x.ts'],
+        contractsMutated: ['none'], contractsRead: [], gates: [], acceptance: [],
       }],
     }
     store.createArc(usagePlan, repo, 'base', 'arc/usage-arc-integration')
@@ -688,12 +688,12 @@ describe('plan-only execution boundary', () => {
     enqueue(2, { scouts: [{ id: 's1', area: 'UI', brief: 'inspect the UI', engine: 'codex' }] })
     enqueue(3, {
       area: 'UI', findings: [{ file: 'src/app.tsx', line: 1, what: 'UI entrypoint', why: 'the plan concerns UI' }],
-      filesToTouch: ['src/app.tsx'], contractsMutated: [], contractsRead: [], risks: [], premiseVerdicts: [],
+      filesToTouch: ['src/app.tsx'], contractsMutated: ['none'], contractsRead: [], risks: [], premiseVerdicts: [],
       proposedWork: [{ title: 'Adjust UI', rationale: 'meet the goal' }],
     })
     enqueue(4, { tasks: [{
       id: 'adjust-ui', title: 'Adjust the UI safely', spec: 'Make the planned UI adjustment.',
-      dependsOn: [], footprint: ['src/app.tsx'], contractsMutated: [], contractsRead: [], gates: ['test'],
+      dependsOn: [], footprint: ['src/app.tsx'], contractsMutated: ['none'], contractsRead: [], gates: ['test'],
       acceptance: [{ id: 'test', text: 'tests pass', proofKind: 'command', proofCommand: 'pnpm test', requiredTier: 'checked' }],
     }] })
 
@@ -970,7 +970,7 @@ describe('trust modes and lane locks gate the direct lane', () => {
       {
         area: 'importer',
         findings: [{ file: 'src/importer.ts', line: 4, what: 'rows are stored but never read', why: 'learning loop is open' }],
-        filesToTouch: [], contractsMutated: [], contractsRead: [], risks: [], premiseVerdicts: [], proposedWork: [],
+        filesToTouch: [], contractsMutated: ['none'], contractsRead: [], risks: [], premiseVerdicts: [], proposedWork: [],
       },
       {
         answer: 'Reviews are captured but nothing consumes them, so no learning happens.',
@@ -1004,7 +1004,7 @@ describe('trust modes and lane locks gate the direct lane', () => {
       { goal: 'Understand importer behavior', objectives: ['map the signals'], nonGoals: [], constraints: [] },
       { scouts: [{ id: 's1', area: 'importer', brief: 'inspect review writes', engine: 'codex' }] },
       {
-        area: 'importer', findings: [], filesToTouch: [], contractsMutated: [], contractsRead: [], risks: [], proposedWork: [],
+        area: 'importer', findings: [], filesToTouch: [], contractsMutated: ['none'], contractsRead: [], risks: [], proposedWork: [],
         premiseVerdicts: [{ id: 'p-storage', verdict: 'refuted', evidence: 'src/importer.ts:41 stores every review' }],
       },
       {
@@ -1014,7 +1014,7 @@ describe('trust modes and lane locks gate the direct lane', () => {
       { goal: 'Understand how stored reviews are used', objectives: ['map consumers'], nonGoals: [], constraints: [] },
       { scouts: [{ id: 's2', area: 'consumers', brief: 'inspect review consumers', engine: 'codex' }] },
       {
-        area: 'consumers', findings: [], filesToTouch: [], contractsMutated: [], contractsRead: [], risks: [],
+        area: 'consumers', findings: [], filesToTouch: [], contractsMutated: ['none'], contractsRead: [], risks: [],
         premiseVerdicts: [], proposedWork: [],
       },
       { answer: 'Stored reviews have no consumers.', keyFindings: [], contradictions: [], missingFromPrompt: '' },
@@ -1050,7 +1050,7 @@ describe('trust modes and lane locks gate the direct lane', () => {
       { goal: 'Understand importer behavior', objectives: ['map the signals'], nonGoals: [], constraints: [] },
       { scouts: [{ id: 's1', area: 'writes', brief: 'inspect writes', engine: 'codex' }] },
       {
-        area: 'writes', findings: [], filesToTouch: [], contractsMutated: [], contractsRead: [], risks: [], proposedWork: [],
+        area: 'writes', findings: [], filesToTouch: [], contractsMutated: ['none'], contractsRead: [], risks: [], proposedWork: [],
         premiseVerdicts: [{ id: 'p-one', verdict: 'refuted', evidence: 'src/importer.ts:41 stores reviews' }],
       },
       {
@@ -1060,7 +1060,7 @@ describe('trust modes and lane locks gate the direct lane', () => {
       { goal: 'Understand importer behavior', objectives: ['map the signals'], nonGoals: [], constraints: [] },
       { scouts: [{ id: 's2', area: 'reads', brief: 'inspect reads', engine: 'codex' }] },
       {
-        area: 'reads', findings: [], filesToTouch: [], contractsMutated: [], contractsRead: [], risks: [], proposedWork: [],
+        area: 'reads', findings: [], filesToTouch: [], contractsMutated: ['none'], contractsRead: [], risks: [], proposedWork: [],
         premiseVerdicts: [{ id: 'p-two', verdict: 'refuted', evidence: 'src/importer.ts:72 reads reviews' }],
       },
       {

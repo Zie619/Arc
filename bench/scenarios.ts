@@ -37,8 +37,14 @@ function plan(arcId: string, tasks: Array<Record<string, unknown>>): Plan {
     charter: { goal: 'bench the harness', objectives: ['hold the invariants'], nonGoals: [] },
     tasks: tasks.map((over) => ({
       id: 'only', title: 'do the thing', spec: 'do the thing', dependsOn: [],
-      footprint: [], contractsMutated: [], contractsRead: [], gates: [],
+      // The fake writer creates `<worktree>-generated.ts`, and the worktree is
+      // named `<arcId>--<taskId>`. Declaring it keeps the parallel scenarios
+      // genuinely parallel; `['.']` would serialise them.
+      footprint: [`${arcId}--${String(over.id ?? 'only')}-generated.ts`],
+      contractsMutated: ['none'], contractsRead: [], gates: [],
       acceptance: [{ id: 'c1', text: 'it happened', proofKind: 'agent-review', requiredTier: 'claimed' }],
+      // (agent-review criteria carry no command, so the dry-run has nothing to
+      // execute for them — the scenarios that DO carry one override this.)
       ...over,
     })),
   } as unknown as Plan
@@ -176,6 +182,38 @@ export const SCENARIOS: Scenario[] = [
     expect: { arcStatus: 'done', landed: 1, logContains: ['risk phase OFF'] },
   },
 
+  {
+    id: 'adv-vacuous-proof',
+    defends: 'ATTACK: a proof that already passes at base proves nothing',
+    plan: plan('bench-vacuous', [{
+      id: 'alpha',
+      acceptance: [{
+        id: 'c1', text: 'the file exists', proofKind: 'command',
+        // Passes before the work exists. Static analysis cannot see this;
+        // execution at the base commit sees it completely. Without the dry-run
+        // it would grant `checked` and put a green tick beside nothing.
+        proofCommand: 'test -f README.md', polarity: 'discriminating', requiredTier: 'checked',
+      }],
+    }]),
+    env: { ARC_FAKE_WRITE: 'auto', ARC_FAKE_PAYLOAD: DONE_PAYLOAD },
+    expect: {
+      arcStatus: 'incomplete', landed: 0,
+      logContains: ['already PASSES at the base commit', 'Nothing was dispatched'],
+    },
+  },
+  {
+    id: 'adv-unportable-proof',
+    defends: 'a proof whose shell is wrong on BSD is refused before it is trusted',
+    plan: plan('bench-unportable', [{
+      id: 'alpha',
+      acceptance: [{
+        id: 'c1', text: 'no TODOs remain', proofKind: 'command',
+        proofCommand: 'rg TODO src/ | wc -l | grep -qx 0', requiredTier: 'checked',
+      }],
+    }]),
+    env: { ARC_FAKE_WRITE: 'auto', ARC_FAKE_PAYLOAD: DONE_PAYLOAD },
+    expect: { arcStatus: 'incomplete', landed: 0, logContains: ['wc-l-string-compare'] },
+  },
   {
     id: 'adv-unknown-gate',
     defends: 'a plan that does not fit the config is refused BEFORE anything is billed',

@@ -19,8 +19,12 @@ function git(...args: string[]): string {
 function task(id: string): Record<string, unknown> {
   return {
     id, title: id, spec: 'create the requested file',
-    dependsOn: [], footprint: [], contractsMutated: [], contractsRead: [], gates: ['green'],
-    acceptance: [{ id: 'c1', text: 'the task ran', proofKind: 'command', proofCommand: 'true', requiredTier: 'checked' }],
+    dependsOn: [], footprint: [`unattended--${id}-generated.ts`], contractsMutated: ['none'], contractsRead: [], gates: ['green'],
+    // Discriminating: fails at base, passes once the file exists.
+    acceptance: [{
+      id: 'c1', text: 'the task ran', proofKind: 'command',
+      proofCommand: `test -f unattended--${id}-generated.ts`, requiredTier: 'checked',
+    }],
   }
 }
 

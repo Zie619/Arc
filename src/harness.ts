@@ -27,6 +27,11 @@ export interface DispatchOptions {
   schema?: z.ZodType
   /** Called on every parsed event — this is what feeds liveness. */
   onEvent?: (event: { kind: string; at: number; payload: unknown }) => void
+  /** The provider's process-GROUP id, reported as soon as it is spawned.
+   *  A SIGKILL to arc runs none of arc's own handlers, so the provider and
+   *  everything it spawned survive, reparented to init. Recording the group is
+   *  what lets a later resume find the orphan instead of racing it. */
+  onSpawn?: (pgid: number) => void
   /** Abort from the UI (escape). Kills the whole process tree, not just the
    *  direct child — an agent that spawned a build would otherwise keep going
    *  after you told it to stop. */
@@ -285,6 +290,10 @@ export async function dispatch(o: DispatchOptions): Promise<DispatchResult> {
     env: buildProviderChildEnv(cli, process.env, { ...allowedProjectEnv, ARC_RUN: '1' }),
     detached: true,
   })
+
+  // detached: true means the child IS its own group leader, so its pid is the
+  // group id.
+  if (child.pid !== undefined) o.onSpawn?.(child.pid)
 
   const killTree = (): void => {
     if (child.pid === undefined) return

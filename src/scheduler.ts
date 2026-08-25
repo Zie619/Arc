@@ -1,3 +1,4 @@
+import { lintShell } from './shell-lint.ts'
 import type { Plan, PlanTask } from './types.ts'
 import { posix } from 'node:path'
 
@@ -65,8 +66,31 @@ function pathsOverlap(a: string, b: string): boolean {
   return left === right || left.startsWith(`${right}/`) || right.startsWith(`${left}/`)
 }
 
+/**
+ * An EMPTY footprint means "not declared", which is not the same as "touches
+ * nothing" — and the scheduler must not read it as "impose no constraint".
+ *
+ * `[].find(...)` is undefined, so a task declaring nothing never collided with
+ * anything and was always schedulable alongside everything. The tell was ten
+ * lines up: `pathsOverlap` treats an empty STRING conservatively (`'.'` collides
+ * with everything) while the empty ARRAY took the opposite branch. One
+ * fail-closed, one fail-open, side by side.
+ *
+ * validatePlan rejects an empty footprint outright; this is the second line of
+ * defence for a plan that reached the scheduler another way.
+ */
+/** An UNDECLARED footprint is "unknown", not "nothing" — so it means the whole
+ *  tree. `pathsOverlap` already treats `'.'` as colliding with everything; the
+ *  empty ARRAY simply never reached it. */
+const declared = (footprint: string[]): string[] => footprint.length > 0 ? footprint : ['.']
+
+/** `["none"]` is how a task SAYS it mutates no shared contract, as opposed to
+ *  saying nothing. It is a sentinel, never a contract name. */
+export const NO_CONTRACT = 'none'
+const contracts = (names: string[]): string[] => names.filter((n) => n !== NO_CONTRACT)
+
 function footprintCollision(paths: string[], claimed: string[]): string | undefined {
-  return paths.find((path) => claimed.some((other) => pathsOverlap(path, other)))
+  return declared(paths).find((path) => claimed.some((other) => pathsOverlap(path, other)))
 }
 
 /**
@@ -104,11 +128,11 @@ export function computeFrontier(input: SchedulerInput): Frontier {
   const occupiedMutations = new Set<string>()
   const occupiedReads = new Set<string>()
   for (const t of occupied) {
-    for (const c of t.contractsMutated) occupiedMutations.add(c)
-    for (const c of t.contractsRead) occupiedReads.add(c)
+    for (const c of contracts(t.contractsMutated)) occupiedMutations.add(c)
+    for (const c of contracts(t.contractsRead)) occupiedReads.add(c)
   }
 
-  const occupiedPaths = occupied.flatMap((t) => t.footprint)
+  const occupiedPaths = occupied.flatMap((t) => declared(t.footprint))
 
   const slots = Math.max(0, agentConcurrency - occupied.length)
 
@@ -132,13 +156,13 @@ export function computeFrontier(input: SchedulerInput): Frontier {
 
     // A contract may have exactly one mutator in flight. Readers wait too:
     // reading a signature that is being changed under you is the bug.
-    const touched = [...task.contractsMutated, ...task.contractsRead]
+    const touched = [...contracts(task.contractsMutated), ...contracts(task.contractsRead)]
     const contended = touched.find((c) => occupiedMutations.has(c))
     if (contended) {
       blocked.push({ id: task.id, reason: `contract "${contended}" has a mutator in flight` })
       continue
     }
-    const readerContended = task.contractsMutated.find((c) => occupiedReads.has(c))
+    const readerContended = contracts(task.contractsMutated).find((c) => occupiedReads.has(c))
     if (readerContended) {
       blocked.push({ id: task.id, reason: `contract "${readerContended}" has a reader in flight` })
       continue
@@ -165,11 +189,11 @@ export function computeFrontier(input: SchedulerInput): Frontier {
     // Readers may share a contract. A writer conflicts with both readers and
     // writers, regardless of which one appeared first in the plan.
     if (task.contractsRead.some((c) => claimedMutations.has(c))) continue
-    if (task.contractsMutated.some((c) => claimedMutations.has(c) || claimedReads.has(c))) continue
+    if (contracts(task.contractsMutated).some((c) => claimedMutations.has(c) || claimedReads.has(c))) continue
     if (footprintCollision(task.footprint, claimedPaths)) continue
-    for (const c of task.contractsMutated) claimedMutations.add(c)
-    for (const c of task.contractsRead) claimedReads.add(c)
-    claimedPaths.push(...task.footprint)
+    for (const c of contracts(task.contractsMutated)) claimedMutations.add(c)
+    for (const c of contracts(task.contractsRead)) claimedReads.add(c)
+    claimedPaths.push(...declared(task.footprint))
     admitted.push(task)
   }
 
@@ -221,6 +245,21 @@ export function validatePlan(plan: Plan, config?: { gates: Array<{ name: string 
   for (const t of plan.tasks) {
     if (ids.has(t.id)) errors.push(`duplicate task id "${t.id}"`)
     ids.add(t.id)
+    // `footprint: []` collapsed three meanings into one value the scheduler read
+    // as "no constraint": the model did not say, it touches no files, and it may
+    // touch anything. Make the degenerate value inexpressible: a task that may
+    // touch anything says so.
+    if (t.footprint.length === 0) {
+      errors.push(`task "${t.id}" declares no footprint — say which paths it touches, or ["."] if it may touch anything (which serialises it against every other task)`)
+    }
+    // Contracts are 100% honour system: there is no measured counterpart to
+    // measuredFootprint anywhere. Two tasks that both forget to declare
+    // `contractsMutated` run concurrently and land contradictory signatures,
+    // and contract serialisation is the one mechanism nothing else in the field
+    // has. Silence must not be spelled the same way as "nothing".
+    if (t.contractsMutated.length === 0) {
+      errors.push(`task "${t.id}" declares no contractsMutated — name the exported signatures it changes, or ["none"]`)
+    }
     if (gateNames) {
       for (const g of t.gates) {
         if (!gateNames.has(g)) {
@@ -235,6 +274,12 @@ export function validatePlan(plan: Plan, config?: { gates: Array<{ name: string 
       if (c.proofKind === 'command' && !c.proofCommand) {
         errors.push(`task "${t.id}": criterion "${c.id}" is proofKind=command with no proofCommand`)
       }
+      // Model-authored shell, linted before anything runs it. These feed the
+      // planner's existing repair loop, so each rule is a self-repairing
+      // constraint at no extra control-flow cost.
+      for (const issue of c.proofCommand ? lintShell(c.proofCommand) : []) {
+        errors.push(`task "${t.id}": criterion "${c.id}" proofCommand [${issue.rule}] — ${issue.message}`)
+      }
     }
   }
 
@@ -246,6 +291,42 @@ export function validatePlan(plan: Plan, config?: { gates: Array<{ name: string 
 
   const cycle = findCycle(plan)
   if (cycle) errors.push(`dependency cycle: ${cycle.join(' → ')}`)
+
+  // Traceability between what the operator approved and what got planned. Arc
+  // had none: an objective could be dropped silently and a task could exist for
+  // no stated reason. Only enforced once ANY task declares coverage, so plans
+  // written before this still validate.
+  const objectives = plan.charter.objectives ?? []
+  if (objectives.length > 0 && plan.tasks.some((t) => (t.covers ?? []).length > 0)) {
+    const covered = new Set(plan.tasks.flatMap((t) => t.covers ?? []))
+    for (const objective of objectives) {
+      if (!covered.has(objective)) {
+        errors.push(`no task covers the objective "${objective}" — the goal cannot shrink silently`)
+      }
+    }
+    for (const t of plan.tasks) {
+      if ((t.covers ?? []).length === 0) {
+        errors.push(`task "${t.id}" covers no charter objective — say which one it advances, or drop it`)
+      }
+      for (const c of t.covers ?? []) {
+        if (!objectives.includes(c)) {
+          errors.push(`task "${t.id}" claims to cover "${c}", which is not one of the charter's objectives`)
+        }
+      }
+    }
+  }
+
+  // Ambiguity words: a criterion nobody can fail is a criterion nobody can pass.
+  const VAGUE = /\b(properly|correctly|robust|robustly|clean(?:ly)?|as needed|appropriate(?:ly)?|reasonable|sensible)\b/i
+  for (const t of plan.tasks) {
+    for (const c of t.acceptance) {
+      const vague = c.text.match(VAGUE)
+      if (vague) {
+        errors.push(`task "${t.id}": criterion "${c.id}" says "${vague[0]}" — name the observable behaviour instead, `
+          + 'or nobody can tell whether it held')
+      }
+    }
+  }
 
   return errors
 }
