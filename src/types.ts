@@ -170,6 +170,19 @@ export const ProjectConfig = z.object({
    */
   sandboxPolicy: z.enum(['caveat', 'refuse']).default('caveat'),
   /**
+   * The pre-diff risk phase: the reviewer predicts what will go wrong from the
+   * spec and the base tree, BEFORE it is shown the diff. Precommitment is the
+   * standard defence against a reviewer rationalising whatever was written.
+   *
+   * It is also a full extra dispatch per review, and — being honest — its
+   * benefit has never been measured. This switch exists so it can be: run the
+   * arm, compare findings that survive execution per dollar. Default on,
+   * because the reasoning is sound; a switch, because sound reasoning is
+   * exactly what Arc refuses to accept from a model and should not accept from
+   * its author either.
+   */
+  reviewRiskPhase: z.boolean().default(true),
+  /**
    * The surface a task may not quietly move, because it is what PROVES the
    * task. A writer that deletes an inconvenient test makes every gate strictly
    * greener, and the baseline comparison is structurally blind to it — a

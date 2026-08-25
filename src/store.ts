@@ -913,6 +913,66 @@ export class Store {
     return r.n
   }
 
+  /**
+   * Everything needed to compare two runs of the same plan. Pure SQL over rows
+   * that already existed — "this run cost three times the last one" was simply
+   * a question nobody had written down.
+   */
+  arcMetrics(arcId: string): Record<string, any> {
+    const tasks = this.allTasks(arcId)
+    const criteria = this.allCriteria(arcId)
+    const totals = this.db.prepare(
+      `SELECT COUNT(*) attempts,
+              SUM(COALESCE(a.ended_at, ?) - a.started_at) wall_ms
+       FROM attempt a WHERE a.arc_id = ?`,
+    ).get(Date.now(), arcId) as { attempts: number; wall_ms: number }
+    const byTier: Record<string, number> = {}
+    for (const c of criteria) byTier[String(c.tier)] = (byTier[String(c.tier)] ?? 0) + 1
+    return {
+      arcId,
+      status: this.getArc(arcId)?.status ?? 'missing',
+      tasks: tasks.length,
+      landed: tasks.filter((t) => t.state === 'landed').length,
+      failed: tasks.filter((t) => t.state === 'failed').length,
+      attempts: Number(totals?.attempts ?? 0),
+      wallMs: Number(totals?.wall_ms ?? 0),
+      findings: this.findingsFor(arcId).length,
+      byTier,
+      roles: this.costSummary(arcId),
+    }
+  }
+
+  /**
+   * Gates that both passed and failed on the SAME base sha.
+   *
+   * Arc can PROVE flakiness where most CI vendors can only infer it, because
+   * gate_run stores the base sha alongside the verdict: same commit, same
+   * command, two different answers is not an inference, it is a contradiction.
+   *
+   * Never let this SUPPRESS a failure — a genuinely broken gate looks flaky for
+   * a while. It is here to be surfaced, not to be swallowed.
+   */
+  flakyGates(minRuns = 3): Array<Record<string, any>> {
+    return this.db.prepare(
+      `SELECT name, base_sha,
+              COUNT(*) runs,
+              SUM(CASE WHEN verdict = 'pass' THEN 1 ELSE 0 END) passes,
+              SUM(CASE WHEN verdict = 'fail' THEN 1 ELSE 0 END) fails
+       FROM gate_run
+       WHERE verdict IN ('pass', 'fail')
+       GROUP BY name, base_sha
+       HAVING runs >= ? AND passes > 0 AND fails > 0
+       ORDER BY fails * (CAST(fails AS REAL) / runs) DESC`,
+    ).all(minRuns) as any
+  }
+
+  /** Every attempt in the arc, whatever task or role. The bench counts these. */
+  allAttempts(arcId: string): Array<Record<string, any>> {
+    return this.db
+      .prepare(`SELECT * FROM attempt WHERE arc_id = ? ORDER BY started_at`)
+      .all(arcId) as any
+  }
+
   attemptsFor(arcId: string, taskId: string): Array<Record<string, any>> {
     return this.db
       .prepare(`SELECT * FROM attempt WHERE arc_id = ? AND task_id = ? ORDER BY started_at`)

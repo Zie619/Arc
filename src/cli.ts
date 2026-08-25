@@ -279,6 +279,9 @@ ${C.bold('Plumbing — arc "..." already runs all of these for you:')}
   arc setup-terminal                make shift+enter work in your editor
   arc keys                          show what your terminal sends for each key
   arc doctor                        inspect installed provider capabilities (no model call)
+  arc bench                         run Arc against itself — invariants, no tokens spent
+  arc diff <arcA> <arcB>            compare two runs: attempts, tokens, tiers, wall clock
+  arc flaky                         gates that gave different answers on the same commit
 
 Options:
   --danger        no approval stops: take every recommendation, run the plan
@@ -292,7 +295,7 @@ const SUBCOMMANDS = new Set([
   'interview', 'scout', 'plan', 'validate', 'run', 'resume', 'clean', 'status',
   'ui', 'watch', 'criteria', 'findings', 'show', 'init', 'go', 'cost',
   'setup-terminal', 'keys',
-  'doctor',
+  'doctor', 'bench', 'diff', 'flaky',
 ])
 
 async function main(): Promise<void> {
@@ -399,6 +402,23 @@ async function main(): Promise<void> {
       for (const diagnostic of provider.diagnostics) console.log(C.yellow(`  ! ${diagnostic}`))
     }
     if (!report.ready) process.exitCode = 2
+    return
+  }
+
+  if (cmd === 'bench') {
+    // Arc grading Arc, against the fake provider CLIs. Zero tokens, seconds to
+    // run, so it can gate every commit — which is the only property that makes
+    // a regression suite get used.
+    const { SCENARIOS } = await import('../bench/scenarios.ts')
+    const { runBench, formatBench } = await import('./bench.ts')
+    const only = flag(argv, '--only')
+    const chosen = only ? SCENARIOS.filter((s) => s.id.includes(only)) : SCENARIOS
+    if (chosen.length === 0) die(`no bench scenario matches "${only}"`)
+    console.log(C.bold(`arc bench — ${chosen.length} scenario(s), no tokens spent`))
+    const results = await runBench(chosen)
+    for (const line of formatBench(results)) console.log(line)
+    // Non-zero when an invariant slipped: this is a gate, not a report.
+    if (results.some((r) => !r.passed)) process.exitCode = 2
     return
   }
 
@@ -612,6 +632,68 @@ async function main(): Promise<void> {
         }
         break
       }
+      case 'diff': {
+        // Two runs of the same plan, side by side. Everything here was already
+        // persisted; "this run cost three times the last one" was simply a
+        // question nobody had written down.
+        const [a, b] = positional
+        if (!a || !b) die('usage: arc diff <arcA> <arcB>')
+        const left = store.arcMetrics(a)
+        const right = store.arcMetrics(b)
+        if (left.status === 'missing') die(`no arc "${a}"`)
+        if (right.status === 'missing') die(`no arc "${b}"`)
+
+        const delta = (l: number, r: number): string => {
+          const d = r - l
+          if (d === 0) return C.dim('  ·')
+          return d > 0 ? C.yellow(`  +${d}`) : C.green(`  ${d}`)
+        }
+        const row = (label: string, l: unknown, r: unknown, numeric = true): void => {
+          console.log(`  ${label.padEnd(14)} ${String(l).padStart(10)}  ${String(r).padStart(10)}`
+            + (numeric ? delta(Number(l), Number(r)) : ''))
+        }
+
+        console.log(C.bold(`\n  ${''.padEnd(14)} ${a.padStart(10)}  ${b.padStart(10)}`))
+        row('status', left.status, right.status, false)
+        row('tasks', left.tasks, right.tasks)
+        row('landed', left.landed, right.landed)
+        row('failed', left.failed, right.failed)
+        row('attempts', left.attempts, right.attempts)
+        row('findings', left.findings, right.findings)
+        row('wall (min)', Math.round(left.wallMs / 60_000), Math.round(right.wallMs / 60_000))
+        for (const tier of ['observed', 'checked', 'claimed', 'unproven']) {
+          row(tier, left.byTier[tier] ?? 0, right.byTier[tier] ?? 0)
+        }
+        console.log('')
+        for (const side of [{ id: a, metrics: left }, { id: b, metrics: right }]) {
+          console.log(C.dim(`  ${side.id}`))
+          for (const line of formatCostSummary(side.metrics.roles).lines) console.log(line)
+        }
+        break
+      }
+
+      case 'flaky': {
+        // Same gate, same base sha, two different answers. That is not an
+        // inference — it is a contradiction, and gate_run has always had both
+        // halves of it. Most CI vendors can only guess at this.
+        const rows = store.flakyGates()
+        if (rows.length === 0) {
+          console.log('no gate has contradicted itself on the same commit yet.')
+          console.log(C.dim('  (needs 3+ runs of one gate on one base sha, with both outcomes)'))
+          break
+        }
+        console.log(C.bold(`${rows.length} gate(s) gave different answers on the same commit:`))
+        console.log('')
+        for (const r of rows) {
+          const rate = Math.round((Number(r.fails) / Number(r.runs)) * 100)
+          console.log(`  ${String(r.name).padEnd(20)} ${String(r.base_sha).slice(0, 8)}  `
+            + `${r.passes} pass / ${r.fails} fail of ${r.runs}  (${rate}% red)`)
+        }
+        console.log(C.dim(''))
+        console.log(C.dim('  A genuinely broken gate looks flaky for a while. This surfaces them; it never suppresses one.'))
+        break
+      }
+
       case 'cost': {
         const arcId = positional[0] ?? store.latestArcId()
         if (!arcId) die('no arcs yet')

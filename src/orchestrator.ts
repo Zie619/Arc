@@ -1345,7 +1345,11 @@ async function reviewLoop(
   ].join('\n')
 
   let checklist: z.infer<typeof RiskChecklist>['risks'] = []
-  if (!repair) {
+  if (!repair && !config.reviewRiskPhase) {
+    log(`  · ${task.id} review: risk phase OFF (reviewRiskPhase: false) — the reviewer sees the diff cold`)
+    store.appendEvent(arcId, 'review.risk-phase-skipped', {}, task.id)
+  }
+  if (!repair && config.reviewRiskPhase) {
     const dispatched = await dispatchStep(o, {
       roleName: 'review', role, taskId: task.id, attemptNo: 0,
       dispatch: { cwd: wt.path, prompt: checklistBrief, schema: RiskChecklist, signal: o.signal },
