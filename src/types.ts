@@ -213,9 +213,28 @@ export const ProjectConfig = z.object({
    * content instead (see gateScriptsChanged).
    */
   protectedGatePaths: z.array(z.string()).default([
-    '**/*.test.*', '**/*.spec.*', 'test/**', 'tests/**', '__tests__/**',
     'vitest.config.*', 'jest.config.*', 'pytest.ini', 'conftest.py',
     '.github/workflows/**', 'arc.yaml',
+  ]),
+  /**
+   * Test files, where ADDING is normal and REMOVING is the hazard.
+   *
+   * These were in `protectedGatePaths` and that was wrong. The check could not
+   * tell "wrote the tests for this feature" from "deleted the tests that were
+   * failing", so in a test-first repo — where every task must write tests —
+   * every task tripped it, and the operator was pushed toward declaring
+   * `touchesGateSurface` on all of them. A control that must be waived every
+   * time is a control that has been turned off; the handoff warned about
+   * exactly that and the default walked into it anyway.
+   *
+   * So the rule here is about DELETIONS, not touches. Removing lines from a
+   * test file covers both real attacks: deleting a test, and hollowing out its
+   * assertion (which `testsExecuted` cannot see, because the count is
+   * unchanged). Pure additions pass. A legitimate test refactor that removes
+   * lines still needs `touchesGateSurface` — now rarely rather than always.
+   */
+  protectedTestPaths: z.array(z.string()).default([
+    '**/*.test.*', '**/*.spec.*', 'test/**', 'tests/**', '__tests__/**',
   ]),
   gates: z.array(GateDef).default([]),
   /**

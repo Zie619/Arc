@@ -823,34 +823,81 @@ describe('the orchestrator, end to end', () => {
 })
 
 describe('the gate surface is not the writer\'s to move', () => {
-  it('refuses a task that edits a test file it never declared', async () => {
-    // The canonical reward hack: make the thing that proves you green by
-    // editing the thing that proves you. Path matching catches this one.
+  it('lets a task ADD tests, because in a test-first repo that is every task', async () => {
+    // This used to fail. The check could not tell "wrote the tests for this
+    // feature" from "deleted the tests that were failing", so a repo whose
+    // method is test-first had to declare touchesGateSurface on every single
+    // task — a control waived every time is a control switched off.
     process.env.ARC_FAKE_WRITE = 'thing.test.ts'
     const store = new Store(home)
-    await runArc({ store, plan: plan([task('sneaky')]), config: config(), log })
+    await runArc({
+      store, plan: plan([task('adds-tests', { acceptance: INVARIANT_CRITERION })]),
+      config: config(), log,
+    })
 
-    expect(store.allTasks('e2e')[0]!.state).toBe('failed')
-    expect(logs.join('\n')).toContain('protected gate-surface path')
-    expect(store.findingsFor('e2e').some((f) =>
-      String(f.text).includes('changed the gate surface without declaring it'))).toBe(true)
+    expect(store.allTasks('e2e')[0]!.state).toBe('landed')
+    expect(logs.join('\n')).not.toContain('protected gate-surface path')
     store.close()
   }, 60_000)
 
-  it('allows it when the task declares WHY, and records the exception', async () => {
+  it('refuses a task that REMOVES lines from a test file', async () => {
+    // Deleting a test, and hollowing out an assertion, are both deletions —
+    // and the second is invisible to testsExecuted, because the count does not
+    // change when `expect(x).toBe(1)` becomes `expect(true).toBe(true)`.
+    writeFileSync(join(repo, 'thing.test.ts'), [
+      "import { expect, it } from 'vitest'",
+      "it('a', () => expect(compute(1)).toBe(2))",
+      "it('b', () => expect(compute(2)).toBe(4))",
+      "it('c', () => expect(compute(3)).toBe(6))",
+    ].join('\n') + '\n')
+    sh(repo, 'add', 'thing.test.ts')
+    sh(repo, 'commit', '-q', '-m', 'seed tests')
+
+    process.env.ARC_FAKE_WRITE = 'thing.test.ts'   // overwrites it with one line
+    const store = new Store(home)
+    await runArc({
+      store, plan: plan([task('guts-tests', { acceptance: INVARIANT_CRITERION })]),
+      config: config(), log,
+    })
+
+    expect(store.allTasks('e2e')[0]!.state).toBe('failed')
+    expect(logs.join('\n')).toContain('line(s) removed')
+    // The work is a declaration problem, not lost work — say so, rather than
+    // leaving the operator to discover the branch was salvageable.
+    expect(logs.join('\n')).toContain('The work is not lost')
+    store.close()
+  }, 60_000)
+
+  it('allows the removal when the task declares WHY, and records the exception', async () => {
+    writeFileSync(join(repo, 'thing.test.ts'), 'a\nb\nc\nd\n')
+    sh(repo, 'add', 'thing.test.ts')
+    sh(repo, 'commit', '-q', '-m', 'seed tests')
     process.env.ARC_FAKE_WRITE = 'thing.test.ts'
     const store = new Store(home)
     const p = plan([{
       ...task('honest', { acceptance: INVARIANT_CRITERION }),
-      touchesGateSurface: 'this task adds the missing tests for the importer',
+      touchesGateSurface: 'this task rewrites the importer tests around the new API',
     }])
     await runArc({ store, plan: p, config: config(), log })
 
     expect(store.allTasks('e2e')[0]!.state).toBe('landed')
-    // The exception is RECORDED, not silent — that is the whole point of the
-    // override existing at all.
     expect(store.findingsFor('e2e').some((f) =>
-      String(f.text).includes('adds the missing tests for the importer'))).toBe(true)
+      String(f.text).includes('rewrites the importer tests'))).toBe(true)
+    store.close()
+  }, 60_000)
+
+  it('still refuses ANY change to runner or CI config', async () => {
+    // Different surface, different rule: nobody edits vitest.config or a
+    // workflow file as part of shipping a feature, so any touch is blocking.
+    process.env.ARC_FAKE_WRITE = 'vitest.config.ts'
+    const store = new Store(home)
+    await runArc({
+      store, plan: plan([task('retunes', { acceptance: INVARIANT_CRITERION })]),
+      config: config(), log,
+    })
+
+    expect(store.allTasks('e2e')[0]!.state).toBe('failed')
+    expect(logs.join('\n')).toContain('protected gate-surface path')
     store.close()
   }, 60_000)
 

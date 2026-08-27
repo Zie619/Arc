@@ -149,6 +149,8 @@ closed** on the decisions that matter:
 | A proof already passes at the base commit | **Refused before dispatching.** It cannot tell done from not-done. |
 | A plan names a gate the config does not declare | **Refused before dispatching.** |
 | A task declares no footprint or no contracts | **Refused.** Say `["."]` / `["none"]` and mean it. |
+| A task **adds** tests | Fine — that is what a task is for, and in a test-first repo it is every task. |
+| A task **removes lines from** a test, or touches runner/CI config | **Refused** unless it declares `touchesGateSurface: "why"`. The work is kept on its branch; add the declaration and `arc resume`. |
 | The reviewer requires changes | One repair round, then the task fails. |
 | A model substitute is served | Waits and retries if it is capacity weather; blocks if it is drift. |
 | A blocking pending-op is raised | The arc completes what it can and reports INCOMPLETE. |

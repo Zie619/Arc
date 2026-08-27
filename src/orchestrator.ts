@@ -9,7 +9,7 @@ import {
 import { computeFrontier, validatePlan } from './scheduler.ts'
 import { runGate, selectGates, isSubsetOfBaseline, describe, testsVanished, matchesGlob, type GateResult } from './gates.ts'
 import { checkReviewFinding, type FindingOutcome } from './finding-check.ts'
-import { assembleDiff } from './diff.ts'
+import { assembleDiff, changedFiles } from './diff.ts'
 import { dryRunProofs } from './dry-run.ts'
 import { notify, clearTerminal } from './notify.ts'
 
@@ -1164,6 +1164,13 @@ async function implementLoop(
             + ' — set touchesGateSurface on the task with a reason if this is intended',
           affects: protectedTouched })
         log(`  ✗ ${task.id}: changed ${protectedTouched.length} protected gate-surface path(s) undeclared`)
+        for (const path of protectedTouched.slice(0, 5)) log(`      ${path}`)
+        // The WORK is fine here — this is a declaration problem, and the branch
+        // still holds every commit. Say how to keep it instead of leaving the
+        // operator to work out that it was salvageable.
+        log(`      The work is not lost: it is committed on "${wt.branch}".`)
+        log(`      Add to this task in the plan, then \`arc resume\`:`)
+        log(`        touchesGateSurface: "why this task legitimately changes the gate surface"`)
         return 'failed'
       }
       if (protectedTouched.length > 0) {
@@ -1278,8 +1285,25 @@ async function setupWorktree(o: RunOptions, wt: G.Worktree, taskId?: string): Pr
  * is the canonical version of this attack and path matching cannot see it.
  */
 function protectedSurfaceTouched(o: RunOptions, measured: string[], wt: G.Worktree): string[] {
+  const { protectedGatePaths, protectedTestPaths } = o.config
+  // Runner and CI config: any change at all. Nobody edits vitest.config or a
+  // workflow file as part of shipping a feature.
   const hits = measured.filter((path) =>
-    o.config.protectedGatePaths.some((pattern) => matchesGlob(path, pattern)))
+    protectedGatePaths.some((pattern) => matchesGlob(path, pattern)))
+
+  // Tests: only REMOVAL. Adding tests is what a task is supposed to do, and in
+  // a test-first repo it is what EVERY task does — treating that as tampering
+  // made the control something the operator had to waive every time, which is
+  // the same as not having it.
+  const changed = changedFiles(wt.path, `${wt.baseSha}...HEAD`)
+  for (const file of changed) {
+    if (!protectedTestPaths.some((pattern) => matchesGlob(file.path, pattern))) continue
+    // Covers both real attacks: deleting a test, and hollowing out its
+    // assertion — which testsExecuted cannot see, because the count is
+    // unchanged when `expect(x).toBe(1)` becomes `expect(true).toBe(true)`.
+    if (file.deleted > 0) hits.push(`${file.path} (${file.deleted} line(s) removed)`)
+  }
+
   if (measured.includes('package.json') && gateScriptsChanged(wt)) hits.push('package.json (scripts)')
   return hits
 }
