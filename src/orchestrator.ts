@@ -1527,6 +1527,16 @@ function planCapabilities(o: RunOptions, roleLevel: SandboxLevel, osSandboxed: b
       if (!probe || !spec) continue // validatePlan already refused an undefined one
       const reason = (text: string) => { if (!plan.refusals.has(task.id)) plan.refusals.set(task.id, text) }
 
+      if (probe.reachability.at === 'unknown') {
+        // We could not exercise the sandbox at all, so we know nothing about
+        // what the writer can reach. Quarantining on that would be a verdict
+        // derived from silence. Run, and say plainly that the check did not
+        // happen — this is exactly the pre-existing behaviour, plus a caveat.
+        log(`  ! ${task.id}: \`${name}\` could not be probed — running anyway, unverified`)
+        o.store.addFinding({ arcId: o.plan.arcId, taskId: task.id, kind: 'risk', severity: 'medium',
+          text: `capability "${name}" was never probed (\`codex sandbox\` unavailable) — this task may be writing blind` })
+        continue
+      }
       if (probe.reachability.at === 'nowhere') {
         reason(`\`${name}\` is not reachable at all — \`${spec.probe}\` fails even unsandboxed. Is it running?`)
         continue

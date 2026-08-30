@@ -1,6 +1,9 @@
 import { describe, expect, it } from 'vitest'
 import { execFileSync } from 'node:child_process'
-import { probeCapability, probeUnsandboxedOnly, atLeast, looser, describeReachability } from '../src/capabilities.ts'
+import {
+  probeCapability, probeUnsandboxedOnly, atLeast, looser, describeReachability,
+  sandboxProbeUsable, resetSandboxProbeForTests,
+} from '../src/capabilities.ts'
 
 /**
  * `codex sandbox` runs a command under the exact policy the writer gets, with
@@ -56,5 +59,27 @@ describe('the sandbox ladder is measured, not assumed', () => {
     expect(atLeast('read-only', 'workspace-write')).toBe(false)
     expect(looser('read-only', 'workspace-write')).toBe('workspace-write')
     expect(looser('danger-full-access', 'read-only')).toBe('danger-full-access')
+  })
+})
+
+describe('an unprobeable sandbox is not a verdict', () => {
+  it('reports UNKNOWN rather than concluding "unsandboxed only"', () => {
+    // With no codex on PATH every rung fails for the same uninformative
+    // reason. Reading that as "reachable only outside a sandbox" would
+    // quarantine every task with a requirement, on the strength of a probe
+    // that never ran — a verdict derived from silence.
+    const realPath = process.env.PATH
+    process.env.PATH = '/nonexistent'
+    resetSandboxProbeForTests()
+    try {
+      expect(sandboxProbeUsable()).toBe(false)
+      const probe = probeCapability('git', 'git --version', process.cwd())
+      expect(probe.reachability).toEqual({ at: 'unknown' })
+      expect(probe.rungs).toEqual([])
+      expect(describeReachability(probe)).toContain('UNPROBED')
+    } finally {
+      process.env.PATH = realPath
+      resetSandboxProbeForTests()
+    }
   })
 })

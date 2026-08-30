@@ -45,6 +45,13 @@ export type Reachability =
   | { at: 'unsandboxed' }
   /** Not reachable at all. Docker is not running; the binary is missing. */
   | { at: 'nowhere' }
+  /**
+   * The sandbox MECHANISM could not be exercised — no codex on PATH, or a build
+   * without `codex sandbox`. Every rung then fails for the same uninformative
+   * reason, and concluding "unsandboxed only" from that would quarantine every
+   * task on the strength of a probe that never ran. Silence is not a verdict.
+   */
+  | { at: 'unknown' }
 
 export interface CapabilityProbe {
   name: string
@@ -55,6 +62,25 @@ export interface CapabilityProbe {
 }
 
 const PROBE_TIMEOUT_MS = 20_000
+
+/**
+ * Can we exercise the sandbox at all? Probed once with a command that MUST
+ * succeed, so a mechanism failure is never mistaken for a capability denial.
+ * The same shape as the seatbelt `sandboxUsable` guard the gate tests already
+ * use — a probe you cannot run tells you nothing about the thing you probed.
+ */
+let mechanismUsable: boolean | undefined
+export function sandboxProbeUsable(): boolean {
+  if (mechanismUsable === undefined) {
+    const spawn = spawnSync('codex', ['sandbox', '--', '/bin/echo', 'arc'],
+      { timeout: PROBE_TIMEOUT_MS, stdio: 'ignore' })
+    mechanismUsable = !spawn.error && spawn.status === 0
+  }
+  return mechanismUsable
+}
+
+/** Test seam: the mechanism probe is memoized for the process. */
+export function resetSandboxProbeForTests(): void { mechanismUsable = undefined }
 
 function runAt(level: SandboxLevel | 'unsandboxed', command: string, cwd: string): number | null {
   const spawn = level === 'unsandboxed'
@@ -72,6 +98,9 @@ function runAt(level: SandboxLevel | 'unsandboxed', command: string, cwd: string
  * (already reachable at read-only) costs exactly one subprocess.
  */
 export function probeCapability(name: string, command: string, cwd: string): CapabilityProbe {
+  if (!sandboxProbeUsable()) {
+    return { name, command, reachability: { at: 'unknown' }, rungs: [] }
+  }
   const rungs: CapabilityProbe['rungs'] = []
   for (const level of SANDBOX_LADDER) {
     const exitCode = runAt(level, command, cwd)
@@ -120,6 +149,9 @@ export function describeReachability(probe: CapabilityProbe): string {
       return `${probe.name}: NOT reachable at all (\`${probe.command}\` fails even unsandboxed)`
     case 'unsandboxed':
       return `${probe.name}: reachable only OUTSIDE a sandbox — no writer sandbox can reach it`
+    case 'unknown':
+      return `${probe.name}: UNPROBED — \`codex sandbox\` is unavailable here, so nothing can be`
+        + ' said about what the writer can reach'
     default:
       return `${probe.name}: reachable at ${probe.reachability.at}`
   }
