@@ -234,6 +234,68 @@ export const SCENARIOS: Scenario[] = [
     env: { ARC_FAKE_WRITE: 'auto', ARC_FAKE_PAYLOAD: DONE_PAYLOAD },
     expect: { arcStatus: 'incomplete', landed: 0, logContains: ['wc-l-string-compare'] },
   },
+  // --- the capability gap that started this. -------------------------------
+  // Arc failed a task it could never have completed, and only found out after
+  // two implement attempts. These two scenarios are that failure, made
+  // impossible: refused for free, or granted and named.
+  {
+    id: 'cap-ungranted-quarantines',
+    defends: 'ATTACK: a task whose gate needs an ungranted capability is refused for ZERO dispatches',
+    // beta scopes itself to a gate that needs nothing. `gates: []` would mean
+    // ALL non-heavy gates, which is exactly the fan-out preflight warns about.
+    plan: plan('bench-cap-no', [
+      { id: 'alpha', gates: ['needs-cap'] },
+      { id: 'beta', gates: ['always-green'] },
+    ]),
+    config: {
+      gates: [
+        { name: 'needs-cap', command: 'true', proves: 'nothing', requires: ['unobtainium'] },
+        { name: 'always-green', command: 'true', proves: 'nothing, it is a fixture' },
+      ],
+      // Defined, deliberately NOT granted — defining is not granting.
+      capabilities: { unobtainium: { probe: 'definitely-not-a-real-binary', elevate: false } },
+    },
+    env: { ARC_FAKE_WRITE: 'auto', ARC_FAKE_PAYLOAD: DONE_PAYLOAD },
+    // beta still lands: quarantine holds one task, it does not stop the arc.
+    expect: { arcStatus: 'incomplete', landed: 1, logContains: ['QUARANTINED', 'not reachable at all'] },
+  },
+  {
+    id: 'cap-reachable-is-silent',
+    defends: 'a capability already reachable at the writer\'s level changes nothing',
+    plan: plan('bench-cap-ok', [{ id: 'alpha', gates: ['needs-git'] }]),
+    config: {
+      gates: [{ name: 'needs-git', command: 'true', proves: 'nothing', requires: ['git'] }],
+      capabilities: { git: { probe: 'git --version', elevate: false } },
+    },
+    env: { ARC_FAKE_WRITE: 'auto', ARC_FAKE_PAYLOAD: DONE_PAYLOAD },
+    // No elevation, no quarantine, no noise. The mechanism self-disables.
+    expect: { arcStatus: 'done', landed: 1, logContains: ['reachable at read-only'] },
+  },
+  {
+    id: 'cap-granted-elevates',
+    defends: 'a GRANTED capability elevates exactly the task that needs it, and says so',
+    plan: plan('bench-cap-yes', [
+      { id: 'alpha', gates: ['needs-docker'] },
+      { id: 'beta', gates: ['always-green'] },
+    ]),
+    config: {
+      gates: [
+        { name: 'needs-docker', command: 'true', proves: 'nothing', requires: ['docker'] },
+        { name: 'always-green', command: 'true', proves: 'nothing, it is a fixture' },
+      ],
+      capabilities: { docker: { probe: 'docker info', elevate: true } },
+    },
+    env: {
+      ARC_FAKE_WRITE: 'auto', ARC_FAKE_PAYLOAD: DONE_PAYLOAD,
+      // The fixture's ladder: docker only answers at the top rung.
+      ARC_FAKE_CAP_LEVEL: 'docker info=danger-full-access',
+    },
+    // alpha runs elevated and is NAMED for it; beta is untouched.
+    expect: {
+      arcStatus: 'done', landed: 2,
+      logContains: ['alpha will run ELEVATED at "danger-full-access"', 'declared for `docker`'],
+    },
+  },
   {
     id: 'adv-unknown-gate',
     defends: 'a plan that does not fit the config is refused BEFORE anything is billed',

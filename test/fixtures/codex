@@ -8,6 +8,31 @@ if [ "$1" = "--help" ] || { [ "$1" = "exec" ] && [ "$2" = "--help" ]; }; then
   done
   exit 0
 fi
+# `codex sandbox` — the zero-token capability probe. The real one runs the
+# command under a seatbelt policy; this one runs it for real, and honours
+# ARC_FAKE_CAP_LEVEL to simulate a capability that only works higher up the
+# ladder:  ARC_FAKE_CAP_LEVEL="docker info=danger-full-access"
+if [ "$1" = "sandbox" ]; then
+  shift
+  MODE="read-only"
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -c) case "$2" in sandbox_mode=*) MODE="${2#sandbox_mode=}"; MODE="${MODE//\"/}";; esac; shift 2;;
+      --) shift; break;;
+      *) shift;;
+    esac
+  done
+  if [ -n "$ARC_FAKE_CAP_LEVEL" ]; then
+    RULE_CMD="${ARC_FAKE_CAP_LEVEL%%=*}"
+    RULE_LEVEL="${ARC_FAKE_CAP_LEVEL##*=}"
+    if [[ "$*" = *"$RULE_CMD"* ]]; then
+      # Rank the ladder so "at least this level" is decidable in the fixture.
+      rank() { case "$1" in read-only) echo 0;; workspace-write) echo 1;; *) echo 2;; esac; }
+      [ "$(rank "$MODE")" -lt "$(rank "$RULE_LEVEL")" ] && exit 1
+    fi
+  fi
+  exec "$@"
+fi
 OUT=""; while [ $# -gt 0 ]; do case "$1" in -o) OUT="$2"; shift 2;; *) shift;; esac; done
 cat > /dev/null  # consume the prompt on stdin
 PAYLOAD="$ARC_FAKE_PAYLOAD"

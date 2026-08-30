@@ -11,6 +11,10 @@ import { runGate, selectGates, isSubsetOfBaseline, describe, testsVanished, matc
 import { checkReviewFinding, type FindingOutcome } from './finding-check.ts'
 import { assembleDiff, changedFiles } from './diff.ts'
 import { dryRunProofs } from './dry-run.ts'
+import {
+  probeCapability, probeUnsandboxedOnly, describeReachability, atLeast, looser,
+  type CapabilityProbe, type SandboxLevel,
+} from './capabilities.ts'
 import { notify, clearTerminal } from './notify.ts'
 
 /** Byte budgets for what a reviewer is shown. Deliberately named rather than
@@ -36,6 +40,9 @@ import {
  */
 
 export interface RunOptions {
+  /** Per-task sandbox elevations resolved at preflight. Set by runArc; callers
+   *  never populate it. */
+  elevations?: Map<string, SandboxLevel>
   /** Proceed with no gates. Explicit only: a gate-less arc proves nothing, so
    *  it must be something the operator SAID, never something inferred. */
   allowNoGates?: boolean
@@ -164,6 +171,16 @@ export async function runArc(o: RunOptions): Promise<void> {
     // were ten opportunities to do it again. provisionWorktree now reuses a
     // worktree whose head DESCENDS from the base, so the writer picks up where
     // it stopped and the durable attempt budget stops it re-running forever.
+    // A quarantined task was refused for a reason a HUMAN can clear — a
+    // capability grant, a Docker daemon started. Resume re-probes from scratch,
+    // so putting them back on the queue is what makes `arc resume` the way you
+    // act on the decision.
+    const held = store.allTasks(arcId).filter((t) => String(t.state) === 'quarantined')
+    for (const t of held) {
+      log(`resume: ${t.id} was quarantined — re-checking whether it can run now`)
+      store.setTaskState(arcId, String(t.id), 'pending')
+    }
+
     const stuck = store.allTasks(arcId).filter((t) => ['running', 'reviewing', 'landing'].includes(String(t.state)))
     let requeued = 0
     for (const t of stuck) {
@@ -265,6 +282,38 @@ export async function runArc(o: RunOptions): Promise<void> {
   }, Math.floor(ARC_LEASE_MS / 3))
   // unref so a held interval can never keep the process alive past the run.
   arcLease.unref?.()
+
+  // What can the WRITER actually reach? Arc's gates run unsandboxed, so
+  // verification always worked — but an agent that cannot run the check it is
+  // graded by writes blind, and every retry costs a full dispatch to learn one
+  // bit. Probed before anything is spent: four subprocesses per capability,
+  // zero tokens.
+  const implementRole = config.roles.implement
+  const capabilityPlan = planCapabilities(o, implementRole.sandbox, implementRole.cli === 'codex')
+  store.appendEvent(arcId, 'capability.probe', {
+    probes: [...capabilityPlan.probes.values()].map((probe) => ({
+      name: probe.name, reachability: probe.reachability, rungs: probe.rungs,
+    })),
+  })
+  for (const [taskId, why] of capabilityPlan.refusals) {
+    log(`  ✗ ${taskId} QUARANTINED — ${why}`)
+    store.setTaskState(arcId, taskId, 'quarantined')
+    store.addFinding({ arcId, taskId, kind: 'risk', severity: 'high',
+      text: `quarantined: ${why.split('\n')[0]}` })
+  }
+  o.elevations = new Map([...capabilityPlan.elevations].map(([id, e]) => [id, e.level]))
+  if (capabilityPlan.elevations.size > 0) {
+    const n = capabilityPlan.elevations.size
+    if (n === plan.tasks.length && n > 1) {
+      // Arithmetically correct — those tasks do run that gate — but rarely
+      // intended. The lever is task.gates, and it belongs to the planner.
+      log(`  ! ${n} of ${plan.tasks.length} tasks will run ELEVATED. Scope the gate in the plan (task.gates) if that is not what you meant.`)
+    }
+    for (const [taskId, e] of capabilityPlan.elevations) {
+      log(`  ▲ ${taskId} will run ELEVATED at "${e.level}" — declared for \`${e.because}\``)
+      store.appendEvent(arcId, 'task.elevated', { level: e.level, capability: e.because }, taskId)
+    }
+  }
 
   // Every proof command executed at the base commit BEFORE anything is
   // dispatched. A vacuous proof — one that already passes — would otherwise
@@ -727,6 +776,9 @@ async function runTask(
 
     const outcome = await implementLoop(o, task, wt, baselines, heavy)
     if (outcome === 'failed') { store.setTaskState(arcId, task.id, 'failed'); return }
+    // implementLoop already recorded the state and the reason; a quarantined
+    // task is not a failure and must not be rewritten into one.
+    if (outcome === 'quarantined') return
 
     // A no-op produced no diff, so there is nothing to review and nothing to
     // land — but its criteria still have to hold, and the worktree must
@@ -836,7 +888,7 @@ async function runTask(
  * integers are deliberately kept: "5 failed" → "3 failed" is convergence, and
  * erasing it would kill a loop that is working.
  */
-type ImplementOutcome = 'ok' | 'noop' | 'failed'
+type ImplementOutcome = 'ok' | 'noop' | 'failed' | 'quarantined'
 
 function modelStatus(
   o: RunOptions,
@@ -1004,8 +1056,14 @@ async function implementLoop(
 ): Promise<ImplementOutcome> {
   const { store, plan, config, log } = o
   const arcId = plan.arcId
-  const role = config.roles.implement
-  if (!role) throw new Error('project.yaml defines no "implement" role')
+  const configured = config.roles.implement
+  if (!configured) throw new Error('project.yaml defines no "implement" role')
+  // Elevation only ever RAISES, and only for a task that declared the need and
+  // whose capability the operator permitted.
+  const elevated = o.elevations?.get(task.id)
+  const role = elevated && elevated !== configured.sandbox
+    ? { ...configured, sandbox: elevated }
+    : configured
 
   // Every budget is derived from ROWS, so a resume continues one task rather
   // than starting a fresh one wearing the same name. capacityWaitMinutes was
@@ -1180,8 +1238,21 @@ async function implementLoop(
         log(`  · ${task.id}: gate surface changed by declaration — ${task.touchesGateSurface}`)
       }
 
-      const gateResults = await runTaskGates(o, task, wt, baselines, attemptId, heavy)
+        const gateResults = await runTaskGates(o, task, wt, baselines, attemptId, heavy)
       failed = gateResults.filter((g) => !g.ok)
+
+      // The backstop. Declarations can be wrong, and Docker can die mid-run.
+      // When a gate fails AND the capability it needs is gone at this moment,
+      // that is a capability loss, not a code failure: do not burn a retry on
+      // it and do not raise a finding blaming the writer.
+      const lost = capabilityLost(o, failed.map((f) => f.result.name))
+      if (lost) {
+        log(`  ✗ ${task.id} QUARANTINED mid-run — ${lost}`)
+        store.addFinding({ arcId, taskId: task.id, attemptId, kind: 'risk', severity: 'high',
+          text: `quarantined: ${lost}` })
+        store.setTaskState(arcId, task.id, 'quarantined')
+        return 'quarantined'
+      }
     }
 
     if (failed.length === 0) {
@@ -1398,6 +1469,114 @@ function driftedIntoInflight(o: RunOptions, task: PlanTask): string[] {
 
 function workspaceId(arcId: string, taskId: string): string {
   return `${arcId}--${taskId}`
+}
+
+/**
+ * Which capabilities a task needs: the union over the gates it will actually
+ * run, plus its own explicit `needs`.
+ *
+ * Gates are the primary source because that is where the knowledge already is —
+ * you wrote `npm run db:test`, so you know it needs Docker. A planner does not,
+ * reliably, and a planner that forgets puts you back at discovering the gap on
+ * attempt two.
+ */
+function requiredCapabilities(config: ProjectConfig, task: PlanTask): Set<string> {
+  const out = new Set<string>()
+  for (const gate of selectGates(config.gates, task.gates)) {
+    for (const name of gate.requires ?? []) out.add(name)
+  }
+  for (const need of task.needs ?? []) out.add(need.capability)
+  return out
+}
+
+export interface CapabilityPlan {
+  /** Probe result per declared capability. */
+  probes: Map<string, CapabilityProbe>
+  /** Tasks that cannot run, and why — in operator-readable form. */
+  refusals: Map<string, string>
+  /** Tasks that will run above the role's configured sandbox. */
+  elevations: Map<string, { level: SandboxLevel; because: string }>
+}
+
+/**
+ * Probe once, then decide for every task. Runs BEFORE any dispatch, costs at
+ * most four subprocesses per capability, and spends no tokens.
+ */
+function planCapabilities(o: RunOptions, roleLevel: SandboxLevel, osSandboxed: boolean): CapabilityPlan {
+  const { config, log } = o
+  const declared = Object.entries(config.capabilities ?? {})
+  const plan: CapabilityPlan = { probes: new Map(), refusals: new Map(), elevations: new Map() }
+  const wanted = new Set(o.plan.tasks.flatMap((t) => [...requiredCapabilities(config, t)]))
+  if (wanted.size === 0) return plan
+
+  for (const [name, spec] of declared) {
+    if (!wanted.has(name)) continue
+    // The claude lane has no OS sandbox to probe or widen, so the only question
+    // that still means anything is whether it is reachable on this machine.
+    const probe = osSandboxed
+      ? probeCapability(name, spec.probe, config.repo)
+      : probeUnsandboxedOnly(name, spec.probe, config.repo)
+    plan.probes.set(name, probe)
+    log(`  ${describeReachability(probe)}`)
+  }
+
+  for (const task of o.plan.tasks) {
+    for (const name of requiredCapabilities(config, task)) {
+      const probe = plan.probes.get(name)
+      const spec = config.capabilities?.[name]
+      if (!probe || !spec) continue // validatePlan already refused an undefined one
+      const reason = (text: string) => { if (!plan.refusals.has(task.id)) plan.refusals.set(task.id, text) }
+
+      if (probe.reachability.at === 'nowhere') {
+        reason(`\`${name}\` is not reachable at all — \`${spec.probe}\` fails even unsandboxed. Is it running?`)
+        continue
+      }
+      if (!osSandboxed) continue // nothing to elevate; reachable is reachable
+      if (probe.reachability.at === 'unsandboxed') {
+        reason(`\`${name}\` is reachable only outside a sandbox, so no writer sandbox can reach it.`
+          + ' Run this task yourself, or make the capability reachable from a sandbox.')
+        continue
+      }
+      const needed = probe.reachability.at
+      if (atLeast(roleLevel, needed)) continue // already reachable; silent
+
+      if (!spec.elevate) {
+        reason(`\`${name}\` needs sandbox "${needed}" but the writer runs at "${roleLevel}",`
+          + ` and the project config does not permit elevating for it.\n`
+          + `      Add to arc.yaml, then \`arc resume\`:\n`
+          + `        capabilities:\n          ${name}:\n            probe: ${spec.probe}\n            elevate: true`)
+        continue
+      }
+      const current = plan.elevations.get(task.id)
+      const level = current ? looser(current.level, needed) : needed
+      plan.elevations.set(task.id, { level, because: name })
+    }
+  }
+  return plan
+}
+
+/**
+ * A gate failed. Is the reason that its capability is no longer reachable?
+ *
+ * Re-probes only the capabilities the FAILING gates declared, so the common
+ * case (a genuine code failure on a gate that needs nothing) costs nothing.
+ */
+function capabilityLost(o: RunOptions, failedGateNames: string[]): string | null {
+  const { config } = o
+  const suspects = new Set(
+    config.gates
+      .filter((g) => failedGateNames.includes(g.name))
+      .flatMap((g) => g.requires ?? []),
+  )
+  for (const name of suspects) {
+    const spec = config.capabilities?.[name]
+    if (!spec) continue
+    const probe = probeUnsandboxedOnly(name, spec.probe, config.repo)
+    if (probe.reachability.at === 'nowhere') {
+      return `\`${name}\` stopped being reachable (\`${spec.probe}\` now fails) — the gate failure is environmental, not the writer's`
+    }
+  }
+  return null
 }
 
 async function runTaskGates(
@@ -2142,6 +2321,7 @@ function report(o: RunOptions, integrationBranch: string, integrationApproved: b
   const landed = tasks.filter((t) => t.state === 'landed')
   const failed = tasks.filter((t) => t.state === 'failed')
   const blocked = tasks.filter((t) => t.state === 'blocked')
+  const quarantined = tasks.filter((t) => t.state === 'quarantined')
 
   const byTier = (t: string) => crit.filter((c) => c.tier === t).length
 
@@ -2153,6 +2333,7 @@ function report(o: RunOptions, integrationBranch: string, integrationApproved: b
   log(`  landed   ${landed.length}/${tasks.length}`)
   if (failed.length) log(`  FAILED   ${failed.length}  (${failed.map((t) => t.id).join(', ')})`)
   if (blocked.length) log(`  blocked  ${blocked.length}  (${blocked.map((t) => t.id).join(', ')})`)
+  if (quarantined.length) log(`  waiting on YOU  ${quarantined.length}  (${quarantined.map((t) => t.id).join(', ')})`)
   log('')
   log(`  criteria: observed ${byTier('observed')} · checked ${byTier('checked')} · claimed-only ${byTier('claimed')} · unproven ${byTier('unproven')}`)
 
@@ -2179,7 +2360,19 @@ function report(o: RunOptions, integrationBranch: string, integrationApproved: b
 
   logCostSummary(o)
 
-  const complete = integrationApproved && failed.length === 0 && blocked.length === 0 && weak.length === 0 && ops.length === 0
+  if (quarantined.length > 0) {
+    log('')
+    log('  QUARANTINED — never attempted, and nothing is wrong with them.')
+    log('  Each needs a decision from you; the rest of the arc ran to completion.')
+    for (const t of quarantined) {
+      const why = store.findingsFor(arcId)
+        .find((f) => f.task_id === t.id && String(f.text).startsWith('quarantined: '))
+      log(`    ${t.id}: ${String(why?.text ?? 'see findings').replace(/^quarantined: /, '')}`)
+    }
+  }
+
+  const complete = integrationApproved && failed.length === 0 && blocked.length === 0
+    && quarantined.length === 0 && weak.length === 0 && ops.length === 0
   log('')
   log(`  integration branch: ${integrationBranch}`)
   log(`  ${complete ? 'COMPLETE — every criterion has evidence' : 'INCOMPLETE — see above. Nothing merged to your main branch.'}`)

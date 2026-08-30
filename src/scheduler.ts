@@ -19,6 +19,17 @@ export type TaskState =
   | 'landing'
   | 'landed'
   | 'blocked'
+  /**
+   * Refused for a reason a human can clear, not for a reason the writer caused
+   * — today, a capability its sandbox cannot reach. Distinct from `failed`
+   * because the work was never attempted and nothing is wrong with it: the
+   * frontier skips it, the report separates it, the rest of the DAG runs to
+   * completion, and `arc resume` picks it up once you grant.
+   *
+   * (This is the state declined during v2 planning on the grounds that nothing
+   * produced the signal. Capability refusal produces it.)
+   */
+  | 'quarantined'
   | 'failed'
 
 export interface TaskRuntime {
@@ -237,10 +248,28 @@ export function findCycle(plan: Plan): string[] | null {
  * does not declare used to throw at TASK RUNTIME, after the implement dispatch
  * had already been paid for.
  */
-export function validatePlan(plan: Plan, config?: { gates: Array<{ name: string }> }): string[] {
+export function validatePlan(
+  plan: Plan,
+  config?: {
+    gates: Array<{ name: string; requires?: string[] }>
+    capabilities?: Record<string, unknown>
+  },
+): string[] {
   const errors: string[] = []
   const ids = new Set<string>()
   const gateNames = config ? new Set(config.gates.map((g) => g.name)) : null
+  const capabilityNames = config?.capabilities ? new Set(Object.keys(config.capabilities)) : null
+
+  // A gate that requires a capability nobody defined can never be probed, so
+  // this is a config error rather than a runtime surprise.
+  for (const gate of config?.gates ?? []) {
+    for (const need of gate.requires ?? []) {
+      if (capabilityNames && !capabilityNames.has(need)) {
+        errors.push(`gate "${gate.name}" requires capability "${need}", which the project config does not define`
+          + ` — add it under \`capabilities:\` with a probe`)
+      }
+    }
+  }
 
   for (const t of plan.tasks) {
     if (ids.has(t.id)) errors.push(`duplicate task id "${t.id}"`)
@@ -259,6 +288,12 @@ export function validatePlan(plan: Plan, config?: { gates: Array<{ name: string 
     // has. Silence must not be spelled the same way as "nothing".
     if (t.contractsMutated.length === 0) {
       errors.push(`task "${t.id}" declares no contractsMutated — name the exported signatures it changes, or ["none"]`)
+    }
+    for (const need of t.needs ?? []) {
+      if (capabilityNames && !capabilityNames.has(need.capability)) {
+        errors.push(`task "${t.id}" needs capability "${need.capability}", which the project config does not define`
+          + ` — add it under \`capabilities:\` with a probe, or remove the need`)
+      }
     }
     if (gateNames) {
       for (const g of t.gates) {

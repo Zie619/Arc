@@ -1,6 +1,7 @@
 # Sandbox capability gaps
 
-> Design, 2026-08-30. Status: approved, not yet implemented.
+> Design, 2026-08-30. Status: **implemented**. See `src/capabilities.ts`,
+> `docs/unattended.md`, and the `cap-*` bench scenarios.
 
 ## The problem
 

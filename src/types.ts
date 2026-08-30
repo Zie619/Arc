@@ -86,6 +86,14 @@ export const GateDef = z.object({
    * plus post-hoc detection remain the only line.
    */
   readOnly: z.boolean().optional(),
+  /**
+   * Capabilities this gate needs to RUN — names from `capabilities` in the
+   * project config. The writer is graded by this gate, so a writer that cannot
+   * reach these is writing blind and every retry costs a full dispatch to learn
+   * one bit. Declared here because this is where the knowledge already is: you
+   * wrote the command, so you know it needs Docker. A planner does not.
+   */
+  requires: z.array(z.string()).optional(),
 })
 export type GateDef = z.infer<typeof GateDef>
 
@@ -99,7 +107,12 @@ export const RoleBinding = z.object({
   /** Provider-native reasoning effort. Capability discovery decides which
    *  values the installed CLI actually supports for a selected model. */
   effort: z.enum(['low', 'medium', 'high', 'xhigh', 'max']).default('high'),
-  sandbox: z.enum(['read-only', 'workspace-write']).default('read-only'),
+  /**
+   * codex enforces this at the kernel; on the claude lane it is ADVISORY — see
+   * the README. `danger-full-access` is never chosen by Arc on its own: it is
+   * only ever reached by an explicit per-task capability grant.
+   */
+  sandbox: z.enum(['read-only', 'workspace-write', 'danger-full-access']).default('read-only'),
   /** claude only: restrict the toolset. A scout that CAN write will start fixing. */
   tools: z.string().optional(),
   /** Named project variables that this role may receive. Provider auth and
@@ -169,6 +182,26 @@ export const ProjectConfig = z.object({
    *   'refuse' — do not run it; the finding stays unverified and says why
    */
   sandboxPolicy: z.enum(['caveat', 'refuse']).default('caveat'),
+  /**
+   * What a sandboxed writer may need to reach, and how to find out.
+   *
+   *   capabilities:
+   *     docker:
+   *       probe: docker info     # any command; exit 0 means "reachable"
+   *       elevate: true          # may raise a task's sandbox to reach this
+   *
+   * Arc carries NO table of what needs which sandbox — it runs the probe up the
+   * ladder and takes the tightest level that passes. So this self-disables on a
+   * machine where the capability is already reachable, self-corrects when the
+   * provider changes its policy, and can tell "you have not granted it" apart
+   * from "you have not started it".
+   *
+   * `elevate` defaults to false: DEFINING a capability is not GRANTING it.
+   */
+  capabilities: z.record(z.string(), z.object({
+    probe: z.string().min(1),
+    elevate: z.boolean().default(false),
+  })).default({}),
   /**
    * The pre-diff risk phase: the reviewer predicts what will go wrong from the
    * spec and the base tree, BEFORE it is shown the diff. Precommitment is the
@@ -494,6 +527,20 @@ export const PlanTask = z.object({
    * The override exists because without one, operators turn the check off.
    */
   touchesGateSurface: z.string().optional(),
+  /**
+   * Capabilities this task needs for a reason that is NOT one of its gates —
+   * the exception, since gate requirements are derived automatically.
+   *
+   * A request, never a grant: only `capabilities.<name>.elevate` in the project
+   * config permits an elevation, and no trust level collapses the two. A model
+   * can ask for a wider sandbox; it can never give itself one.
+   */
+  needs: z.array(z.object({
+    capability: z.string(),
+    /** Required and non-empty, like touchesGateSurface: an elevation with no
+     *  stated reason is the one that becomes invisible later. */
+    because: z.string().min(1),
+  })).default([]),
   acceptance: z.array(AcceptanceCriterion).min(1),
 })
 export type PlanTask = z.infer<typeof PlanTask>

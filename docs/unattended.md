@@ -149,6 +149,7 @@ closed** on the decisions that matter:
 | A proof already passes at the base commit | **Refused before dispatching.** It cannot tell done from not-done. |
 | A plan names a gate the config does not declare | **Refused before dispatching.** |
 | A task declares no footprint or no contracts | **Refused.** Say `["."]` / `["none"]` and mean it. |
+| A task's gate needs something its sandbox blocks | **Quarantined before dispatch**, with the line to add. Its siblings still run. See below. |
 | A task **adds** tests | Fine — that is what a task is for, and in a test-first repo it is every task. |
 | A task **removes lines from** a test, or touches runner/CI config | **Refused** unless it declares `touchesGateSurface: "why"`. The work is kept on its branch; add the declaration and `arc resume`. |
 | The reviewer requires changes | One repair round, then the task fails. |
@@ -158,6 +159,61 @@ closed** on the decisions that matter:
 Everything refused above is refused **before anything is billed**.
 
 ---
+
+## When the agent cannot reach what it needs
+
+Arc's gates run unsandboxed, so verification always works. The **writer** does
+not — it runs inside codex's sandbox. If a gate needs the Docker socket and the
+sandbox blocks it, the agent is writing code it can never execute, and every
+retry costs a full dispatch to learn one bit.
+
+Arc now finds that out **before spending anything**, for zero tokens, by running
+your probe under the exact policy the writer gets:
+
+```yaml
+# arc.yaml
+capabilities:
+  docker:
+    probe: docker info    # any command; exit 0 means "reachable"
+    elevate: true         # may raise a task's sandbox to reach this
+
+gates:
+  - name: db:test
+    command: npm run db:test
+    proves: RLS denies cross-tenant reads
+    requires: [docker]    # tasks running this gate need it — derived, not declared
+```
+
+There is **no table** of what needs which sandbox. Arc walks the ladder —
+`read-only` → `workspace-write` → `danger-full-access` → unsandboxed — and takes
+the tightest rung that passes. So on a machine where Docker is already reachable
+from `workspace-write`, nothing happens at all; and "you have not granted this"
+is distinguishable from "you have not started Docker", because the unsandboxed
+rung answers that.
+
+**Two keys.** A plan may *request* (`needs: [{capability, because}]` on a task);
+only `arc.yaml` *grants* (`elevate: true`). `--danger` and `--until-done` do not
+grant. A model can ask for a wider sandbox; it can never give itself one.
+
+**Quarantined, not failed.** A task Arc will not run is set aside with the
+reason and the fix. It is never attempted, nothing is wrong with it, and the
+rest of the DAG runs to completion — so six tasks finish while the seventh waits
+for your decision. Grant it and `arc resume`; Arc re-probes and picks it up.
+
+```
+  ✗ R01 QUARANTINED — `docker` needs sandbox "danger-full-access" but the writer
+    runs at "workspace-write", and the project config does not permit elevating
+    for it.
+      Add to arc.yaml, then `arc resume`:
+        capabilities:
+          docker:
+            probe: docker info
+            elevate: true
+```
+
+An elevated task is named in the run log and in the report every time. On the
+claude lane there is no OS sandbox to widen, so a grant means nothing and Arc
+reports N/A rather than implying parity.
 
 ## What it costs
 
