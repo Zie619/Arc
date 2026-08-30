@@ -283,12 +283,16 @@ export const SCENARIOS: Scenario[] = [
         { name: 'needs-docker', command: 'true', proves: 'nothing', requires: ['docker'] },
         { name: 'always-green', command: 'true', proves: 'nothing, it is a fixture' },
       ],
-      capabilities: { docker: { probe: 'docker info', elevate: true } },
+      // NOT a real `docker info`: the fixture runs the command for real once the
+      // rung is high enough, so a real probe would make this scenario depend on
+      // a Docker daemon. CI has none, and it quarantined instead of elevating —
+      // caught by the bench, which is the whole point of the bench being hermetic.
+      capabilities: { docker: { probe: 'echo arc-cap-docker', elevate: true } },
     },
     env: {
       ARC_FAKE_WRITE: 'auto', ARC_FAKE_PAYLOAD: DONE_PAYLOAD,
-      // The fixture's ladder: docker only answers at the top rung.
-      ARC_FAKE_CAP_LEVEL: 'docker info=danger-full-access',
+      // The fixture's ladder: this probe only answers at the top rung.
+      ARC_FAKE_CAP_LEVEL: 'arc-cap-docker=danger-full-access',
     },
     // alpha runs elevated and is NAMED for it; beta is untouched.
     expect: {
