@@ -12,6 +12,11 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
+    # A job that can wedge indefinitely is a job you cannot diagnose: GitHub
+    # serves no logs for a step still in progress, so an hour of "in_progress"
+    # tells you strictly nothing. Bounded, it fails with output instead.
+    # macOS finishes in ~4 minutes and a local Linux container in ~7.
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
       - uses: pnpm/action-setup@v4
@@ -21,7 +26,10 @@ jobs:
           cache: pnpm
       - run: pnpm install --frozen-lockfile
       - run: pnpm typecheck
-      - run: pnpm test
-      # Arc grading Arc: 12 scenarios, seven of them attacks that must fail.
+      # `--reporter=basic` so a wedged run leaves a trail: the default reporter
+      # rewrites one line in place, which is unreadable in a log and useless
+      # after a cancellation.
+      - run: pnpm test -- --reporter=basic
+      # Arc grading Arc: 19 scenarios, most of them attacks that must fail.
       # Zero tokens, seconds to run, non-zero exit when an invariant slips.
       - run: pnpm bench
