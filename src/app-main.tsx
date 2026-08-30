@@ -7,6 +7,8 @@ import { Store } from './store.ts'
 import { ProjectConfig } from './types.ts'
 import { detectProject, findRepos, NoRepoHere } from './autoconfig.ts'
 import { App, RepoPicker } from './app.tsx'
+import { rememberedRepo, rememberRepo, tilde } from './repo-choice.ts'
+
 
 function main(): void {
   const argv = process.argv.slice(2)
@@ -44,8 +46,27 @@ function main(): void {
     launch(detectProject(process.cwd(), repoOverride).config)
   } catch (e) {
     if (e instanceof NoRepoHere && e.candidates.length > 0) {
+      // You are standing in a folder that HOLDS repos but is not one. Arc has
+      // nothing to branch from here, so it does have to know which you meant —
+      // but it should only ask when that is genuinely a question.
+      const only = e.candidates.length === 1 ? e.candidates[0]! : null
+      if (only) {
+        console.log(`using ${tilde(only)} — the only repo in ${tilde(process.cwd())}`)
+        launch(detectProject(only).config)
+        return
+      }
+      const remembered = rememberedRepo(process.cwd())
+      if (remembered && e.candidates.includes(remembered)) {
+        console.log(`using ${tilde(remembered)} — your last choice here (arc --repo <path> to change)`)
+        launch(detectProject(remembered).config)
+        return
+      }
       const picker = render(
-        <RepoPicker candidates={e.candidates} onPick={(repo) => { picker.unmount(); launch(detectProject(repo).config) }} />,
+        <RepoPicker candidates={e.candidates} onPick={(repo) => {
+          picker.unmount()
+          rememberRepo(process.cwd(), repo)
+          launch(detectProject(repo).config)
+        }} />,
       )
       return
     }

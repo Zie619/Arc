@@ -65,8 +65,10 @@ describe('the compose screen', () => {
     expect(text).toContain('what do you want done?')
     expect(text).toContain(repo)
     expect(text).toContain('checks: test')   // detected from package.json
-    // "planned": the workflow rows are a declaration, not the executing state.
-    expect(text).toContain('thread: New thread · chat · 1 planned stage')
+    // The banner carries only what CANNOT change — it is printed once into
+    // scrollback. The thread can change mid-session, so it lives in the live
+    // footer, which is also where it always was.
+    expect(text).toContain('New thread')
     expect(text).toContain('enter to send')
     expect(text).not.toContain('exact usage')
     expect(text).not.toContain('$')

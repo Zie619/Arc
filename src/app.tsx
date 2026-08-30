@@ -154,19 +154,35 @@ function closeStep(timeline: Timeline, now: number): Timeline {
  * above the live region once and leaves them in the terminal's normal buffer.
  * The spinner and its details remain repaintable below them.
  */
+/** Reserved id for the one-shot header. Real entries are non-negative. */
+const BANNER_ID = -1
+type StaticItem = HistoryEntry | { id: typeof BANNER_ID }
+
 export function Transcript({
-  entries, liveStep, width, spin = '·', now = Date.now(),
+  entries, liveStep, width, spin = '·', now = Date.now(), banner,
 }: {
   entries: HistoryEntry[]
   liveStep: StepTurn | null
   width: number
   spin?: string
   now?: number
+  /** Printed ONCE, into scrollback, as the first Static item.
+   *
+   *  It used to live in the live-redraw tree inside a height-pinned Box, so
+   *  every repaint had to fit banner + body + composer into the terminal — and
+   *  when it did not, the top of the banner was pushed off screen and resizing
+   *  did not bring it back. Static is where a thing that never changes belongs;
+   *  it also means the banner stays visible above the transcript instead of
+   *  vanishing the moment the first turn lands. */
+  banner?: React.ReactNode
 }) {
+  const items: StaticItem[] = banner ? [{ id: BANNER_ID }, ...entries] : entries
   return (
     <>
-      <Static items={entries}>
-        {(entry) => <TurnView key={entry.id} entry={entry} width={width} />}
+      <Static items={items}>
+        {(entry) => entry.id === BANNER_ID
+          ? <Box key={BANNER_ID}>{banner}</Box>
+          : <TurnView key={entry.id} entry={entry as HistoryEntry} width={width} />}
       </Static>
       {liveStep && <TurnView entry={liveStep} width={width} live spin={spin} now={now} />}
     </>
@@ -1380,16 +1396,21 @@ export function App({ store, config, danger, initialBrief, version = '0.2.0' }: 
   const thread = service.threadView(threadId)
   const workflowStages = thread ? service.workflowFor(threadId).steps.length : 0
 
+  // Three rows beside the three-row mark. It was five, which is taller than
+  // Claude Code's own header and left less room for the thing you came to read.
   const Banner = () => (
     <Box paddingX={1} marginBottom={1}>
       <ArcLogo />
       <Box flexDirection="column" marginLeft={2}>
-        <Text><Text bold>arc</Text><Text color="gray"> v{version}</Text></Text>
-        <Text color="gray">
-          <Text color={theme.sol}>Sol</Text> writes · <Text color={theme.opus}>Opus</Text> reviews
+        <Text>
+          <Text bold>arc</Text><Text color="gray"> v{version} · </Text>
+          <Text color={theme.sol}>Sol</Text><Text color="gray"> writes · </Text>
+          <Text color={theme.opus}>Opus</Text><Text color="gray"> reviews</Text>
         </Text>
         <Text color="gray">{middleTruncate(tilde(config.repo), Math.max(20, width - 24))}{branch ? ` · ${branch}` : ''}</Text>
-        <ThreadStatus title={thread?.title ?? threadId} lane={thread?.lane ?? 'chat'} stages={workflowStages} />
+        {/* Only what CANNOT change: this is printed once and lives in
+            scrollback. The thread can change mid-session, so it belongs in the
+            live footer — where it already was, and where it was duplicated. */}
         {config.gates.length === 0
           ? <Text color="yellow">⚠ nothing here can check the work — no test or build script</Text>
           : <Text color="gray">checks: {config.gates.map((g) => g.name).join(' · ')}</Text>}
@@ -1401,10 +1422,23 @@ export function App({ store, config, danger, initialBrief, version = '0.2.0' }: 
   // Static when a question opens would print the entire history a second time.
   const empty = timeline.completed.length === 0 && !timeline.liveStep
   const pinCompose = mode === 'compose' && empty && rows !== undefined
+  // The banner is printed ONCE, into scrollback, ABOVE this box — so the box
+  // cannot also claim the whole screen or the two together overflow and push
+  // the banner off the top. That was the bug: resizing never helped, because
+  // the sum was always one banner taller than the terminal.
+  // `empty` is false the moment anything happens, and by then the banner has
+  // scrolled away on its own, so this only ever applies while it is on screen.
+  const BANNER_ROWS = 4
   return (
-    <Box flexDirection="column" width={width} height={pinCompose ? Math.max(rows - 1, 1) : undefined}>
-      {mode === 'compose' && empty && <Banner />}
-      <Transcript entries={timeline.completed} liveStep={timeline.liveStep} width={width} spin={spin} />
+    <Box
+      flexDirection="column"
+      width={width}
+      height={pinCompose ? Math.max(rows - 1 - BANNER_ROWS, 1) : undefined}
+    >
+      <Transcript
+        entries={timeline.completed} liveStep={timeline.liveStep} width={width} spin={spin}
+        banner={<Banner />}
+      />
 
       {mode === 'question' && question && (
         <QuestionPanel
