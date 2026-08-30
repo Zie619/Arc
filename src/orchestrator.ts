@@ -11,6 +11,7 @@ import { runGate, selectGates, isSubsetOfBaseline, describe, testsVanished, matc
 import { checkReviewFinding, type FindingOutcome } from './finding-check.ts'
 import { assembleDiff, changedFiles } from './diff.ts'
 import { dryRunProofs } from './dry-run.ts'
+import { scanContracts, contractDrift, type ContractScan } from './contracts.ts'
 import {
   probeCapability, probeUnsandboxedOnly, describeReachability, atLeast, looser,
   type CapabilityProbe, type SandboxLevel,
@@ -43,6 +44,9 @@ export interface RunOptions {
   /** Per-task sandbox elevations resolved at preflight. Set by runArc; callers
    *  never populate it. */
   elevations?: Map<string, SandboxLevel>
+  /** The arc's base contract surface, scanned once and reused by every task
+   *  because they all branch from the same sha. Populated lazily by runArc. */
+  baseContractScan?: ContractScan
   /** Proceed with no gates. Explicit only: a gate-less arc proves nothing, so
    *  it must be something the operator SAID, never something inferred. */
   allowNoGates?: boolean
@@ -855,6 +859,20 @@ async function runTask(
     // then found to be false, and then ignored. Re-check the MEASURED footprint
     // against what is still in flight before landing, and serialise on a real
     // collision instead of merging into it.
+    // An undeclared contract change that collides with a task still in flight is
+    // the exact hazard: the scheduler let them run together on the strength of
+    // declarations that turned out to be wrong. A merely-undeclared change is a
+    // finding; a colliding one does not land.
+    const contractCollision = undeclaredContractCollision(o, task)
+    if (contractCollision.length > 0) {
+      log(`  ✗ ${task.id}: changed ${contractCollision.join(', ')} — contracts an in-flight task declared. Not landing into a collision.`)
+      store.addFinding({ arcId, taskId: task.id, kind: 'risk', severity: 'high',
+        text: `undeclared contract change collides with an in-flight task: ${contractCollision.join(', ')}`,
+        affects: contractCollision })
+      store.setTaskState(arcId, task.id, 'failed')
+      return
+    }
+
     const drifted = driftedIntoInflight(o, task)
     if (drifted.length > 0) {
       log(`  ✗ ${task.id}: touched ${drifted.join(', ')} — files an in-flight task declared. Not landing into a collision.`)
@@ -1210,6 +1228,21 @@ async function implementLoop(
             affects: undeclared })
           log(`  ! footprint drift: ${undeclared.length} undeclared file(s)`)
         }
+      }
+
+      // Contracts, measured against the real declarations rather than trusted.
+      const contracts = undeclaredContracts(o, task, wt, measured)
+      if (contracts.unmeasured) {
+        log(`  ! ${task.id}: contracts UNMEASURED — ${contracts.unmeasured}`)
+        store.addFinding({ arcId, taskId: task.id, attemptId, kind: 'risk', severity: 'low',
+          text: `exported contracts could not be measured: ${contracts.unmeasured}` })
+      }
+      if (contracts.undeclared.length > 0) {
+        log(`  ! ${task.id}: changed ${contracts.undeclared.length} exported signature(s) it never declared: ${contracts.undeclared.slice(0, 5).join(', ')}`)
+        store.addFinding({ arcId, taskId: task.id, attemptId, kind: 'risk', severity: 'high',
+          text: `changed exported contracts without declaring them: ${contracts.undeclared.slice(0, 8).join(', ')}`
+            + ' — the scheduler used contractsMutated to decide this task could run alongside others',
+          affects: contracts.undeclared })
       }
 
       const protectedTouched = protectedSurfaceTouched(o, measured, wt)
@@ -1587,6 +1620,84 @@ function capabilityLost(o: RunOptions, failedGateNames: string[]): string | null
     }
   }
   return null
+}
+
+/**
+ * Contracts, MEASURED — the half the mechanism never had.
+ *
+ * `computeFrontier` refuses to run two tasks that declare the same
+ * `contractsMutated`, which is the answer to the failure per-branch CI is green
+ * against by construction: two branches can each be green and still land
+ * contradictory versions of one exported signature. Footprints were declared and
+ * then measured against the real diff; contracts were declared and measured by
+ * nothing at all, so two tasks that both simply forgot were invisible.
+ *
+ * The base scan is cached for the whole arc: every task branches from the same
+ * base sha, so scanning it once and reusing it turns an expensive check into a
+ * cheap one. An unsupported scan (no tsconfig, tsc unreachable) yields null and
+ * is reported as unmeasured — never as "no drift".
+ */
+function baseContracts(o: RunOptions, baseSha: string): ContractScan {
+  if (!o.baseContractScan) {
+    const workspace = `${o.plan.arcId}-contracts`
+    G.releaseTaskWorkspace(o.config.repo, o.store.root, workspace)
+    try {
+      const tree = G.provisionWorktree(o.config.repo, o.store.root, workspace, baseSha)
+      try { o.baseContractScan = scanContracts(tree.path) }
+      finally { G.releaseTaskWorkspace(o.config.repo, o.store.root, workspace) }
+    } catch (error) {
+      o.baseContractScan = { supported: false, why: `base tree unavailable: ${(error as Error).message}` }
+    }
+  }
+  return o.baseContractScan
+}
+
+/** Exported symbols this task changed that it never declared. */
+function undeclaredContracts(o: RunOptions, task: PlanTask, wt: G.Worktree, measured: string[]): {
+  undeclared: string[]
+  unmeasured?: string
+} {
+  // Emitting declarations twice is not cheap, so only pay for it when the task
+  // actually touched TypeScript.
+  if (!measured.some((file) => /\.tsx?$/.test(file))) return { undeclared: [] }
+
+  const before = baseContracts(o, wt.baseSha)
+  const after = scanContracts(wt.path)
+  const drift = contractDrift(before, after)
+  if (!drift) {
+    const why = before.supported === false ? before.why : (after as { why: string }).why
+    return { undeclared: [], unmeasured: why }
+  }
+  const declared = new Set(task.contractsMutated)
+  // `added` is not drift a sibling can collide with — a new export contradicts
+  // nothing that already existed. Changed and removed are the hazard.
+  return {
+    undeclared: [...drift.changed, ...drift.removed].filter((name) => !declared.has(name)),
+  }
+}
+
+/**
+ * Undeclared contract changes that a task still in flight DID declare.
+ *
+ * Findings are recorded for every undeclared change; only this subset blocks,
+ * because only this subset is the failure the serialisation rule exists to stop.
+ * Read from the finding already written at gate time so the expensive scan runs
+ * once per task, not again at land.
+ */
+function undeclaredContractCollision(o: RunOptions, task: PlanTask): string[] {
+  const finding = o.store.findingsFor(o.plan.arcId).find((f) =>
+    f.task_id === task.id && String(f.text).startsWith('changed exported contracts without declaring them'))
+  if (!finding) return []
+  const undeclared = JSON.parse(String(finding.affects ?? '[]')) as string[]
+  if (undeclared.length === 0) return []
+
+  const inflight = o.store.allTasks(o.plan.arcId)
+    .filter((t) => t.id !== task.id && ['running', 'reviewing', 'landing'].includes(String(t.state)))
+    .map((t) => String(t.id))
+  const claimed = new Set(
+    o.plan.tasks.filter((t) => inflight.includes(t.id)).flatMap((t) => t.contractsMutated),
+  )
+  return undeclared.filter((name) => claimed.has(name))
 }
 
 async function runTaskGates(

@@ -253,8 +253,11 @@ so ten relaunches do not multiply them.
   finding is then kept and marked unverified rather than silently dropped.
 - **Seatbelt refuses to nest**, so the same is true when Arc itself runs inside
   a sandboxed agent session. Arc probes for this once and says so.
-- **Contracts are an honour system.** Footprints are measured against the real
-  diff; contracts are not. Two tasks that both fail to declare a shared contract
-  can still land contradictory signatures.
+- **Contracts are measured on TypeScript, and declared everywhere else.** Arc
+  emits declarations at the base commit and at the task's head and diffs the
+  exported symbols, so a signature changed without being declared is a
+  high-severity finding — and refuses to land if it collides with a task still
+  in flight. Where the scan cannot run (no tsconfig, tsc unreachable) it says
+  UNMEASURED rather than reporting no drift.
 - **A notifier is best-effort.** If it fails, you will not hear about the arc —
   check `arc digest` on a schedule if the run matters.

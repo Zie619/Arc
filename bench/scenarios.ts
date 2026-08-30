@@ -301,6 +301,39 @@ export const SCENARIOS: Scenario[] = [
     },
   },
   {
+    id: 'adv-undeclared-contract',
+    defends: 'ATTACK: an exported signature changed but never declared is caught by MEASUREMENT',
+    // contractsMutated was 100% honour system: declared, and verified by
+    // nothing. Two tasks that both simply forget land contradictory signatures,
+    // and per-branch CI is green against that class by construction.
+    seed: {
+      'tsconfig.json': JSON.stringify({
+        compilerOptions: { target: 'ES2022', module: 'ESNext', moduleResolution: 'bundler', strict: true },
+        include: ['src'],
+      }, null, 2),
+      'src/api.ts': 'export function greet(name: string): string {\n  return `hi ${name}`\n}\n',
+    },
+    plan: plan('bench-contract-drift', [{
+      id: 'alpha',
+      footprint: ['src/api.ts'],
+      contractsMutated: ['none'],   // says it changes nothing shared — and lies
+    }]),
+    env: {
+      ARC_FAKE_WRITE: 'src/api.ts',
+      ARC_FAKE_PAYLOAD: DONE_PAYLOAD,
+    },
+    // It LANDS, and that is deliberate: an undeclared change is real work with a
+    // wrong declaration, and blocking every one of them would be harsh given
+    // that a task mid-rewrite can degrade a type to `any`. The finding is the
+    // product here. Only an undeclared change that COLLIDES with a task still
+    // in flight refuses to land, because only that is the failure the
+    // serialisation rule exists to stop.
+    expect: {
+      arcStatus: 'done', landed: 1,
+      logContains: ['exported signature(s) it never declared', 'greet'],
+    },
+  },
+  {
     id: 'adv-unknown-gate',
     defends: 'a plan that does not fit the config is refused BEFORE anything is billed',
     plan: plan('bench-unknown', [{ id: 'alpha', gates: ['no-such-gate'] }]),
