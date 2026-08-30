@@ -8,7 +8,7 @@ import { join, resolve } from 'node:path'
 import { realpathSync, readFileSync, readdirSync } from 'node:fs'
 import {
   App, RepoPicker, AgentList, ApprovalPanel, QuestionPanel, Transcript, deriveArcId,
-  resolveQuestionChoice, type HistoryEntry, type StepTurn,
+  resolveQuestionChoice, useTimeline, type HistoryEntry, type StepTurn,
 } from '../src/app.tsx'
 import { Store } from '../src/store.ts'
 import { detectProject } from '../src/autoconfig.ts'
@@ -155,6 +155,40 @@ describe('the compose screen', () => {
       app.unmount()
     }
     store.close()
+  })
+})
+
+describe('coalescing the provider event stream', () => {
+  it('a burst of stream lines costs a handful of frames, not one per line', async () => {
+    const out = fakeStdout(80)
+    let frames = 0
+    let api: { step: (t: string) => void; detail: (l: string) => void } | null = null
+
+    function Probe() {
+      frames++
+      const { timeline, step, detail } = useTimeline()
+      React.useEffect(() => { api = { step, detail } }, [step, detail])
+      return <Text>{(timeline.liveStep?.detail ?? []).join(' | ')}</Text>
+    }
+
+    const app = render(<Probe />, { stdout: out.stream, exitOnCtrlC: false, patchConsole: false })
+    await tick()
+    const before = frames
+
+    api!.step('streaming')
+    // Every provider event arrives on its own I/O turn, which is exactly what
+    // React cannot batch for us — one setState each was one repaint each, for
+    // as long as the tool kept printing. Counting the last frame would not
+    // catch that coming back; counting frames is the whole point of the test.
+    for (let i = 0; i < 200; i++) {
+      api!.detail(`event ${i}`)
+      await new Promise((r) => setImmediate(r))
+    }
+    await new Promise((r) => setTimeout(r, 250))
+
+    expect(frames - before).toBeLessThan(20)
+    expect(out.text()).toContain('event 199')
+    app.unmount()
   })
 })
 

@@ -18,6 +18,8 @@ import { createInterface } from 'node:readline/promises'
 import { doctorProviders } from './provider-runtime.ts'
 import { formatCostSummary } from './cost.ts'
 import { buildDigest } from './digest.ts'
+import { describeConfig } from './config-report.ts'
+import { explainFailure } from './why.ts'
 
 const C = {
   dim: (s: string) => `\x1b[2m${s}\x1b[0m`,
@@ -314,6 +316,8 @@ ${C.bold('Plumbing — arc "..." already runs all of these for you:')}
   arc diff <arcA> <arcB>            compare two runs: attempts, tokens, tiers, wall clock
   arc flaky                         gates that gave different answers on the same commit
   arc digest [--since last-seen]    what happened while you were away, and what needs you
+  arc config                        every effective setting, where it came from, and the gaps
+  arc why <taskId>                  why one task failed — stuck or thrashing, and the real error
 
 Options:
   --danger        no approval stops: take every recommendation, run the plan
@@ -328,7 +332,7 @@ const SUBCOMMANDS = new Set([
   'interview', 'scout', 'plan', 'validate', 'run', 'resume', 'clean', 'status',
   'ui', 'watch', 'criteria', 'findings', 'show', 'init', 'go', 'cost',
   'setup-terminal', 'keys',
-  'doctor', 'bench', 'diff', 'flaky', 'digest',
+  'doctor', 'bench', 'diff', 'flaky', 'digest', 'config', 'why',
 ])
 
 async function main(): Promise<void> {
@@ -728,6 +732,26 @@ async function main(): Promise<void> {
         }
         console.log(C.dim(''))
         console.log(C.dim('  A genuinely broken gate looks flaky for a while. This surfaces them; it never suppresses one.'))
+        break
+      }
+
+      case 'config': {
+        // "Why is it doing that?" used to mean reading three files and knowing
+        // the precedence rules. Provenance turns it into a glance.
+        const ri = argv.indexOf('--repo')
+        const detected = detectProject(process.cwd(), ri >= 0 ? resolve(argv[ri + 1]!) : undefined)
+        for (const line of describeConfig(detected.config, detected.source, detected.notes)) {
+          console.log(line.startsWith('!') ? C.yellow(line) : line)
+        }
+        break
+      }
+
+      case 'why': {
+        const taskId = positional[0]
+        if (!taskId) die('usage: arc why <taskId> [arcId]')
+        const arcId = positional[1] ?? store.latestArcId()
+        if (!arcId) die('no arcs yet')
+        for (const line of explainFailure(store, arcId, taskId)) console.log(line)
         break
       }
 

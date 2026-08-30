@@ -149,6 +149,67 @@ function closeStep(timeline: Timeline, now: number): Timeline {
   }
 }
 
+/** Long enough to collapse a provider's event storm into one repaint, short
+ *  enough that the live region still reads as live. */
+const TIMELINE_FLUSH_MS = 100
+
+/**
+ * The transcript, with the writers a provider drives coalesced.
+ *
+ * describeEvent turns every provider event into a detail line, and a chatty
+ * codex run emits many a second — each one used to be its own setState, so a
+ * walk-away six-hour run repainted the whole tree tens of thousands of times
+ * for a laptop nobody was watching. Buffered edits are applied together on a
+ * timer. Everything that ENDS a beat — a message, a closed step — drains the
+ * buffer first, so the order is still what happened and the tail of a run is
+ * never lost.
+ */
+export function useTimeline() {
+  const [timeline, setTimeline] = useState<Timeline>(emptyTimeline)
+  const pending = useRef<Array<(t: Timeline) => Timeline>>([])
+  const timer = useRef<ReturnType<typeof setTimeout> | null>(null)
+
+  const flush = useCallback(() => {
+    if (timer.current) { clearTimeout(timer.current); timer.current = null }
+    if (pending.current.length === 0) return
+    const edits = pending.current
+    pending.current = []
+    setTimeline((t) => edits.reduce((acc, edit) => edit(acc), t))
+  }, [])
+
+  const buffer = useCallback((edit: (t: Timeline) => Timeline) => {
+    pending.current.push(edit)
+    timer.current ??= setTimeout(flush, TIMELINE_FLUSH_MS)
+  }, [flush])
+
+  /** Start a step; the previous one is closed with how long it took. */
+  const step = useCallback((text: string) => {
+    buffer((t) => startStep(t, text, Date.now()))
+  }, [buffer])
+
+  const detail = useCallback((line: string) => {
+    buffer((t) => t.liveStep
+      ? { ...t, liveStep: { ...t.liveStep, detail: [...t.liveStep.detail.slice(-3), line] } }
+      : t)
+  }, [buffer])
+
+  const append = useCallback((entry: EntryWithoutId) => {
+    pending.current.push((t) => appendEntry(t, entry))
+    flush()
+  }, [flush])
+
+  const closeSteps = useCallback(() => {
+    const now = Date.now()
+    pending.current.push((t) => closeStep(t, now))
+    flush()
+  }, [flush])
+
+  // Whatever is still buffered when this goes away is the tail of the run.
+  useEffect(() => flush, [flush])
+
+  return { timeline, step, detail, append, closeSteps }
+}
+
 /**
  * Completed entries go through Ink's static-output channel, which writes them
  * above the live region once and leaves them in the terminal's normal buffer.
@@ -811,7 +872,7 @@ export function App({ store, config, danger, initialBrief, version = '0.2.0' }: 
   })
 
   const [mode, setMode] = useState<Mode>('compose')
-  const [timeline, setTimeline] = useState<Timeline>(emptyTimeline)
+  const { timeline, step, detail, append: appendTimeline, closeSteps } = useTimeline()
   const [question, setQuestion] = useState<PendingQuestion | null>(null)
   const [plan, setPlan] = useState<Plan | null>(null)
   const [approve, setApprove] = useState<((ok: boolean) => void) | null>(null)
@@ -853,39 +914,23 @@ export function App({ store, config, danger, initialBrief, version = '0.2.0' }: 
   useEffect(() => () => { if (exitTimer.current) clearTimeout(exitTimer.current) }, [])
 
   const say = useCallback((kind: 'you' | 'arc', text: string) => {
-    setTimeline((p) => appendEntry(p, { kind, text }))
+    appendTimeline({ kind, text })
     try { service.appendMessage(threadId, kind === 'you' ? 'user' : 'assistant', text) } catch { /* paint still wins */ }
-  }, [service, threadId])
+  }, [appendTimeline, service, threadId])
 
   /** Local command output is terminal history, not conversation context. */
   const localSay = useCallback((kind: 'you' | 'arc', text: string) => {
-    setTimeline((p) => appendEntry(p, { kind, text }))
-  }, [])
-
-  /** Start a step; the previous one is closed with how long it took. */
-  const step = useCallback((text: string) => {
-    setTimeline((p) => startStep(p, text, Date.now()))
-  }, [])
-
-  const detail = useCallback((line: string) => {
-    setTimeline((p) => p.liveStep ? {
-      ...p,
-      liveStep: { ...p.liveStep, detail: [...p.liveStep.detail.slice(-3), line] },
-    } : p)
-  }, [])
-
-  const closeSteps = useCallback(() => {
-    setTimeline((p) => closeStep(p, Date.now()))
-  }, [])
+    appendTimeline({ kind, text })
+  }, [appendTimeline])
 
   const archiveQuestion = useCallback((q: Pick<PendingQuestion, 'text' | 'recommendation'>, rawAnswer: string) => {
     const answer = rawAnswer.trim().length > 0 ? rawAnswer.trim() : q.recommendation
-    setTimeline((p) => appendEntry(p, { kind: 'question', question: q.text, answer }))
-  }, [])
+    appendTimeline({ kind: 'question', question: q.text, answer })
+  }, [appendTimeline])
 
   const archivePlan = useCallback((p: Plan, decision: PlanTurn['decision']) => {
-    setTimeline((t) => appendEntry(t, { kind: 'plan', plan: p, decision }))
-  }, [])
+    appendTimeline({ kind: 'plan', plan: p, decision })
+  }, [appendTimeline])
 
   /** Paint a yes/no stop and wait. The decision lands in terminal history. */
   const askConfirm = useCallback((title: string, lines: string[] = []) =>
@@ -895,11 +940,11 @@ export function App({ store, config, danger, initialBrief, version = '0.2.0' }: 
     }), [])
 
   const archiveProduct = useCallback((result: TaskProduct) => {
-    setTimeline((t) => appendEntry(t, {
+    appendTimeline({
       kind: 'product', taskId: result.taskId, shipped: result.shipped,
       noop: result.noop, noopReason: result.noopReason,
-    }))
-  }, [])
+    })
+  }, [appendTimeline])
 
   const submit = useCallback((text: string) => {
     if (busy.current || text.trim().length === 0) return

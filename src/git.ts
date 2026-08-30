@@ -413,6 +413,25 @@ export function stampTaskTrailers(wt: string, baseSha: string, arcId: string, ta
     `--trailer=Arc-Arc=${arcId}`,
     `--trailer=Arc-Model=${model}`,
   ]
+  // `--exec` puts git into its sequencer, which consults GIT_SEQUENCE_EDITOR.
+  // Arc runs unattended: a git command that can reach for an editor is a git
+  // command that can stall a six-hour run on a machine we never tested on.
+  // stdin is already 'ignore', so this is belt and braces — and cheap.
+  const priorSeq = process.env.GIT_SEQUENCE_EDITOR
+  const priorEditor = process.env.GIT_EDITOR
+  process.env.GIT_SEQUENCE_EDITOR = 'true'
+  process.env.GIT_EDITOR = 'true'
+  try {
+    return stampWithTrailers(wt, baseSha, trailers)
+  } finally {
+    if (priorSeq === undefined) delete process.env.GIT_SEQUENCE_EDITOR
+    else process.env.GIT_SEQUENCE_EDITOR = priorSeq
+    if (priorEditor === undefined) delete process.env.GIT_EDITOR
+    else process.env.GIT_EDITOR = priorEditor
+  }
+}
+
+function stampWithTrailers(wt: string, baseSha: string, trailers: string[]): boolean {
   return gitOk(wt, 'rebase', baseSha, '--exec',
     `git commit --amend --no-edit ${trailers.map((t) => `'${t}'`).join(' ')}`)
 }

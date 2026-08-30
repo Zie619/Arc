@@ -173,6 +173,7 @@ const MIGRATIONS: string[] = [
      command TEXT NOT NULL,
      exit_code INTEGER,
      verdict TEXT NOT NULL,
+     caveat TEXT,
      created_at INTEGER NOT NULL,
      PRIMARY KEY (finding_id, artifact_id)
    )`,
@@ -349,6 +350,7 @@ export class Store {
     // Where `arc digest --since last-seen` resumes from. What makes a digest
     // useful on the SECOND return rather than only the first.
     this.ensureColumn('arc', 'last_seen_seq', 'INTEGER')
+    this.ensureColumn('finding_evidence', 'caveat', 'TEXT')
     this.ensureColumn('arc', 'lease_owner', 'TEXT')
     this.ensureColumn('arc', 'lease_expires_at', 'INTEGER')
   }
@@ -1308,11 +1310,17 @@ export class Store {
     verdict: 'pass' | 'fail' | 'inconclusive'
     caveat?: string
   }): void {
+    // The caveat gets its OWN column. Concatenating it into `verdict` corrupted
+    // the one column whose entire job is to hold one of three known values —
+    // and it only ever showed on Linux, where there is no seatbelt sandbox, so
+    // every check carries a caveat and every verdict came back as
+    // `pass (ran without an OS write sandbox…)`. Invisible on the machine it
+    // was written on, which is the whole reason CI runs two platforms.
     this.db.prepare(
-      `INSERT INTO finding_evidence (finding_id, artifact_id, command, exit_code, verdict, created_at)
-       VALUES (?, ?, ?, ?, ?, ?)`,
+      `INSERT INTO finding_evidence (finding_id, artifact_id, command, exit_code, verdict, caveat, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`,
     ).run(findingId, evidence.artifactId, evidence.command, evidence.exitCode,
-          evidence.caveat ? `${evidence.verdict} (${evidence.caveat})` : evidence.verdict, Date.now())
+          evidence.verdict, evidence.caveat ?? null, Date.now())
   }
 
   evidenceForFinding(findingId: string): Array<Record<string, any>> {

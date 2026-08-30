@@ -10,6 +10,16 @@ import { App, RepoPicker } from './app.tsx'
 import { rememberedRepo, rememberRepo, tilde } from './repo-choice.ts'
 
 
+/**
+ * This sits unattended for hours while an agent prints, so a repaint is CPU is
+ * battery is fan noise. Incremental rendering rewrites only the lines that
+ * changed instead of the whole frame, and 10fps is still smooth for a spinner.
+ *
+ * Deliberately NOT alternateScreen: it would hide the run's own scrollback,
+ * which is the only record of what happened while nobody was watching.
+ */
+const RENDER_OPTIONS = { incrementalRendering: true, maxFps: 10 }
+
 function main(): void {
   const argv = process.argv.slice(2)
   const ci = argv.indexOf('--config')
@@ -32,7 +42,7 @@ function main(): void {
   const launch = (config: ProjectConfig) => {
     const root = process.env.ARC_HOME ?? join(process.env.HOME ?? '.', '.arc', config.name)
     const store = new Store(root)
-    const app = render(<App store={store} config={config} danger={danger} initialBrief={initialBrief} />)
+    const app = render(<App store={store} config={config} danger={danger} initialBrief={initialBrief} />, RENDER_OPTIONS)
     app.waitUntilExit().then(() => store.close())
   }
 
@@ -67,6 +77,7 @@ function main(): void {
           rememberRepo(process.cwd(), repo)
           launch(detectProject(repo).config)
         }} />,
+        RENDER_OPTIONS,
       )
       return
     }
