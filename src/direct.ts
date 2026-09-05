@@ -8,6 +8,7 @@ import { git, headSha } from './git.ts'
 import { describe, isSubsetOfBaseline, runGate, selectGates, type GateResult } from './gates.ts'
 import { checkReviewFinding, type FindingOutcome } from './finding-check.ts'
 import { signaturesMatch } from './classify.ts'
+import { acquire, release } from './checkout-lock.ts'
 import {
   RiskChecklist,
   ReviewVerdict,
@@ -148,7 +149,7 @@ export interface DirectRunOptions {
 export interface DirectDependencies {
   dispatch: (options: DispatchOptions) => Promise<DispatchResult>
   runGate: (
-    gate: Parameters<typeof runGate>[0], cwd: string, baseSha: string, signal?: AbortSignal,
+    gate: Parameters<typeof runGate>[0], cwd: string, baseSha: string, signal?: AbortSignal, options?: Parameters<typeof runGate>[4],
   ) => GateResult | Promise<GateResult>
 }
 
@@ -434,6 +435,23 @@ export async function runDirect(
   dependencies: DirectDependencies = DEFAULT_DEPENDENCIES,
 ): Promise<DirectRunResult> {
   const repo = options.config.repo
+  const holder = acquire(repo)
+  if (holder) {
+    const before = captureDirectSnapshot(repo)
+    return checkpointResult(repo, before, { gates: [], findingChecks: [], transcripts: [],
+      ok: false, status: 'refused',
+      reason: `Another session is editing this checkout — pid ${holder.pid} on ${holder.hostname}. Wait or use the deep lane.`,
+    })
+  }
+  try { return await runDirectOwned(options, dependencies) }
+  finally { release(repo) }
+}
+
+async function runDirectOwned(
+  options: DirectRunOptions,
+  dependencies: DirectDependencies,
+): Promise<DirectRunResult> {
+  const repo = options.config.repo
   const transcripts: DirectTranscript[] = []
   const gates: Array<{ ok: boolean; result: GateResult }> = []
   const findingChecks: DirectFindingCheck[] = []
@@ -528,7 +546,7 @@ async function runDirectFrom(
   // blamed on the direct task without creating or switching worktrees.
   const baselines = new Map<string, GateResult>()
   for (const gate of config.gates.filter(gate => gate.baselineSubset)) {
-    const result = await dependencies.runGate(gate, repo, before.head, options.signal)
+    const result = await dependencies.runGate(gate, repo, before.head, options.signal, { sandboxPolicy: options.config.sandboxPolicy })
     baselines.set(gate.name, result)
     log(`baseline ${describe(result)}`)
   }
@@ -666,7 +684,7 @@ async function runDirectFrom(
     // would otherwise mark a now-green checkout as failed.
     gates.length = 0
     for (const gate of selectedGates) {
-      const result = await dependencies.runGate(gate, repo, before.head, options.signal)
+      const result = await dependencies.runGate(gate, repo, before.head, options.signal, { sandboxPolicy: options.config.sandboxPolicy })
       const baseline = baselines.get(gate.name)
       const ok = gate.baselineSubset && baseline ? isSubsetOfBaseline(result, baseline) : result.pass
       gates.push({ ok, result })

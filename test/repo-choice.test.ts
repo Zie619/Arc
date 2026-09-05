@@ -1,5 +1,5 @@
 import { describe, expect, it, beforeEach, afterEach } from 'vitest'
-import { mkdtempSync, rmSync } from 'node:fs'
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { rememberedRepo, rememberRepo } from '../src/repo-choice.ts'
@@ -19,6 +19,12 @@ afterEach(() => {
 })
 
 describe('arc stops asking which repo you meant', () => {
+  it.each(['null', '[]', '42', '{"/w/x":42}'])('ignores malformed choice data: %s', (content) => {
+    mkdirSync(join(home, '.arc'))
+    writeFileSync(join(home, '.arc', 'repo-choice.json'), content)
+    expect(rememberedRepo('/w/x')).toBeUndefined()
+    expect(rememberedRepo('__proto__')).toBeUndefined()
+  })
   it('remembers the choice per directory, and keeps them separate', () => {
     expect(rememberedRepo('/w/gambit')).toBeUndefined()
     rememberRepo('/w/gambit', '/w/gambit/openflow')

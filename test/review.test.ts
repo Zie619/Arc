@@ -32,6 +32,7 @@ afterEach(() => {
 
 function config() {
   return ProjectConfig.parse({
+    sandboxPolicy: 'caveat', // Explicitly trusted fixture commands; refusal is covered in security.test.ts.
     name: 'review', repo, gates: [{ name: 'syntax', command: 'true', proves: 'syntax' }],
     roles: {
       implement: { cli: 'codex', model: 'sol', sandbox: 'workspace-write' },

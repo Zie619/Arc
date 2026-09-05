@@ -177,11 +177,10 @@ export const ProjectConfig = z.object({
    * profile — on Linux, and inside another sandbox where Seatbelt refuses to
    * nest, there is nothing underneath.
    *
-   *   'caveat' — run it and record that it ran unprotected (default: an
-   *              unverified finding is worse than an unsandboxed check)
-   *   'refuse' — do not run it; the finding stays unverified and says why
+   *   'caveat' — explicitly opt into execution without a sandbox
+   *   'refuse' — default: do not run it; the finding stays unverified
    */
-  sandboxPolicy: z.enum(['caveat', 'refuse']).default('caveat'),
+  sandboxPolicy: z.enum(['caveat', 'refuse']).default('refuse'),
   /**
    * What a sandboxed writer may need to reach, and how to find out.
    *
@@ -488,8 +487,13 @@ export const AcceptanceCriterion = z.object({
 })
 export type AcceptanceCriterion = z.infer<typeof AcceptanceCriterion>
 
+// These identifiers become branch and worktree names. "--" separates the arc
+// from its task; accepting it inside either id aliases another arc's workspace.
+export const PlanIdentifier = z.string().regex(/^(?!.*--)[A-Za-z0-9][A-Za-z0-9_-]{0,79}$/,
+  'use 1–80 letters, digits, single hyphens or underscores; start with a letter or digit')
+
 export const PlanTask = z.object({
-  id: z.string(),
+  id: PlanIdentifier,
   title: z.string(),
   /** Frozen at dispatch. Editing the plan mid-arc must not retroactively
    *  change what an already-queued agent will be told. */
@@ -546,7 +550,7 @@ export const PlanTask = z.object({
 export type PlanTask = z.infer<typeof PlanTask>
 
 export const Plan = z.object({
-  arcId: z.string(),
+  arcId: PlanIdentifier,
   /**
    * Stored byte-for-byte and injected verbatim into EVERY dispatch. Never
    * summarised, never compacted. This is the whole point: at step 200 the goal

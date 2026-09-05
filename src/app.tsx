@@ -17,7 +17,7 @@ import { theme, agentColor, agentName } from './theme.ts'
 import { mode as getMode, nextMode, prevMode, type ModeName } from './modes.ts'
 import { codexLimitsSnapshot } from './limits.ts'
 import { describeEvent } from './activity.ts'
-import { acquire as acquireCheckoutLock, release as releaseCheckoutLock } from './checkout-lock.ts'
+import { inspectCheckoutLock } from './checkout-lock.ts'
 import { git } from './git.ts'
 import { ArcLogo } from './logo.tsx'
 import {
@@ -1049,14 +1049,9 @@ export function App({ store, config, danger, initialBrief, version = '0.2.0' }: 
             )
             if (!ok) { closeSteps(); say('arc', 'Stopped before any agent ran. Nothing was changed.'); return }
           }
-          // Parallel sessions corrupt a shared tree. Only lanes that WRITE
-          // the checkout take the lock — deep work runs in its own worktrees
-          // and needs none. Known gap: deep landing briefly checks out the
-          // integration branch here unlocked; that race is narrower than the
-          // whole-lane one this closes, and lands under the semaphore.
-          // Released in this submit's finally (owner-guarded, so a no-op
-          // everywhere else).
-          const holder = acquireCheckoutLock(runtimeConfig.repo)
+          // Explain a held lock before opening a lane. runDirect acquires the
+          // lock atomically itself, including callers outside this interface.
+          const holder = inspectCheckoutLock(runtimeConfig.repo)
           if (holder) {
             closeSteps()
             const age = Math.round((Date.now() - holder.acquiredAt) / 1000)
@@ -1308,9 +1303,6 @@ export function App({ store, config, danger, initialBrief, version = '0.2.0' }: 
         busy.current = false
         abort.current = null
         setAgents([])
-        // Owner-guarded: removes the checkout lock only when this process
-        // holds it, so it is a no-op for every lane that never took it.
-        try { releaseCheckoutLock(runtimeConfig.repo) } catch { /* lock file already gone */ }
         // A finished run's arc id must not linger: /steer typed after this
         // would bind to a dead arc and never reach any future brief.
         setArcId('')

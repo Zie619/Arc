@@ -26,6 +26,7 @@ jobs:
           cache: pnpm
       - run: pnpm install --frozen-lockfile
       - run: pnpm typecheck
+      - run: pnpm docs:check
       # `--reporter=basic` so a wedged run leaves a trail: the default reporter
       # rewrites one line in place, which is unreadable in a log and useless
       # after a cancellation.

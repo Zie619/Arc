@@ -154,15 +154,17 @@ closed** on the decisions that matter:
 | A task **removes lines from** a test, or touches runner/CI config | **Refused** unless it declares `touchesGateSurface: "why"`. The work is kept on its branch; add the declaration and `arc resume`. |
 | The reviewer requires changes | One repair round, then the task fails. |
 | A model substitute is served | Waits and retries if it is capacity weather; blocks if it is drift. |
-| A blocking pending-op is raised | The arc completes what it can and reports INCOMPLETE. |
+| A blocking pending-op is raised | Finish already active tasks, pause new dispatches, and report INCOMPLETE. Use `arc ops` to resolve it. |
 
-Everything refused above is refused **before anything is billed**.
+Configuration and plan preflight refusals happen before implementation dispatch.
+Changes discovered during implementation, gates, or review are recorded after
+that work has run; its quota has already been spent.
 
 ---
 
 ## When the agent cannot reach what it needs
 
-Arc's gates run unsandboxed, so verification always works. The **writer** does
+Ordinary project gates run outside the writer sandbox, with a minimized environment. The **writer** does
 not — it runs inside codex's sandbox. If a gate needs the Docker socket and the
 sandbox blocks it, the agent is writing code it can never execute, and every
 retry costs a full dispatch to learn one bit.
@@ -246,13 +248,12 @@ so ten relaunches do not multiply them.
 
 ## The honest limits
 
-- **`readOnly` is enforced by the OS on macOS and by a recorded caveat
-  everywhere else.** Reviewer-authored check commands are model-authored shell
-  that Arc executes on purpose, and only macOS Seatbelt applies the deny-write
-  profile. Set `sandboxPolicy: refuse` to skip such checks entirely instead; the
-  finding is then kept and marked unverified rather than silently dropped.
-- **Seatbelt refuses to nest**, so the same is true when Arc itself runs inside
-  a sandboxed agent session. Arc probes for this once and says so.
+- **Read-only reproduction commands fail closed by default.** Where the OS
+  sandbox is unavailable, `sandboxPolicy: refuse` skips the command and keeps
+  the finding unverified. `sandboxPolicy: caveat` explicitly permits execution
+  without that protection. macOS checks have a private scratch directory and
+  denied network access; sibling temporary worktrees remain protected.
+- **Seatbelt can be unavailable inside another sandbox.** ARC probes once and applies the configured refusal policy. See [security](security.md).
 - **Contracts are measured on TypeScript, and declared everywhere else.** Arc
   emits declarations at the base commit and at the task's head and diffs the
   exported symbols, so a signature changed without being declared is a
@@ -261,3 +262,24 @@ so ten relaunches do not multiply them.
   UNMEASURED rather than reporting no drift.
 - **A notifier is best-effort.** If it fails, you will not hear about the arc —
   check `arc digest` on a schedule if the run matters.
+
+## Resolve and resume
+
+`arc ops` lists the exact IDs and descriptions of outstanding operations. Perform
+an operation yourself, then record it:
+
+```sh
+arc ops resolve OPERATION_ID --note "what I completed and how I checked it"
+arc resume
+```
+
+ARC records an operator statement; it does not execute an agent-written operation
+description. `--id ARC_ID` selects an older run. A resumed run preserves its plan
+and budgets and refreshes capability grants from the current configuration.
+Blocked dependents become eligible for scheduling again when their prerequisites
+are satisfied. Failed tasks retain their work for inspection; resume does not
+invent a new attempt budget.
+
+Before delivery, all configured project gates and the command criteria for landed
+tasks run on the final combined tree. Passing a task check before a later task
+changes the repository is insufficient evidence for the final result.

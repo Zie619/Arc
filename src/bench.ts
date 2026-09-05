@@ -116,6 +116,8 @@ export async function runScenario(scenario: Scenario): Promise<ScenarioResult> {
 
     const config = ProjectConfig.parse({
       name: 'bench',
+      // These commands are trusted fixtures; exercise their verdicts on Linux too.
+      sandboxPolicy: 'caveat',
       repo,
       mainBranch: 'main',
       landStrategy: 'none',

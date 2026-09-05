@@ -1,36 +1,10 @@
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import { once } from 'node:events'
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { spawn, execFileSync } from 'node:child_process'
 import { hostname, tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { acquire, release, type CheckoutLockHolder } from '../src/checkout-lock.ts'
-
-// The stale-lock break is a race, and a race is only testable if we can stop one
-// contender in the middle of it. Both ways of breaking a lock start by moving
-// the stale file out of the way, so a one-shot hook on the first rename or
-// unlink of an acquire drops the second contender in at exactly the instant
-// that used to produce two winners. Everything else passes through to real fs.
-const hooks = vi.hoisted(() => ({ beforeBreak: undefined as (() => void) | undefined }))
-vi.mock('node:fs', async (importOriginal) => {
-  const real = await importOriginal<typeof import('node:fs')>()
-  const fire = (): void => {
-    const hook = hooks.beforeBreak
-    hooks.beforeBreak = undefined
-    hook?.()
-  }
-  return {
-    ...real,
-    renameSync: (...args: Parameters<typeof real.renameSync>): void => {
-      fire()
-      return real.renameSync(...args)
-    },
-    unlinkSync: (...args: Parameters<typeof real.unlinkSync>): void => {
-      fire()
-      return real.unlinkSync(...args)
-    },
-  }
-})
 
 let repo: string
 let root: string
@@ -60,15 +34,6 @@ function holder(pid: number): CheckoutLockHolder {
   }
 }
 
-/** A real second contender: its own pid, its own view of the lock file. */
-function acquireInChild(dir: string): { pid: number; result: CheckoutLockHolder | null } {
-  const module = new URL('../src/checkout-lock.ts', import.meta.url).href
-  const source = `const { acquire } = await import(${JSON.stringify(module)})\n` +
-    `process.stdout.write(JSON.stringify({ pid: process.pid, result: acquire(${JSON.stringify(dir)}) }))`
-  const out = execFileSync(process.execPath, ['--input-type=module', '-e', source], { encoding: 'utf8' })
-  return JSON.parse(out) as { pid: number; result: CheckoutLockHolder | null }
-}
-
 beforeEach(() => {
   repo = mkdtempSync(join(tmpdir(), 'arc-checkout-lock-repo-'))
   root = mkdtempSync(join(tmpdir(), 'arc-checkout-lock-root-'))
@@ -81,7 +46,6 @@ beforeEach(() => {
 })
 
 afterEach(() => {
-  hooks.beforeBreak = undefined
   release(repo)
   rmSync(repo, { recursive: true, force: true })
   rmSync(root, { recursive: true, force: true })
@@ -123,23 +87,47 @@ describe('checkout lock', () => {
     expect(replacement.acquiredAt).toBeGreaterThan(recycled.acquiredAt)
   })
 
-  it('hands a stale lock to exactly one of two contenders that race to break it', async () => {
-    writeFileSync(checkoutLockPath(), JSON.stringify(holder(await deadPid()), null, 2))
+  it('refuses malformed ownership instead of deleting it', () => {
+    writeFileSync(checkoutLockPath(), '')
+    expect(() => acquire(repo)).toThrow('malformed')
+    expect(readFileSync(checkoutLockPath(), 'utf8')).toBe('')
+  })
 
-    // The child reads the same dead holder we just did and completes its whole
-    // break while we are reaching for the stale file, so its fresh lock is
-    // sitting at the lock path when we get there. Read -> unlink -> create
-    // deleted that fresh lock and handed us the checkout as well: two winners,
-    // and the child's release() then found our record and quietly gave up.
-    let child: { pid: number; result: CheckoutLockHolder | null } | undefined
-    hooks.beforeBreak = () => { child = acquireInChild(repo) }
+  it('does not treat a foreign host pid as a dead local process', async () => {
+    const foreign = { ...holder(await deadPid()), hostname: 'another-machine' }
+    writeFileSync(checkoutLockPath(), JSON.stringify(foreign))
+    expect(acquire(repo)).toEqual(foreign)
+  })
 
-    const held = acquire(repo)
-
-    expect(child?.result).toBeNull()
-    expect(held?.pid).toBe(child?.pid)
-    const onDisk = JSON.parse(readFileSync(checkoutLockPath(), 'utf8')) as CheckoutLockHolder
-    expect(onDisk.pid).toBe(child?.pid)
+  it('admits exactly one process when stale-lock contenders race', async () => {
+    writeFileSync(checkoutLockPath(), JSON.stringify(holder(await deadPid())))
+    const module = new URL('../src/checkout-lock.ts', import.meta.url).href
+    const children = Array.from({ length: 6 }, () => spawn(process.execPath, ['--input-type=module', '-e',
+      `const { acquire } = await import(${JSON.stringify(module)});
+       const result = acquire(${JSON.stringify(repo)});
+       process.stdout.write(JSON.stringify({ pid: process.pid, result }) + "\\n");
+       setInterval(() => {}, 1000);`,
+    ], { stdio: ['ignore', 'pipe', 'pipe'] }))
+    try {
+      const results = await Promise.all(children.map((child) => new Promise<{ pid: number; result: CheckoutLockHolder | null }>((resolve, reject) => {
+        let out = ''
+        child.stdout.on('data', (chunk) => {
+          out += chunk
+          if (out.includes('\n')) resolve(JSON.parse(out.trim()))
+        })
+        child.on('error', reject)
+        child.on('exit', (code) => reject(new Error(`contender exited ${code}: ${out}`)))
+      })))
+      const winners = results.filter((r) => r.result === null)
+      expect(winners).toHaveLength(1)
+      expect(JSON.parse(readFileSync(checkoutLockPath(), 'utf8')).pid).toBe(winners[0]!.pid)
+    } finally {
+      await Promise.all(children.map(async (child) => {
+        const exited = once(child, 'exit')
+        child.kill('SIGKILL')
+        await exited
+      }))
+    }
   })
 
   it('release removes only a lock owned by this process', async () => {

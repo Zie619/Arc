@@ -318,6 +318,8 @@ ${C.bold('Plumbing — arc "..." already runs all of these for you:')}
   arc digest [--since last-seen]    what happened while you were away, and what needs you
   arc config                        every effective setting, where it came from, and the gaps
   arc why <taskId>                  why one task failed — stuck or thrashing, and the real error
+  arc ops                           list operations waiting on you
+  arc ops resolve <id> --note "…"   record an operation you completed, then arc resume
 
 Options:
   --danger        no approval stops: take every recommendation, run the plan
@@ -332,7 +334,7 @@ const SUBCOMMANDS = new Set([
   'interview', 'scout', 'plan', 'validate', 'run', 'resume', 'clean', 'status',
   'ui', 'watch', 'criteria', 'findings', 'show', 'init', 'go', 'cost',
   'setup-terminal', 'keys',
-  'doctor', 'bench', 'diff', 'flaky', 'digest', 'config', 'why',
+  'doctor', 'bench', 'diff', 'flaky', 'digest', 'config', 'why', 'ops',
 ])
 
 async function main(): Promise<void> {
@@ -362,7 +364,7 @@ async function main(): Promise<void> {
   const ci = argv.indexOf('--config')
   const configPath = ci >= 0 ? resolve(argv[ci + 1]!) : undefined
   const danger = argv.includes('--danger') || argv.includes('--yolo')
-  const valueFlags = ['--config', '--id', '-o', '--out', '--repo']
+  const valueFlags = ['--config', '--id', '-o', '--out', '--repo', '--note']
   const valueIdx = new Set(valueFlags.map((f) => argv.indexOf(f)).filter((i) => i >= 0).map((i) => i + 1))
   const allPositional = argv.filter((a, i) => !a.startsWith('-') && !valueIdx.has(i))
   // For a bare `arc "brief..."` the brief IS the first positional, so nothing
@@ -497,6 +499,22 @@ async function main(): Promise<void> {
 
   try {
     switch (cmd) {
+      case 'ops': {
+        const arcId = flag(argv, '--id') ?? store.latestArcId()
+        if (!arcId || !store.getArc(arcId)) die('no arc found; use --id <arcId> to select one')
+        if (positional[0] === 'resolve') {
+          const opId = positional[1] ?? die('usage: arc ops resolve <id> --note "what you completed"')
+          const note = flag(argv, '--note') ?? die('resolution requires --note "what you completed"')
+          store.resolvePendingOp(arcId, opId, note)
+          console.log(`Resolved ${opId}. Run arc resume to continue ${arcId}.`)
+        } else {
+          if (positional.length) die('usage: arc ops [resolve <id> --note "what you completed"]')
+          const ops = store.pendingOps(arcId)
+          if (!ops.length) console.log(`No open operations for ${arcId}.`)
+          for (const op of ops) console.log(`${op.id}  ${op.blocking ? 'BLOCKING' : 'optional'}  [${op.kind}] ${op.description}`)
+        }
+        break
+      }
       case 'run': {
         const planPath = resolve(positional[0] ?? 'plan.yaml')
         const plan = loadPlan(planPath)

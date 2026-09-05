@@ -1,4 +1,5 @@
 import { spawnSync } from 'node:child_process'
+import { buildGateChildEnv } from './provider-runtime.ts'
 import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
@@ -83,7 +84,7 @@ export function scanContracts(treePath: string): ContractScan {
       // .tsbuildinfo next to the tsconfig.
       '--outDir', outDir, '--declarationDir', outDir,
       '--incremental', 'false', '--composite', 'false',
-    ], { cwd: treePath, encoding: 'utf8', timeout: SCAN_TIMEOUT_MS, maxBuffer: 16 * 1024 * 1024 })
+    ], { cwd: treePath, env: buildGateChildEnv(), encoding: 'utf8', timeout: SCAN_TIMEOUT_MS, maxBuffer: 16 * 1024 * 1024 })
 
     if (run.error) {
       const why = (run.error as NodeJS.ErrnoException).code === 'ETIMEDOUT'

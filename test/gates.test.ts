@@ -100,6 +100,25 @@ describe('async gates', () => {
     expect(result.exitCode).toBeNull()
     expect(result.durationMs).toBeLessThan(1_000)
   })
+
+  it('does not execute an already-cancelled command', async () => {
+    const cwd = mkdtempSync(join(tmpdir(), 'arc-gate-'))
+    const controller = new AbortController()
+    controller.abort()
+    const result = await runGate(gate('echo should-not-run'), cwd, 'base', controller.signal)
+    expect(result.exitCode).toBeNull()
+    expect(result.output).not.toContain('should-not-run')
+  })
+
+  it.skipIf(!sandboxUsable)('denies writes to sibling temp directories, including other worktrees', async () => {
+    const cwd = mkdtempSync(join(tmpdir(), 'arc-gate-'))
+    const sibling = mkdtempSync(join(tmpdir(), 'arc-sibling-'))
+    const file = join(sibling, 'data.txt')
+    writeFileSync(file, 'untouched')
+    const result = await runGate({ ...gate(`echo tampered > '${file}'`), readOnly: true }, cwd, 'base')
+    expect(result.pass).toBe(false)
+    expect(readFileSync(file, 'utf8')).toBe('untouched')
+  })
 })
 
 function result(over: Partial<GateResult> = {}): GateResult {

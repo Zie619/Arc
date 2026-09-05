@@ -54,6 +54,18 @@ describe('the sandbox ladder is measured, not assumed', () => {
     expect(probe.rungs).toHaveLength(1)
   })
 
+  it('does not give capability probes the operator credentials', () => {
+    const old = process.env.ARC_PROBE_SECRET
+    process.env.ARC_PROBE_SECRET = 'private'
+    try {
+      const probe = probeUnsandboxedOnly('env', 'test -z "${ARC_PROBE_SECRET:-}"', process.cwd())
+      expect(probe.reachability).toEqual({ at: 'unsandboxed' })
+    } finally {
+      if (old === undefined) delete process.env.ARC_PROBE_SECRET
+      else process.env.ARC_PROBE_SECRET = old
+    }
+  })
+
   it('orders levels so elevation only ever raises', () => {
     expect(atLeast('danger-full-access', 'workspace-write')).toBe(true)
     expect(atLeast('read-only', 'workspace-write')).toBe(false)

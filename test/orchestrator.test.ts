@@ -65,6 +65,7 @@ afterEach(() => {
 
 function config(over: Partial<any> = {}) {
   return ProjectConfig.parse({
+    sandboxPolicy: 'caveat', // Explicitly trusted fixture commands; refusal is covered in security.test.ts.
     name: 'test',
     repo,
     mainBranch: 'main',
@@ -119,6 +120,192 @@ function plan(tasks: any[]): Plan {
 }
 
 const log = (l: string) => { logs.push(l); if (process.env.ARC_TEST_VERBOSE) console.log(l) }
+
+describe('run ownership and recovery boundaries', () => {
+  it('recovers a task at its original base after a sibling advanced integration', async () => {
+    const store = new Store(home)
+    const p = plan([task('a'), task('b')])
+    const cfg = config()
+    const base = G.headSha(repo)
+    const integration = 'arc/e2e-integration'
+    store.createArc(p, repo, base, integration)
+    store.saveRunSnapshot(p.arcId, cfg)
+    G.git(repo, 'branch', integration, base)
+    const b = G.provisionWorktree(repo, home, 'e2e--b', base)
+    writeFileSync(join(b.path, 'partial.txt'), 'keep my committed work')
+    G.commitPaths(b.path, ['partial.txt'], 'partial work')
+    store.setTaskWorkspace(p.arcId, 'b', b.path, b.branch, base)
+    store.setTaskState(p.arcId, 'b', 'running', 90_000)
+    const a = G.provisionWorktree(repo, home, 'e2e--a', base)
+    writeFileSync(join(a.path, 'e2e--a-generated.ts'), 'export const a = 1\n')
+    G.commitPaths(a.path, ['e2e--a-generated.ts'], 'land a')
+    expect(G.landBranch(repo, integration, a.branch).ok).toBe(true)
+    store.setTaskState(p.arcId, 'a', 'landed')
+    const artifact = store.putArtifact(p.arcId, 'criterion-proof', 'a passed')
+    store.promoteCriterion(p.arcId, 'a', 'c1', 'checked', 'a passed', artifact)
+    try {
+      await runArc({ store, plan: p, config: cfg, resume: true, log })
+      expect(store.getArc(p.arcId)?.status).toBe('done')
+      expect(store.getTask(p.arcId, 'b')?.state).toBe('landed')
+      expect(G.git(repo, 'show', `${integration}:partial.txt`)).toBe('keep my committed work')
+    } finally { store.close() }
+  })
+
+  it('rejects a reviewer that commits changes while claiming to be read-only', async () => {
+    const store = new Store(home)
+    process.env.ARC_FAKE_CLAUDE_WRITE = 'reviewer-change.ts'
+    try {
+      await runArc({ store, plan: plan([task('a')]), config: config({ roles: {
+        implement: { cli: 'codex', model: 'gpt-5.6-sol', sandbox: 'workspace-write' },
+        review: { cli: 'claude', model: 'opus', sandbox: 'read-only' },
+      } }), log })
+      expect(store.getArc('e2e')?.status).toBe('incomplete')
+      expect(store.allTasks('e2e').filter((t) => t.state === 'landed')).toHaveLength(0)
+      expect(store.eventsSince('e2e', 0).some((e) => e.kind === 'safety.read-only-violation')).toBe(true)
+    } finally { store.close() }
+  })
+
+  it('re-probes a changed capability grant and resumes a quarantined task', async () => {
+    const store = new Store(home)
+    const p = plan([task('a', { needs: [{ capability: 'service', because: 'test fixture' }] })])
+    const cfg = config({ capabilities: { service: { probe: 'echo arc-cap-service', elevate: false } } })
+    process.env.ARC_FAKE_CAP_LEVEL = 'arc-cap-service=danger-full-access'
+    try {
+      await runArc({ store, plan: p, config: cfg, log })
+      expect(store.getTask(p.arcId, 'a')?.state).toBe('quarantined')
+      const granted = { ...cfg, capabilities: { service: { probe: 'echo arc-cap-service', elevate: true } } }
+      await runArc({ store, plan: p, config: granted, resume: true, log })
+      expect(store.getTask(p.arcId, 'a')?.state).toBe('landed')
+      expect(store.getArc(p.arcId)?.status).toBe('done')
+    } finally { delete process.env.ARC_FAKE_CAP_LEVEL; store.close() }
+  })
+
+  it('does not reuse a previously green criterion after its proof fails', async () => {
+    const store = new Store(home)
+    const p = plan([task('a', { acceptance: [{ ...INVARIANT_CRITERION[0], proofCommand: 'false' }] })])
+    const cfg = config()
+    const base = G.headSha(repo)
+    store.createArc(p, repo, base, 'arc/e2e-integration')
+    store.saveRunSnapshot(p.arcId, cfg)
+    G.git(repo, 'branch', 'arc/e2e-integration', base)
+    const evidence = store.putArtifact(p.arcId, 'criterion-proof', 'passed on an earlier revision')
+    store.promoteCriterion(p.arcId, 'a', 'c1', 'checked', 'earlier proof', evidence)
+    try {
+      await runArc({ store, plan: p, config: cfg, resume: true, log })
+      expect(store.getArc(p.arcId)?.status).toBe('incomplete')
+      expect(store.getTask(p.arcId, 'a')?.state).not.toBe('landed')
+      expect(store.criteriaFor(p.arcId, 'a')[0]?.tier).toBe('unproven')
+    } finally { store.close() }
+  })
+
+  it('checks earlier tasks criteria against the final integrated tree', async () => {
+    const store = new Store(home)
+    const p = plan([
+      task('a', { acceptance: [{ ...INVARIANT_CRITERION[0], proofCommand: 'test ! -f e2e--b-generated.ts' }] }),
+      task('b', { dependsOn: ['a'] }),
+    ])
+    try {
+      await runArc({ store, plan: p, config: config(), log })
+      expect(store.allTasks(p.arcId).filter((t) => t.state === 'landed')).toHaveLength(2)
+      expect(store.getArc(p.arcId)?.status).toBe('incomplete')
+      expect(logs.join('\n')).toContain('final criterion a/c1')
+    } finally { store.close() }
+  })
+
+  it('fills a free worker slot while another independent task is still running', async () => {
+    const store = new Store(home)
+    const p = plan([task('fast'), task('slow', { gates: ['slow'] }), task('next', { dependsOn: ['fast'] })])
+    let slowStateAtNext: string | undefined
+    try {
+      await runArc({ store, plan: p, config: config({ agentConcurrency: 2, gates: [
+        { name: 'always-green', command: 'true', proves: 'fixture' },
+        { name: 'slow', command: 'sleep 1', proves: 'slow fixture' },
+      ] }), log, onTaskResult: (result) => {
+        if (result.taskId === 'next') slowStateAtNext = store.getTask(p.arcId, 'slow')?.state
+      } })
+      expect(['running', 'reviewing', 'landing']).toContain(slowStateAtNext)
+      expect(store.getArc(p.arcId)?.status).toBe('done')
+    } finally { store.close() }
+  })
+
+  it('stops admitting tasks when an unresolved blocking operation needs the operator', async () => {
+    const store = new Store(home)
+    process.env.ARC_FAKE_PAYLOAD = JSON.stringify({
+      status: 'done', noop: false,
+      criteria: [{ id: 'c1', claimedTier: 'checked', evidence: 'fixture' }],
+      pendingOps: [{ kind: 'external', description: 'provision a test database', blocking: true }],
+    })
+    try {
+      const p = plan([task('a'), task('b')])
+      await runArc({ store, plan: p, config: config({ agentConcurrency: 1 }), log })
+      expect(store.getArc(p.arcId)?.status).toBe('incomplete')
+      expect(store.getTask(p.arcId, 'b')?.state).toBe('pending')
+      expect(store.eventsSince(p.arcId, 0).some((event) => event.kind === 'arc.needs-input')).toBe(true)
+    } finally { store.close() }
+  })
+
+  it('refuses a competing resume before changing any task or event', async () => {
+    const owner = new Store(home)
+    const contender = new Store(home)
+    const p = plan([task('a')])
+    const cfg = config()
+    const base = G.headSha(repo)
+    owner.createArc(p, repo, base, 'arc/e2e-integration')
+    owner.saveRunSnapshot(p.arcId, cfg)
+    G.git(repo, 'branch', 'arc/e2e-integration', base)
+    owner.setTaskState(p.arcId, 'a', 'running', 90_000)
+    owner.claimArc(p.arcId, 90_000)
+    const events = owner.eventsSince(p.arcId, 0)
+    try {
+      await runArc({ store: contender, plan: p, config: cfg, resume: true, log })
+      expect(owner.getTask(p.arcId, 'a')?.state).toBe('running')
+      expect(owner.eventsSince(p.arcId, 0)).toEqual(events)
+      expect(owner.getArc(p.arcId)?.lease_owner).toBe(owner.owner)
+    } finally { owner.close(); contender.close() }
+  })
+
+  it('releases ownership when a proof dry-run refuses the plan', async () => {
+    const store = new Store(home)
+    const contender = new Store(home)
+    try {
+      const p = plan([task('a', { acceptance: [{ ...INVARIANT_CRITERION[0], polarity: 'discriminating' }] })])
+      await runArc({ store, plan: p, config: config(), log })
+      expect(store.getArc(p.arcId)?.status).toBe('incomplete')
+      expect(store.getArc(p.arcId)?.lease_owner).toBeNull()
+      expect(contender.claimArc(p.arcId, 90_000)).toBe(true)
+    } finally { store.close(); contender.close() }
+  })
+
+  it('releases ownership on exceptions after acquiring it', async () => {
+    const store = new Store(home)
+    try {
+      await expect(runArc({ store, plan: plan([task('a')]), config: config(), log: (line) => {
+        if (line.startsWith('dry-running')) throw new Error('observer crashed')
+      } })).rejects.toThrow('observer crashed')
+      expect(store.getArc('e2e')?.lease_owner).toBeNull()
+    } finally { store.close() }
+  })
+
+  it('resets a resumed incomplete run to running before attempting work', async () => {
+    const store = new Store(home)
+    const p = plan([task('a')])
+    const cfg = config()
+    const base = G.headSha(repo)
+    store.createArc(p, repo, base, 'arc/e2e-integration')
+    store.saveRunSnapshot(p.arcId, cfg)
+    G.git(repo, 'branch', 'arc/e2e-integration', base)
+    store.closeArc(p.arcId, 'incomplete')
+    try {
+      await expect(runArc({ store, plan: p, config: cfg, resume: true, log: (line) => {
+        if (line.startsWith('resuming arc')) {
+          expect(store.getArc(p.arcId)?.status).toBe('running')
+          expect(store.getArc(p.arcId)?.closed_at).toBeNull()
+          throw new Error('resume observed')
+        }
+      } })).rejects.toThrow('resume observed')
+    } finally { store.close() }
+  })
+})
 
 describe('the orchestrator, end to end', () => {
   it('waits out cheaper-model capacity weather and discards every substituted result', async () => {
@@ -220,6 +407,9 @@ describe('the orchestrator, end to end', () => {
   }, 60_000)
 
   it('refuses wave one when preflight observes a cheaper substitute without supervision', async () => {
+    // Preflight is read-only. The fake writer must not edit before its actual
+    // implementation turn, or the mutation guard correctly refuses it first.
+    delete process.env.ARC_FAKE_WRITE
     const queue = join(home, 'queue-preflight-refusal')
     mkdirSync(queue)
     writeFileSync(join(queue, '0.json'), JSON.stringify({ ok: true }))

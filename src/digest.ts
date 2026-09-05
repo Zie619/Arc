@@ -50,10 +50,12 @@ export function buildDigest(store: Store, arcId: string, options: DigestOptions 
   // 1. Needs you — and ONLY things blocked on a human.
   const blocking = store.openBlockingOps(arcId)
   const interventions = store.pendingInterventionsForArc(arcId)
-  const needsYou = blocking.length + interventions.length
+  const quarantined = tasks.filter((t) => t.state === 'quarantined')
+  const needsYou = blocking.length + interventions.length + quarantined.length
   if (needsYou > 0) {
     lines.push(head('NEEDS YOU'))
-    for (const op of blocking) lines.push(`${bullet}[${op.kind}] ${op.description}`)
+    for (const op of blocking) lines.push(`${bullet}[${op.kind}] ${op.description} — arc ops resolve ${op.id} --note "what you completed"`)
+    for (const task of quarantined) lines.push(`${bullet}[quarantined] ${task.id} — check arc findings, fix the capability, then arc resume`)
     for (const i of interventions) lines.push(`${bullet}[steering] ${String(i.text ?? '').slice(0, 160)}`)
     lines.push('')
   }

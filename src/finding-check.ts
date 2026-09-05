@@ -84,7 +84,7 @@ export async function checkReviewFinding(
     heavy: false,
     baselineSubset: false,
     readOnly: true,
-  }, cwd, baseSha, opts.signal)
+  }, cwd, baseSha, opts.signal, { sandboxPolicy: opts.sandboxPolicy })
 
   const outcome = checkOutcome(result)
   const caveats: string[] = []

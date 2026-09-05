@@ -1,9 +1,40 @@
 import { describe, expect, it } from 'vitest'
-import { readFileSync } from 'node:fs'
+import { readFileSync, mkdtempSync, writeFileSync, rmSync } from 'node:fs'
 import { spawnSync } from 'node:child_process'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+import { Store } from '../src/store.ts'
+import { Plan } from '../src/types.ts'
 
 const root = new URL('../', import.meta.url)
 const version = JSON.parse(readFileSync(new URL('package.json', root), 'utf8')).version
+
+it('lists and resolves a blocking operation through the CLI without running its description', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'arc-ops-cli-'))
+  const cfg = join(dir, 'config.json')
+  writeFileSync(cfg, JSON.stringify({ name: 'ops', repo: dir,
+    roles: { implement: { cli: 'codex', model: 'fixture' } } }))
+  const store = new Store(dir)
+  const p = Plan.parse({ arcId: 'ops', charter: { goal: 'fixture' }, tasks: [{
+    id: 'task', title: 'fixture', spec: 'fixture', acceptance: [{ id: 'c', text: 'fixture', proofKind: 'agent-review' }],
+  }] })
+  store.createArc(p, dir, 'base', 'arc/ops-integration')
+  store.addPendingOp(p.arcId, 'task', 'external', 'operator must prepare the database', true)
+  const op = store.openBlockingOps(p.arcId)[0]!
+  const run = (...args: string[]) => spawnSync(process.execPath, ['src/cli.ts', 'ops', ...args, '--config', cfg, '--id', p.arcId], {
+    cwd: root, encoding: 'utf8', env: { ...process.env, ARC_HOME: dir },
+  })
+  try {
+    const listed = run()
+    expect(listed.status).toBe(0)
+    expect(listed.stdout).toContain(op.id)
+    expect(run('resolve', op.id).status).not.toBe(0)
+    const resolved = run('resolve', op.id, '--note', 'prepared and checked')
+    expect(resolved.status, resolved.stderr).toBe(0)
+    expect(resolved.stdout).toContain('Run arc resume')
+    expect(store.openBlockingOps(p.arcId)).toEqual([])
+  } finally { store.close(); rmSync(dir, { recursive: true, force: true }) }
+})
 
 describe('arc version flag', () => {
   for (const flag of ['--version', '-V']) {

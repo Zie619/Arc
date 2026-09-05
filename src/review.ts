@@ -101,7 +101,7 @@ export async function runReviewLane(options: {
     const checklist = risk.parsed as typeof RiskChecklist._output
     const baselines = new Map<string, GateResult>()
     for (const gate of config.gates.filter((item) => item.baselineSubset)) {
-      const baseline = await runGate(gate, baseTree, before.head, signal)
+      const baseline = await runGate(gate, baseTree, before.head, signal, { sandboxPolicy: config.sandboxPolicy })
       baselines.set(gate.name, baseline)
       if (!baseline.pass) {
         // The detached base worktree has no installed dependencies or build
@@ -110,7 +110,7 @@ export async function runReviewLane(options: {
       }
     }
     for (const gate of config.gates) {
-      const result = await runGate(gate, config.repo, before.head, signal)
+      const result = await runGate(gate, config.repo, before.head, signal, { sandboxPolicy: config.sandboxPolicy })
       const baseline = baselines.get(gate.name)
       const ok = gate.baselineSubset && baseline ? isSubsetOfBaseline(result, baseline) : result.pass
       gates.push({ ok, result })

@@ -1,5 +1,6 @@
 import { spawn, spawnSync } from 'node:child_process'
-import { realpathSync } from 'node:fs'
+import { mkdtempSync, realpathSync, rmSync } from 'node:fs'
+import { tmpdir } from 'node:os'
 import { join, isAbsolute } from 'node:path'
 import { normalizeFailureSignature } from './classify.ts'
 import { buildGateChildEnv } from './provider-runtime.ts'
@@ -34,13 +35,8 @@ export interface GateResult {
   sandboxed: boolean
 }
 
-// Deny-write profile for reviewer-authored commands. Temp dirs and /dev stay
-// writable so ordinary read-only tooling (node, grep pipelines) still runs —
-// but the tree being checked gets a FINAL deny (seatbelt: last match wins),
-// because a repo or worktree can itself live under a temp path.
-const READ_ONLY_PROFILE =
-  '(version 1)(allow default)(deny file-write*)' +
-  '(allow file-write* (subpath "/private/tmp") (subpath "/private/var/folders") (subpath "/dev"))'
+// A private scratch directory is the only writable tree. Allowing all of /tmp
+// also grants access to sibling worktrees and other processes' control files.
 
 /**
  * Seatbelt refuses to NEST — a profile cannot even tighten inside another one.
@@ -60,13 +56,15 @@ export function sandboxUsable(): boolean {
   return sandboxProbe
 }
 
-function gateArgv(gate: GateDef, dir: string): { bin: string; args: string[]; sandboxed: boolean } {
+function gateArgv(gate: GateDef, dir: string, scratch?: string): { bin: string; args: string[]; sandboxed: boolean } {
   if (gate.readOnly && sandboxUsable()) {
     const target = JSON.stringify(realpathSync(dir))
-    const profile = `${READ_ONLY_PROFILE}(deny file-write* (subpath ${target}))`
-    return { bin: '/usr/bin/sandbox-exec', args: ['-p', profile, 'bash', '-c', gate.command], sandboxed: true }
+    const profile = '(version 1)(allow default)(deny file-write*)(deny network*)'
+      + `(allow file-write* (subpath ${JSON.stringify(realpathSync(scratch!))}) (literal "/dev/null"))`
+      + `(deny file-write* (subpath ${target}))`
+    return { bin: '/usr/bin/sandbox-exec', args: ['-p', profile, '/bin/bash', '-c', gate.command], sandboxed: true }
   }
-  return { bin: 'bash', args: ['-c', gate.command], sandboxed: false }
+  return { bin: '/bin/bash', args: ['-c', gate.command], sandboxed: false }
 }
 
 export async function runGate(
@@ -74,54 +72,71 @@ export async function runGate(
   cwd: string,
   baseSha: string,
   signal?: AbortSignal,
+  options: { sandboxPolicy?: 'caveat' | 'refuse' } = {},
 ): Promise<GateResult> {
   const started = Date.now()
+  const refused = gate.readOnly && !sandboxUsable() && options.sandboxPolicy !== 'caveat'
+  if (signal?.aborted || refused) {
+    return {
+      name: gate.name, command: gate.command, proves: gate.proves,
+      exitCode: null, pass: false, timedOut: false, baseSha, durationMs: 0, sandboxed: false,
+      output: refused ? 'not run: read-only command requires an OS sandbox (sandboxPolicy: refuse)' : 'not run: cancelled',
+      signature: refused ? 'sandbox unavailable' : 'cancelled',
+    }
+  }
   const dir = isAbsolute(gate.cwd) ? gate.cwd : join(cwd, gate.cwd)
-  const { bin, args, sandboxed } = gateArgv(gate, dir)
-  return await new Promise<GateResult>((resolve) => {
-    let output = ''
-    let timedOut = false
-    let settled = false
-    const child = spawn(bin, args, {
-      cwd: dir,
-      env: buildGateChildEnv(process.env, gate.envAllowlist ?? []),
-      stdio: ['ignore', 'pipe', 'pipe'],
-      detached: true,
-    })
-    const append = (chunk: Buffer): void => {
-      output = `${output}${chunk.toString()}`.slice(-64 * 1024 * 1024)
-    }
-    child.stdout.on('data', append)
-    child.stderr.on('data', append)
-    const kill = (): void => {
-      if (child.pid !== undefined) {
-        try { process.kill(-child.pid, 'SIGKILL') } catch { /* already gone */ }
-      }
-      try { child.kill('SIGKILL') } catch { /* already gone */ }
-    }
-    const finish = (code: number | null): void => {
-      if (settled) return
-      settled = true
-      clearTimeout(timer)
-      signal?.removeEventListener('abort', abort)
-      const trimmed = output.trim()
-      const exitCode = timedOut || signal?.aborted ? null : code
-      const pass = !timedOut && !signal?.aborted && exitCode === 0
-      resolve({
-        name: gate.name, command: gate.command, proves: gate.proves,
-        exitCode, pass, timedOut,
-        output: trimmed.slice(-20_000),
-        signature: normalizeFailureSignature(trimmed),
-        baseSha, durationMs: Date.now() - started, sandboxed,
+  const scratch = gate.readOnly ? mkdtempSync(join(tmpdir(), 'arc-check-')) : undefined
+  try {
+    const { bin, args, sandboxed } = gateArgv(gate, dir, scratch)
+    return await new Promise<GateResult>((resolve) => {
+      let output = ''
+      let timedOut = false
+      let settled = false
+      const child = spawn(bin, args, {
+        cwd: dir,
+        env: { ...buildGateChildEnv(process.env, gate.envAllowlist ?? []),
+          ...(scratch ? { TMPDIR: scratch, TMP: scratch, TEMP: scratch } : {}) },
+        stdio: ['ignore', 'pipe', 'pipe'],
+        detached: true,
       })
-    }
-    const abort = (): void => { kill() }
-    const timer = setTimeout(() => { timedOut = true; kill() }, gate.timeoutMs)
-    if (signal?.aborted) abort()
-    else signal?.addEventListener('abort', abort, { once: true })
-    child.on('error', () => finish(null))
-    child.on('close', (code) => finish(code))
-  })
+      const append = (chunk: Buffer): void => {
+        output = `${output}${chunk.toString()}`.slice(-64 * 1024 * 1024)
+      }
+      child.stdout.on('data', append)
+      child.stderr.on('data', append)
+      const kill = (): void => {
+        if (child.pid !== undefined) {
+          try { process.kill(-child.pid, 'SIGKILL') } catch { /* already gone */ }
+        }
+        try { child.kill('SIGKILL') } catch { /* already gone */ }
+      }
+      const finish = (code: number | null): void => {
+        if (settled) return
+        settled = true
+        kill()
+        clearTimeout(timer)
+        signal?.removeEventListener('abort', abort)
+        const trimmed = output.trim()
+        const exitCode = timedOut || signal?.aborted ? null : code
+        const pass = !timedOut && !signal?.aborted && exitCode === 0
+        resolve({
+          name: gate.name, command: gate.command, proves: gate.proves,
+          exitCode, pass, timedOut,
+          output: trimmed.slice(-20_000),
+          signature: normalizeFailureSignature(trimmed),
+          baseSha, durationMs: Date.now() - started, sandboxed,
+        })
+      }
+      const abort = (): void => { kill() }
+      const timer = setTimeout(() => { timedOut = true; kill() }, gate.timeoutMs)
+      if (signal?.aborted) abort()
+      else signal?.addEventListener('abort', abort, { once: true })
+      child.on('error', () => finish(null))
+      child.on('close', (code) => finish(code))
+    })
+  } finally {
+    if (scratch) rmSync(scratch, { recursive: true, force: true })
+  }
 }
 
 /**

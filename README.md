@@ -9,7 +9,7 @@
 <p align="center">
   <a href="https://github.com/Zie619/Arc/actions/workflows/ci.yml"><img src="https://github.com/Zie619/Arc/actions/workflows/ci.yml/badge.svg" alt="CI" /></a>
   <img src="https://img.shields.io/badge/license-MIT-a78bfa" alt="MIT" />
-  <img src="https://img.shields.io/badge/node-%E2%89%A5%2022.5-22d3ee" alt="node >= 22.5" />
+  <img src="https://img.shields.io/badge/node-%E2%89%A5%2024-22d3ee" alt="node >= 24" />
   <img src="https://img.shields.io/badge/runtime%20deps-4-34d399" alt="4 runtime deps" />
   <img src="https://img.shields.io/badge/status-alpha-e879f9" alt="alpha" />
 </p>
@@ -20,134 +20,121 @@
 
 ---
 
-Arc looks like a single AI assistant in your terminal. Underneath, it runs a **team**: a strong model plans and asks you the right questions, a different model writes the code, and a third — never the author — reviews it. Your project's own tests actually run. Nothing counts as done without evidence on disk.
+ARC runs a coding mission across multiple agents and keeps the goal, work, and
+proof outside their conversations. One model investigates and plans, another
+implements in isolated Git worktrees, and an independent model reviews. Your
+project's actual checks run before work is accepted.
 
-It exists because of a measurement, not a vibe:
+The original need was simple: **give it a large request, walk away, and come back
+knowing what changed, what passed, and what still needs you.** Long conversations,
+mixed-up checkouts, repeated infrastructure failures, and unsupported “done”
+claims drove the design. [Why we built ARC →](docs/purpose.md)
 
-| session | duration | compactions | outcome |
-|---|---:|---:|---|
-| A | 60h | 2 | lost the plot |
-| B | 53h | 2 | lost the plot |
-| C | 4.6h | 0 | held fine |
+## Start here
 
-Long agent sessions don't get lazy — they **forget** when their context gets compacted. So Arc refuses to let any model be the memory:
+Use Node 24 or newer, pnpm, Git, and logged-in `claude` and `codex` CLIs.
 
-> Every goal, decision, plan, task, and proof lives in SQLite and files on your disk.
-> Every model call is short, single-purpose, and rebuilt fresh from those rows.
-> An agent can crash, be killed, or be swapped for a newer model mid-mission — nothing is forgotten.
+```sh
+git clone https://github.com/Zie619/Arc.git
+cd Arc
+pnpm install --frozen-lockfile
+pnpm typecheck
+pnpm test
+node src/cli.ts doctor
+```
 
-We proved it the direct way: `kill -9` mid-build, then `arc resume` — the stranded tasks were reclaimed, rebuilt, reviewed, and landed.
+Then open it in the repository you want to work on:
 
-<p align="center">
-  <img src="docs/assets/pipeline.svg" alt="the arc pipeline" width="880" />
-</p>
-
-## What talking to it feels like
-
-Just type. A fast triage model routes every message to a **lane**:
-
-| you type… | lane | what happens |
-|---|---|---|
-| `hey` | chat | instant reply, zero cost |
-| `fix the null crash in slugify` | **direct** | one writer edits your checkout · tests run · independent review · minutes |
-| `how does auth work here?` | **research** | read-only scouts investigate · synthesis with file:line evidence |
-| `should we migrate to X?` | **plan** | interview → scouts → a plan · nothing is built |
-| `check my working changes` | **review** | your diff reviewed against a clean base · nothing touched |
-| a big messy mission | **deep** | the full machine below |
-
-Pin a thread with `/lane direct` (or hand routing back with `/lane auto`). **shift+tab** cycles trust: *asks first* → *auto* → *plan only* → *danger*.
-
-## The deep lane — missions that used to die in long chats
-
-1. **Interview.** A deliberately repo-blind head extracts every buried question from your brief and asks you — with recommendations you can accept by pressing Enter.
-2. **Premise check.** Scouts (a mix of both model families, because they notice different things) read the real code and **fact-check your brief's assumptions**. A refuted premise reopens the interview with the evidence — instead of poisoning the plan.
-3. **Plan.** Tasks with declared file footprints and acceptance criteria, each naming its own proof command. You approve it.
-4. **Build.** Writers work in parallel, each in an isolated git worktree — never in your checkout. Overlapping footprints and shared contracts are serialized automatically.
-5. **Verify.** Your project's own tests and typecheck run in each worktree. The reviewer predicts risks *before* seeing the diff (it works from a tree where the diff doesn't exist), then reviews it. Its findings are re-executed as commands — in a deny-write sandbox.
-6. **Land.** Verified tasks land one at a time on an integration branch, re-gated after every rebase. A final whole-branch review hunts cross-task contradictions. Your `main` is untouched until you merge.
-
-## The paranoia layer
-
-Agents say "done" when they aren't. Arc never takes their word:
-
-- A task is done only when **evidence artifacts** exist — executed proof commands, gate outputs, review verdicts. Claims without artifacts are recorded as claims.
-- *"No change needed"* is **rejected** if the worktree holds commits — a false no-op cannot silently abandon work.
-- The model that actually ran is verified against the one you asked for. An `opus-4` quietly substituting for `opus-5` is caught as **model drift** and blocked. There is no fallback-model flag, ever — a silent downgrade is exactly what verification exists to expose.
-- Agents get a **minimal, allowlisted environment** — never your shell's credentials. So do gates. So do reviewer-authored check commands, which additionally run read-only sandboxed (macOS).
-- Before any direct edit, your checkout is **snapshotted** (patches, hashes, untracked inventory) and your pre-existing changes become protected paths. Arc detects violations and never "fixes" them with destructive recovery.
-- Crashed? `arc resume` recomputes everything from the database. Cancelled? One `esc` kills the whole process tree in ~300ms.
-
-## Quick start
-
-```bash
-# prerequisites: node >= 22.5, pnpm, git,
-# plus the two agent CLIs, logged in: claude and codex
-
-git clone https://github.com/Zie619/Arc.git && cd Arc
-pnpm install
-pnpm test                      # 333 tests, no tokens spent — agents are faked
-
-# point it at any repo
+```sh
 cd ~/your/project
-node /path/to/Arc/src/cli.ts go        # or link it: npm link / alias arc=...
+node /path/to/Arc/src/cli.ts
 ```
 
-Arc auto-detects your repo, main branch, and test/build scripts. No config file needed to start; `arc init` writes an `arc.yaml` you can tune. `arc doctor` probes your installed CLIs without spending a model call.
+For a first mission, run `arc init`, inspect the detected gates, set
+`landStrategy: none`, and start with a small task. You can inspect the resulting
+integration branch before choosing how to deliver it.
 
-## The cast
+**[First-run guide](docs/getting-started.md)** ·
+[Configuration](docs/configuration.md) ·
+[Unattended execution](docs/unattended.md) ·
+[Security model](docs/security.md)
 
-| role | default | job |
-|---|---|---|
-| head | claude / opus | interviews you, assigns scouts, plans, synthesizes |
-| triage | claude / haiku | routes what you typed, in a second or two |
-| scout | codex / gpt-5.6-sol | read-only investigation |
-| implement | codex / gpt-5.6-sol | writes the code |
-| review | claude / opus | predicts risks blind, then reviews — never the author |
-| integrate | claude / opus | whole-branch review before anything is called complete |
+## How a deep mission works
 
-`/model` opens an arrow-driven picker (role → model → effort). Prefer aliases like `opus` — a new model generation ships and you're on it with zero changes. Personal overrides live in your own settings, never in the repo's config.
+1. Clarify the goal and the decisions that change the work.
+2. Send read-only scouts to check the repository and the brief's assumptions.
+3. Produce a plan with dependencies, file footprints, shared contracts, and acceptance checks.
+4. Run eligible tasks concurrently in separate worktrees. Fill free slots as tasks finish.
+5. Execute checks and independent review, then serialize rebasing and landing on an integration branch.
+6. Re-run project gates and landed tasks' command criteria on the combined tree, review integration, and deliver using the configured strategy.
 
-## Receipts, always
+SQLite and immutable artifacts hold the charter, attempts, findings, and evidence.
+Every dispatch gets a fresh brief. Resume claims ownership before recovering
+stranded tasks and retains committed work and spent budgets.
 
+## Choose the right lane
+
+| Lane | Use it for |
+| --- | --- |
+| direct | A small change in the current checkout, with a checkpoint, gates, and review |
+| research | Read-only investigation and synthesis |
+| plan | Design and a proposed plan without building |
+| review | Review existing changes |
+| deep | Isolated tasks, concurrency, durable evidence, and crash recovery |
+
+Pin a lane with `/lane deep` or return to automatic routing with `/lane auto`.
+Use `/model` to configure provider, model, and effort per role. ARC drives
+provider CLIs; it does not silently substitute a fallback model.
+
+## Leave it running; return to receipts
+
+```sh
+arc run plan.yaml --until-done
+arc digest
+arc why TASK_ID
+arc criteria
+arc findings
+arc ops
 ```
-/status       tasks, live agents, and proof state
-/criteria     every promise and whether it is actually proven
-/findings     what the reviewers caught, with evidence
-/transcript   the exact conversation of any agent dispatch
-/usage        exact provider-reported token receipts
-/limits       real subscription-window headroom (read from provider data, never invented)
+
+The supervisor prevents sleep on macOS and relaunches crashed runs through
+resume. Repeated crashes without progress stop. A blocking operation pauses new
+work; complete the action, record it with
+`arc ops resolve OP_ID --note "what you did"`, then `arc resume`.
+
+A failed task keeps its worktree for inspection. Successfully landed task
+worktrees are removed. A failed push or PR creation leaves the run incomplete.
+
+## Safety and limits
+
+- **Trusted repositories only.** Worktrees share Git metadata. Project dependencies,
+  hooks, provider settings, and approved commands can execute code as your user.
+- **Read-only reproduction commands fail closed by default.** macOS checks have
+  private scratch space and denied writes outside it, plus denied network access.
+  Where the OS sandbox is unavailable, the finding stays unverified and the command
+  is skipped. `sandboxPolicy: caveat` explicitly permits an unsandboxed check.
+- **Provider isolation differs.** Codex uses its sandbox controls. Claude agents use
+  tool permissions and a minimized environment; ARC does not give them an OS sandbox.
+- **Evidence belongs to a revision.** New implementation attempts invalidate old
+  criteria. Final checks must hold on the combined tree. Independent review can
+  still miss bugs.
+- **Alpha.** The deterministic tests and adversarial benchmark verify harness
+  behavior with fake providers. They do not measure coding-model quality or prove
+  universal reliability. Direct edits do not have deep-run crash recovery.
+
+Read the [security model](docs/security.md) for the trust boundaries and explicit
+capability grants. ARC also supports bounded retries, model identity checks,
+TypeScript contract scanning, token receipts, and command evidence.
+
+## Development
+
+```sh
+pnpm typecheck
+pnpm test
+pnpm bench
+pnpm docs:check
 ```
 
-Every provider call can be reconstructed from disk. If Arc can't measure something honestly, it says so instead of showing a number.
-
-## Built by itself
-
-The last several features in this repo — including the premise-reopen flow, the stall watchdog, and capability-gated provider flags — were **built by Arc running on its own repository**: one model as head and reviewer, the other writing. Its scouts refuted its operator's specs five times (correctly, every time), its integration reviewer blocked a cross-task design contradiction, and its failures surfaced engine bugs that are now regression-tested. The commit history is the receipt.
-
-## Walking away
-
-`arc run plan.yaml --until-done` supervises the run: it prevents sleep,
-relaunches through `arc resume` after a crash, keeps your committed work, and
-stops when relaunching stops producing progress. Your terminal title and tab
-progress ring track it; `notifyCommand` in `arc.yaml` sends the three moments
-that want a human anywhere you like. When you come back, `arc digest` says what
-happened and what needs you.
-
-**[docs/unattended.md](docs/unattended.md)** is the full guide.
-
-## Honest limits
-
-- Alpha. One heavy dogfooding campaign, not years of daily use.
-- macOS-first: the read-only command sandbox and clipboard image paste use macOS facilities; on Linux both degrade gracefully (post-hoc mutation detection remains).
-- **`readOnly` is enforced by the OS on macOS and by a recorded caveat everywhere else.** Reviewer-authored `checkCommand`s are model-authored shell that Arc executes on purpose, and only macOS Seatbelt applies the deny-write profile. On Linux there is no kernel sandbox under them — and Seatbelt refuses to nest, so the same is true when Arc itself runs inside a sandboxed agent session. Arc probes for this once and, when there is no sandbox, still runs the check but attaches a caveat saying it ran unprotected. Set `sandboxPolicy: refuse` to skip such checks entirely instead; the finding is then kept and marked unverified rather than being silently dropped.
-- `role.sandbox` means different things per lane: on the **codex** lane it becomes a kernel-enforced `--sandbox` flag, on the **claude** lane it is enforced only by the tool allowlist and the minimized environment. Treat a permission glob as a speed bump, not a fence.
-- Currently drives two provider CLIs: `claude` and `codex`. The seams for more exist; the adapters don't yet.
-- A deep mission costs real model turns. Arc spends them on verification because unverified work costs more.
-
-## Contributing
-
-See [CONTRIBUTING.md](CONTRIBUTING.md). The short version: every change lands with a test, UI changes need a paint assertion, and nothing weakens a safety invariant without a reproduced counterexample. PRs that came out of running Arc on itself are especially welcome — say so in the description.
-
-## License
-
-[MIT](LICENSE)
+Tests and benchmarks use fake provider CLIs and spend no model tokens. No new
+runtime dependencies were added for the execution hardening.
+See [CONTRIBUTING.md](CONTRIBUTING.md). MIT licensed.

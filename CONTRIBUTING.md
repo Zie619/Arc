@@ -28,6 +28,7 @@ dependencies, one process, everything auditable — and it stays that way.
 pnpm install
 pnpm test        # ~15s, no network, no tokens
 pnpm typecheck
+pnpm docs:check
 ```
 
 To run the real thing you need the `claude` and `codex` CLIs installed and

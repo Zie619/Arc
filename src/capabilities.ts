@@ -1,4 +1,5 @@
 import { spawnSync } from 'node:child_process'
+import { buildGateChildEnv } from './provider-runtime.ts'
 
 /**
  * What can a SANDBOXED writer actually reach?
@@ -73,7 +74,7 @@ let mechanismUsable: boolean | undefined
 export function sandboxProbeUsable(): boolean {
   if (mechanismUsable === undefined) {
     const spawn = spawnSync('codex', ['sandbox', '--', '/bin/echo', 'arc'],
-      { timeout: PROBE_TIMEOUT_MS, stdio: 'ignore' })
+      { timeout: PROBE_TIMEOUT_MS, stdio: 'ignore', env: buildGateChildEnv() })
     mechanismUsable = !spawn.error && spawn.status === 0
   }
   return mechanismUsable
@@ -84,9 +85,9 @@ export function resetSandboxProbeForTests(): void { mechanismUsable = undefined 
 
 function runAt(level: SandboxLevel | 'unsandboxed', command: string, cwd: string): number | null {
   const spawn = level === 'unsandboxed'
-    ? spawnSync('bash', ['-c', command], { cwd, timeout: PROBE_TIMEOUT_MS, stdio: 'ignore' })
+    ? spawnSync('/bin/bash', ['-c', command], { cwd, timeout: PROBE_TIMEOUT_MS, stdio: 'ignore', env: buildGateChildEnv() })
     : spawnSync('codex', ['sandbox', '-c', `sandbox_mode="${level}"`, '--', 'bash', '-c', command],
-      { cwd, timeout: PROBE_TIMEOUT_MS, stdio: 'ignore' })
+      { cwd, timeout: PROBE_TIMEOUT_MS, stdio: 'ignore', env: buildGateChildEnv() })
   // A missing `codex` binary is not "capability unavailable" — it is "we cannot
   // tell", and the caller must not read a spawn failure as a sandbox verdict.
   if (spawn.error) return null

@@ -13,17 +13,23 @@ const CHOICE_FILE = (): string => join(process.env.HOME ?? '.', '.arc', 'repo-ch
 
 function readChoices(): Record<string, string> {
   try {
-    return JSON.parse(readFileSync(CHOICE_FILE(), 'utf8')) as Record<string, string>
+    const value: unknown = JSON.parse(readFileSync(CHOICE_FILE(), 'utf8'))
+    if (!value || typeof value !== 'object' || Array.isArray(value)) return {}
+    return Object.fromEntries(Object.entries(value).filter(([, repo]) => typeof repo === 'string'))
   } catch { return {} }
 }
 
 export function rememberedRepo(cwd: string): string | undefined {
-  return readChoices()[cwd]
+  const choices = readChoices()
+  return Object.hasOwn(choices, cwd) ? choices[cwd] : undefined
 }
 
 export function rememberRepo(cwd: string, repo: string): void {
   try {
-    mkdirSync(dirname(CHOICE_FILE()), { recursive: true })
+    // HOME already exists. Recursive mkdir on a non-creatable virtual path
+    // such as /proc can spin in the Node 24 Linux runtime instead of throwing.
+    try { mkdirSync(dirname(CHOICE_FILE())) }
+    catch (error) { if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error }
     writeFileSync(CHOICE_FILE(), JSON.stringify({ ...readChoices(), [cwd]: repo }, null, 2))
   } catch { /* a remembered convenience is never worth failing a run over */ }
 }

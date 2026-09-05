@@ -15,6 +15,7 @@ export function git(repo: string, ...args: string[]): string {
     return execFileSync('git', ['-C', repo, ...args], {
       encoding: 'utf8',
       maxBuffer: 64 * 1024 * 1024,
+      timeout: 120_000,
       // Capture stderr rather than letting it inherit our terminal: probing
       // for a branch that does not exist is normal control flow, and leaking
       // `fatal: Needed a single revision` into the arc log reads like a crash.
@@ -95,7 +96,7 @@ export interface Worktree {
  * established, the task does not run.
  */
 export function provisionWorktree(repo: string, root: string, taskId: string, baseSha: string): Worktree {
-  const safe = taskId.replace(/[^A-Za-z0-9._-]/g, '-')
+  const safe = workspaceName(taskId)
   const path = join(root, 'worktrees', safe)
   const branch = `arc/${safe}`
 
@@ -147,12 +148,19 @@ export function removeWorktree(repo: string, wt: string): void {
  * manual git surgery. Resume and `arc clean` go through here instead.
  */
 export function releaseTaskWorkspace(repo: string, root: string, taskId: string): void {
-  const safe = taskId.replace(/[^A-Za-z0-9._-]/g, '-')
+  const safe = workspaceName(taskId)
   const path = join(root, 'worktrees', safe)
   const branch = `arc/${safe}`
   if (existsSync(path)) removeWorktree(repo, path)
   gitOk(repo, 'worktree', 'prune')
   gitOk(repo, 'branch', '-D', branch)
+}
+
+function workspaceName(id: string): string {
+  if (!/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(id) || id.includes('..') || id.endsWith('.') || id.endsWith('.lock')) {
+    throw new Error(`unsafe workspace id "${id}" — refusing to alias or traverse a worktree path`)
+  }
+  return id
 }
 
 /** Every branch this arc created, for cleanup and for reporting. */

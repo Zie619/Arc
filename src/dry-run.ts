@@ -1,5 +1,5 @@
 import * as G from './git.ts'
-import { runGate } from './gates.ts'
+import { runGate, checkOutcome } from './gates.ts'
 import type { Plan, ProjectConfig } from './types.ts'
 
 /**
@@ -93,7 +93,11 @@ export async function dryRunProofs(
         proves: criterion.text,
         cwd: '.', timeoutMs: 300_000, heavy: false, baselineSubset: false,
         readOnly: true,
-      }, tree.path, baseSha, signal)
+      }, tree.path, baseSha, signal, { sandboxPolicy: config.sandboxPolicy })
+
+      if (checkOutcome(result) === 'could-not-run') {
+        return { ran: false, findings, reason: `proof ${task.id}/${criterion.id} could not run: ${result.output || `exit ${result.exitCode}`}` }
+      }
 
       const polarity = criterion.polarity
       if (polarity === 'discriminating' && result.pass) {

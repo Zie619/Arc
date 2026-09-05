@@ -63,7 +63,6 @@ const RUNTIME_ENV = new Set([
   'TMPDIR', 'TMP', 'TEMP',
   'LANG', 'LANGUAGE', 'LC_ALL', 'LC_CTYPE',
   'TERM', 'COLORTERM', 'NO_COLOR', 'FORCE_COLOR', 'CI',
-  'SSH_AUTH_SOCK',
   'HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY', 'NO_PROXY',
   'http_proxy', 'https_proxy', 'all_proxy', 'no_proxy',
   'SSL_CERT_FILE', 'SSL_CERT_DIR', 'NODE_EXTRA_CA_CERTS',

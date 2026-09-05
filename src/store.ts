@@ -367,37 +367,44 @@ export class Store {
   // -- arc ------------------------------------------------------------------
 
   createArc(plan: Plan, repo: string, baseSha: string, integrationBranch: string, threadId?: string): void {
-    this.db
-      .prepare(
-        `INSERT INTO arc (id, thread_id, charter_json, plan_json, repo, base_sha, integration_branch, status, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, 'running', ?)`,
-      )
-      .run(
-        plan.arcId,
-        threadId ?? null,
-        JSON.stringify(plan.charter),
-        JSON.stringify(plan),
-        repo,
-        baseSha,
-        integrationBranch,
-        Date.now(),
-      )
-
-    for (const t of plan.tasks) {
+    this.db.exec('BEGIN IMMEDIATE')
+    try {
       this.db
         .prepare(
-          `INSERT OR IGNORE INTO task (arc_id, id, title, spec, state) VALUES (?, ?, ?, ?, 'pending')`,
+          `INSERT INTO arc (id, thread_id, charter_json, plan_json, repo, base_sha, integration_branch, status, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, 'running', ?)`,
         )
-        .run(plan.arcId, t.id, t.title, t.spec)
-      for (const c of t.acceptance) {
+        .run(
+          plan.arcId,
+          threadId ?? null,
+          JSON.stringify(plan.charter),
+          JSON.stringify(plan),
+          repo,
+          baseSha,
+          integrationBranch,
+          Date.now(),
+        )
+
+      for (const t of plan.tasks) {
         this.db
           .prepare(
-            `INSERT OR IGNORE INTO criterion
-               (arc_id, task_id, id, text, proof_kind, proof_command, required_tier, tier)
-             VALUES (?, ?, ?, ?, ?, ?, ?, 'unproven')`,
+            `INSERT OR IGNORE INTO task (arc_id, id, title, spec, state) VALUES (?, ?, ?, ?, 'pending')`,
           )
-          .run(plan.arcId, t.id, c.id, c.text, c.proofKind, c.proofCommand ?? null, c.requiredTier)
+          .run(plan.arcId, t.id, t.title, t.spec)
+        for (const c of t.acceptance) {
+          this.db
+            .prepare(
+              `INSERT OR IGNORE INTO criterion
+                 (arc_id, task_id, id, text, proof_kind, proof_command, required_tier, tier)
+               VALUES (?, ?, ?, ?, ?, ?, ?, 'unproven')`,
+            )
+            .run(plan.arcId, t.id, c.id, c.text, c.proofKind, c.proofCommand ?? null, c.requiredTier)
+        }
       }
+      this.db.exec('COMMIT')
+    } catch (error) {
+      this.db.exec('ROLLBACK')
+      throw error
     }
   }
 
@@ -427,6 +434,11 @@ export class Store {
       | { config_json: string }
       | undefined
     return row ? JSON.parse(row.config_json) : undefined
+  }
+
+  markArcRunning(arcId: string): void {
+    this.db.prepare(`UPDATE arc SET status = 'running', closed_at = NULL WHERE id = ? AND lease_owner = ?`)
+      .run(arcId, this.owner)
   }
 
   closeArc(arcId: string, status: 'done' | 'incomplete'): void {
@@ -824,8 +836,8 @@ export class Store {
 
   setTaskState(arcId: string, taskId: string, state: string, leaseMs?: number): void {
     this.db
-      .prepare(`UPDATE task SET state = ?, lease_expires_at = ? WHERE arc_id = ? AND id = ?`)
-      .run(state, leaseMs ? Date.now() + leaseMs : null, arcId, taskId)
+      .prepare(`UPDATE task SET state = ?, lease_expires_at = ?, lease_owner = ? WHERE arc_id = ? AND id = ?`)
+      .run(state, leaseMs ? Date.now() + leaseMs : null, leaseMs ? this.owner : null, arcId, taskId)
     this.appendEvent(arcId, 'task.state', { state }, taskId)
   }
 
@@ -846,7 +858,7 @@ export class Store {
    * safe to fire from cron every few minutes — most of a daemon without shipping
    * one.
    *
-   * A STALE lease is reclaimed: a hard-killed process must never lock the
+   * A dead local holder is reclaimed: a hard-killed process must never lock the
    * operator out of their own arc.
    */
   /**
@@ -854,10 +866,10 @@ export class Store {
    * relaunches it in seconds, well inside any sane lease, so the successor
    * would be locked out by its own dead predecessor. Ask the OS instead.
    *
-   * A recycled pid makes a dead holder look alive, which refuses a run that
-   * could have proceeded — conservative, bounded by the lease expiry, and the
-   * right way round. `checkout-lock` recorded a start hint for exactly this and
-   * then never read it.
+   * An expired timestamp does not prove a live process stopped. Synchronous
+   * compiler calls and machine sleep can delay heartbeats; reclaiming a live
+   * owner would let two processes write the same worktree. PID reuse may
+   * conservatively refuse recovery and requires operator inspection.
    */
   claimArc(arcId: string, leaseMs: number): boolean {
     const row = this.db
@@ -866,13 +878,15 @@ export class Store {
     if (!row) return false
     const heldByOther = Boolean(row.lease_owner)
       && row.lease_owner !== this.owner
-      && Number(row.lease_expires_at ?? 0) > Date.now()
       && holderMayBeAlive(row.lease_owner!)
     if (heldByOther) return false
-    this.db
-      .prepare(`UPDATE arc SET lease_owner = ?, lease_expires_at = ? WHERE id = ?`)
-      .run(this.owner, Date.now() + leaseMs, arcId)
-    return true
+    // Compare the exact row we inspected. Another process may have claimed it
+    // between SELECT and UPDATE; only one contender may observe success.
+    const changed = this.db
+      .prepare(`UPDATE arc SET lease_owner = ?, lease_expires_at = ?
+                WHERE id = ? AND lease_owner IS ? AND lease_expires_at IS ?`)
+      .run(this.owner, Date.now() + leaseMs, arcId, row.lease_owner, row.lease_expires_at)
+    return changed.changes === 1
   }
 
   renewArcLease(arcId: string, leaseMs: number): void {
@@ -1238,6 +1252,16 @@ export class Store {
     return granted
   }
 
+  /** Receipts stay immutable; the current projection must describe this code,
+   * not a proof for an earlier attempt. Explicit human waivers survive. */
+  invalidateCriteria(arcId: string, taskId: string, reason: string, criterionId?: string): void {
+    this.db.prepare(`UPDATE criterion SET tier = 'unproven', evidence = NULL,
+      evidence_artifact_id = NULL, proved_at = NULL
+      WHERE arc_id = ? AND task_id = ? AND tier != 'waived' AND (? IS NULL OR id = ?)`)
+      .run(arcId, taskId, criterionId ?? null, criterionId ?? null)
+    this.appendEvent(arcId, 'criteria.invalidated', { reason, criterionId }, taskId)
+  }
+
   criteriaFor(arcId: string, taskId: string): Array<Record<string, any>> {
     return this.db.prepare(`SELECT * FROM criterion WHERE arc_id = ? AND task_id = ?`).all(arcId, taskId) as any
   }
@@ -1404,6 +1428,25 @@ export class Store {
     return this.db
       .prepare(`SELECT * FROM pending_op WHERE arc_id = ? AND status = 'open' AND blocking = 1`)
       .all(arcId) as any
+  }
+
+  pendingOps(arcId: string): Array<Record<string, any>> {
+    return this.db.prepare(`SELECT * FROM pending_op WHERE arc_id = ? AND status = 'open' ORDER BY created_at, id`)
+      .all(arcId) as any
+  }
+
+  /** An operator receipt, never execution of an agent-supplied description. */
+  resolvePendingOp(arcId: string, opId: string, note: string): void {
+    if (!note.trim()) throw new Error('resolution needs a note describing what was done')
+    this.db.exec('BEGIN IMMEDIATE')
+    try {
+      const op = this.db.prepare(`SELECT task_id FROM pending_op WHERE id = ? AND arc_id = ? AND status = 'open'`)
+        .get(opId, arcId) as { task_id: string } | undefined
+      if (!op) throw new Error(`no open operation "${opId}" in arc "${arcId}"`)
+      this.db.prepare(`UPDATE pending_op SET status = 'resolved' WHERE id = ? AND arc_id = ?`).run(opId, arcId)
+      this.appendEvent(arcId, 'pending-op.resolved', { opId, note: note.trim(), source: 'operator' }, op.task_id)
+      this.db.exec('COMMIT')
+    } catch (error) { this.db.exec('ROLLBACK'); throw error }
   }
 }
 

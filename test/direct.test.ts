@@ -29,6 +29,7 @@ afterEach(() => rmSync(repo, { recursive: true, force: true }))
 
 function config(command = 'true') {
   return ProjectConfig.parse({
+    sandboxPolicy: 'caveat', // Explicitly trusted fixture commands; refusal is covered in security.test.ts.
     name: 'direct-test', repo, mainBranch: 'main', landStrategy: 'none',
     gates: [{ name: 'project', command, proves: 'the project remains valid' }],
     roles: {
@@ -82,6 +83,19 @@ function dependencies(fake: FakeOptions = {}): DirectDependencies & { calls: Dis
 }
 
 describe('the direct lane', () => {
+  it('serializes direct callers even when they bypass the terminal interface', async () => {
+    const firstDeps = dependencies({ implement: () => writeFileSync(join(repo, 'feature.ts'), 'export const feature = true\n') })
+    const secondDeps = dependencies()
+    const first = runDirect({ config: config(), brief: 'add feature.ts' }, firstDeps)
+    try {
+      const second = await runDirect({ config: config(), brief: 'also edit it' }, secondDeps)
+      expect(second.status).toBe('refused')
+      expect(secondDeps.calls).toEqual([])
+      expect(second.reason).toContain('Another session is editing')
+    } finally { await first }
+    // Refusing a same-process contender must not release the first caller's lock.
+    expect(() => readFileSync(join(repo, '.git', 'arc-checkout.lock'))).toThrow()
+  })
   it('predicts first, edits the current checkout, gates and reviews without committing', async () => {
     const originalHead = git('rev-parse', 'HEAD')
     const dep = dependencies({

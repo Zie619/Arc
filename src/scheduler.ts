@@ -1,5 +1,5 @@
 import { lintShell } from './shell-lint.ts'
-import type { Plan, PlanTask } from './types.ts'
+import { PlanIdentifier, type Plan, type PlanTask } from './types.ts'
 import { posix } from 'node:path'
 
 /**
@@ -66,7 +66,7 @@ const OCCUPYING: TaskState[] = ['running', 'reviewing', 'landing']
  * because `src/foo` and `src/foobar` are siblings. Normalise to slash-delimited
  * repo-relative paths and compare at a segment boundary.
  */
-function pathsOverlap(a: string, b: string): boolean {
+export function pathsOverlap(a: string, b: string): boolean {
   const clean = (value: string): string => {
     const normalized = posix.normalize(value.replaceAll('\\', '/')).replace(/^\.\//, '')
     return normalized === '.' ? '' : normalized.replace(/\/$/, '')
@@ -256,8 +256,13 @@ export function validatePlan(
   },
 ): string[] {
   const errors: string[] = []
+  if (!PlanIdentifier.safeParse(plan.arcId).success) errors.push(`unsafe arc id "${plan.arcId}"`)
+  for (const task of plan.tasks) {
+    if (!PlanIdentifier.safeParse(task.id).success) errors.push(`unsafe task id "${task.id}"`)
+  }
   const ids = new Set<string>()
   const gateNames = config ? new Set(config.gates.map((g) => g.name)) : null
+  if (config && gateNames!.size !== config.gates.length) errors.push('gate names must be unique')
   const capabilityNames = config?.capabilities ? new Set(Object.keys(config.capabilities)) : null
 
   // A gate that requires a capability nobody defined can never be probed, so

@@ -4,6 +4,7 @@ import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 import {
   buildProviderChildEnv,
+  buildGateChildEnv,
   doctorProviders,
   getProviderHelpText,
   parseCapabilityManifest,
@@ -35,11 +36,18 @@ describe('provider child environments', () => {
     ARC_FAKE_PAYLOAD: '{}',
   }
 
+  it('withholds the SSH agent from providers and gates unless explicitly granted', () => {
+    expect(buildProviderChildEnv('codex', source)).not.toHaveProperty('SSH_AUTH_SOCK')
+    expect(buildProviderChildEnv('claude', source)).not.toHaveProperty('SSH_AUTH_SOCK')
+    expect(buildGateChildEnv(source)).not.toHaveProperty('SSH_AUTH_SOCK')
+    expect(buildGateChildEnv(source, ['SSH_AUTH_SOCK']).SSH_AUTH_SOCK).toBe(source.SSH_AUTH_SOCK)
+  })
+
   it('keeps only runtime, Arc, and Claude authentication values', () => {
     const env = buildProviderChildEnv('claude', source, { ARC_RUN: '1' })
     expect(env).toMatchObject({
       PATH: '/usr/bin:/bin', HOME: '/home/operator', LANG: 'en_US.UTF-8',
-      SSH_AUTH_SOCK: '/tmp/ssh.sock', ANTHROPIC_API_KEY: 'anthropic-auth',
+      ANTHROPIC_API_KEY: 'anthropic-auth',
       CLAUDE_CODE_OAUTH_TOKEN: 'claude-oauth', ARC_FAKE_PAYLOAD: '{}', ARC_RUN: '1',
     })
     expect(env).not.toHaveProperty('OPENAI_API_KEY')

@@ -6,9 +6,10 @@ import {
   dispatch, checkModel, auxiliaryModels, capacityFailure, modelCheckMode,
   type DispatchOptions, type DispatchResult,
 } from './harness.ts'
-import { computeFrontier, validatePlan } from './scheduler.ts'
+import { computeFrontier, validatePlan, pathsOverlap } from './scheduler.ts'
 import { runGate, selectGates, isSubsetOfBaseline, describe, testsVanished, matchesGlob, type GateResult } from './gates.ts'
 import { checkReviewFinding, type FindingOutcome } from './finding-check.ts'
+import { captureDirectSnapshot } from './direct.ts'
 import { assembleDiff, changedFiles } from './diff.ts'
 import { dryRunProofs } from './dry-run.ts'
 import { scanContracts, contractDrift, type ContractScan } from './contracts.ts'
@@ -27,7 +28,7 @@ import { signaturesMatch, signatureSimilarity, isRetryable } from './classify.ts
 import * as G from './git.ts'
 import { formatCostSummary } from './cost.ts'
 import {
-  TaskResult, ReviewVerdict, RiskChecklist, ProjectConfig, TIER_RANK,
+  TaskResult, ReviewVerdict, RiskChecklist, ProjectConfig, PlanIdentifier, TIER_RANK,
   type Plan, type PlanTask, type AgentRole, type RoleBinding, type ClaimTier,
 } from './types.ts'
 
@@ -46,7 +47,7 @@ export interface RunOptions {
   elevations?: Map<string, SandboxLevel>
   /** The arc's base contract surface, scanned once and reused by every task
    *  because they all branch from the same sha. Populated lazily by runArc. */
-  baseContractScan?: ContractScan
+  baseContractScans?: Map<string, ContractScan>
   /** Proceed with no gates. Explicit only: a gate-less arc proves nothing, so
    *  it must be something the operator SAID, never something inferred. */
   allowNoGates?: boolean
@@ -109,7 +110,39 @@ class Semaphore {
   }
 }
 
+const activeRuns = new Set<string>()
+
 export async function runArc(o: RunOptions): Promise<void> {
+  const key = `${resolve(o.store.root)}\0${o.plan.arcId}`
+  if (activeRuns.has(key)) {
+    o.log(`✗ arc "${o.plan.arcId}" is already running in this process.`)
+    return
+  }
+  activeRuns.add(key)
+  let lease: ReturnType<typeof setInterval> | undefined
+  let claimed = false
+  const claim = (): boolean => {
+    if (!o.store.claimArc(o.plan.arcId, ARC_LEASE_MS)) {
+      o.log(`✗ arc "${o.plan.arcId}" is already being run by another process (its lease is live).`)
+      return false
+    }
+    claimed = true
+    lease = setInterval(() => {
+      try { o.store.renewArcLease(o.plan.arcId, ARC_LEASE_MS) } catch { /* retry at the next heartbeat */ }
+    }, ARC_LEASE_MS / 3)
+    lease.unref()
+    return true
+  }
+  try {
+    await executeArc(o, claim)
+  } finally {
+    if (lease) clearInterval(lease)
+    try { if (claimed) o.store.releaseArc(o.plan.arcId) }
+    finally { activeRuns.delete(key) }
+  }
+}
+
+async function executeArc(o: RunOptions, claim: () => boolean): Promise<void> {
   if (o.resume) {
     const persistedPlan = o.store.getPlan(o.plan.arcId)
     const persistedConfig = o.store.getRunSnapshot(o.plan.arcId)
@@ -117,11 +150,21 @@ export async function runArc(o: RunOptions): Promise<void> {
     o = {
       ...o,
       plan: persistedPlan,
-      config: persistedConfig ? ProjectConfig.parse(persistedConfig) : o.config,
+      // Execution commands stay frozen; capability grants are operator decisions
+      // that must be refreshable when resuming a quarantined task.
+      config: persistedConfig ? ProjectConfig.parse({
+        ...ProjectConfig.parse(persistedConfig), capabilities: o.config.capabilities,
+      }) : o.config,
     }
   }
 
   const { store, plan, config, log } = o
+  PlanIdentifier.parse(plan.arcId)
+  for (const task of plan.tasks) PlanIdentifier.parse(task.id)
+  if (o.resume && store.getArc(plan.arcId)?.status === 'done') {
+    log(`arc "${plan.arcId}" is already done; no work was dispatched.`)
+    return
+  }
   const persistedCapacityWait = o.resume
     ? store.eventsSince(plan.arcId, 0)
       .filter((event) => event.kind === 'capacity.wait')
@@ -153,6 +196,8 @@ export async function runArc(o: RunOptions): Promise<void> {
     if (String(persisted.repo) !== repo) {
       throw new Error(`arc "${arcId}" belongs to ${persisted.repo}, not ${repo}`)
     }
+    if (!claim()) return
+    store.markArcRunning(arcId)
     integrationBranch = String(persisted.integration_branch)
     baseSha = String(persisted.base_sha)
     if (!G.gitOk(repo, 'rev-parse', '--verify', `${baseSha}^{commit}`)) {
@@ -179,9 +224,9 @@ export async function runArc(o: RunOptions): Promise<void> {
     // capability grant, a Docker daemon started. Resume re-probes from scratch,
     // so putting them back on the queue is what makes `arc resume` the way you
     // act on the decision.
-    const held = store.allTasks(arcId).filter((t) => String(t.state) === 'quarantined')
+    const held = store.allTasks(arcId).filter((t) => ['quarantined', 'blocked'].includes(String(t.state)))
     for (const t of held) {
-      log(`resume: ${t.id} was quarantined — re-checking whether it can run now`)
+      log(`resume: ${t.id} was ${t.state} — re-checking whether it can run now`)
       store.setTaskState(arcId, String(t.id), 'pending')
     }
 
@@ -218,6 +263,7 @@ export async function runArc(o: RunOptions): Promise<void> {
     store.appendEvent(arcId, 'arc.resume', { requeued, recovered: stuck.length - requeued })
     log(`resuming arc ${arcId} from persisted base ${baseSha.slice(0, 8)} — ${requeued} task(s) requeued`)
   } else {
+    if (store.getArc(arcId)) throw new Error(`arc "${arcId}" already exists — use arc resume`)
     integrationBranch = `arc/${arcId}-integration`
     // Branch off the CONFIGURED main branch, not whatever happens to be checked
     // out. A repo sitting on someone's feature branch would otherwise silently
@@ -234,6 +280,7 @@ export async function runArc(o: RunOptions): Promise<void> {
       G.git(repo, 'branch', integrationBranch, baseSha)
     }
     store.createArc(plan, repo, baseSha, integrationBranch, o.threadId)
+    if (!claim()) return
     store.saveRunSnapshot(arcId, config)
     store.appendEvent(arcId, 'arc.start', { baseSha, integrationBranch, tasks: plan.tasks.length })
     log(`arc ${arcId} — ${plan.tasks.length} tasks, base ${baseSha.slice(0, 8)}, integration ${integrationBranch}`)
@@ -273,19 +320,6 @@ export async function runArc(o: RunOptions): Promise<void> {
     logCostSummary(o)
     return
   }
-
-  // One process per arc. Without this, two `arc resume` invocations both run,
-  // both provision worktrees, and collide nondeterministically.
-  if (!store.claimArc(arcId, ARC_LEASE_MS)) {
-    log(`✗ arc "${arcId}" is already being run by another process (its lease is live).`)
-    log('  If that process is gone, wait for the lease to expire and try again.')
-    return
-  }
-  const arcLease = setInterval(() => {
-    try { store.renewArcLease(arcId, ARC_LEASE_MS) } catch { /* transient DB busy */ }
-  }, Math.floor(ARC_LEASE_MS / 3))
-  // unref so a held interval can never keep the process alive past the run.
-  arcLease.unref?.()
 
   // What can the WRITER actually reach? Arc's gates run unsandboxed, so
   // verification always worked — but an agent that cannot run the check it is
@@ -355,82 +389,81 @@ export async function runArc(o: RunOptions): Promise<void> {
 
   const baselines = await measureBaselines(o, baseSha)
 
+  const inFlight = new Map<string, Promise<void>>()
+  const crashed = (task: PlanTask, error: unknown): void => {
+    if (o.signal?.aborted) return
+    const message = error instanceof Error ? error.message : String(error)
+    const landed = store.getTask(arcId, task.id)?.state === 'landed'
+    log(`✗ ${task.id}: crashed${landed ? ' after landing (work is preserved)' : ''} — ${message}`)
+    store.appendEvent(arcId, 'task.crashed', { message: message.slice(0, 400), afterLanding: landed }, task.id)
+    if (!landed) store.setTaskState(arcId, task.id, 'failed')
+  }
   let ticks = 0
-  for (;;) {
-    if (o.signal?.aborted) { log('cancelled — stopping. Nothing further will be landed.'); break }
-    if (o.maxTicks && ++ticks > o.maxTicks) { log('max ticks reached'); break }
-
-    const runtime = store.taskRuntime(arcId)
-    const frontier = computeFrontier({ plan, runtime, now: Date.now(), agentConcurrency: config.agentConcurrency })
-
-    for (const id of frontier.reclaimable) {
-      log(`! lease expired on ${id} — reclaiming`)
-      store.appendEvent(arcId, 'lease.expired', {}, id)
-      store.setTaskState(arcId, id, 'pending')
-    }
-
-    const done = plan.tasks.every((t) => ['landed', 'failed', 'blocked'].includes(runtime[t.id]?.state ?? 'pending'))
-    if (done) break
-
-    if (frontier.ready.length === 0) {
-      if (frontier.reclaimable.length > 0) continue
-      const stuck = plan.tasks.filter((t) => (runtime[t.id]?.state ?? 'pending') === 'pending')
-      if (stuck.length > 0) {
-        log(`DEADLOCK: ${stuck.length} task(s) pending but none runnable:`)
-        for (const b of frontier.blocked) log(`  ${b.id}: ${b.reason}`)
-        for (const s of stuck) store.setTaskState(arcId, s.id, 'blocked')
+  try {
+    for (;;) {
+      if (o.signal?.aborted) { log('cancelled — stopping. Nothing further will be landed.'); break }
+      if (o.maxTicks && ++ticks > o.maxTicks) { log('max ticks reached'); break }
+      const pendingOps = store.openBlockingOps(arcId)
+      if (pendingOps.length > 0) {
+        log(`NEEDS INPUT — ${pendingOps.length} blocking operation(s); finishing active tasks and pausing new dispatches.`)
+        store.appendEvent(arcId, 'arc.needs-input', { operations: pendingOps.map((op) => op.id) })
+        notify({ kind: 'needs-input', arcId, message: 'resolve blocking operations with arc ops, then resume' },
+          { command: config.notifyCommand })
+        break
       }
-      break
-    }
 
-    // The frontier is already capped to free slots and is guaranteed
-    // collision-free (disjoint footprints, no shared contract mutator) by
-    // computeFrontier — that analysis lives there, not here. So everything in
-    // it can run at once.
-    if (frontier.ready.length > 1) {
-      log(`▶ ${frontier.ready.length} tasks in parallel: ${frontier.ready.map((t) => t.id).join(', ')}`)
-    }
-    // The window title and the tab progress ring, on every transition. Free,
-    // passive, and the only thing that makes a six-hour run legible from across
-    // the room.
-    const landedSoFar = store.allTasks(arcId).filter((t) => t.state === 'landed').length
-    notify({
-      kind: 'progress', arcId,
-      message: `${landedSoFar}/${plan.tasks.length} · ${frontier.ready.map((t) => t.id).join(', ') || 'waiting'}`,
-      percent: (landedSoFar / Math.max(1, plan.tasks.length)) * 100,
-    }, { command: config.notifyCommand })
-    // allSettled, not all: one task crashing must not detach its siblings
-    // mid-flight or leave its own row 'running' until a lease expiry.
-    const settled = await Promise.allSettled(
-      frontier.ready.map((task) => runTask(o, task, baselines, integrationBranch, heavy, landing)))
-    settled.forEach((s, i) => {
-      if (s.status !== 'rejected' || o.signal?.aborted) return
-      const task = frontier.ready[i]
-      if (!task) return
-      const message = s.reason instanceof Error ? s.reason.message : String(s.reason)
-      // runTask sets `landed` and THEN calls propagateDeviations, which writes
-      // to the store and can throw — on SQLITE_BUSY, now reachable. Overwriting
-      // blindly rewrote a landed row to failed, so the operator saw a failed
-      // task whose work was merged on the integration branch and the arc went
-      // INCOMPLETE over it. Landing is terminal; a late throw is not.
-      const current = String(store.allTasks(arcId).find((t) => t.id === task.id)?.state ?? '')
-      if (current === 'landed') {
-        log(`✗ ${task.id}: threw AFTER landing — ${message} (the work is on the integration branch; state stays landed)`)
-        store.appendEvent(arcId, 'task.crashed', { message: message.slice(0, 400), afterLanding: true }, task.id)
-        return
+      const runtime = store.taskRuntime(arcId)
+      // A synchronous git/compiler call can delay heartbeats. A promise we
+      // still own is a live worker, regardless of its last database timestamp.
+      for (const id of inFlight.keys()) {
+        if (runtime[id]) runtime[id]!.leaseExpiresAt = null
       }
-      log(`✗ ${task.id}: crashed — ${message}`)
-      store.appendEvent(arcId, 'task.crashed', { message: message.slice(0, 400) }, task.id)
-      store.setTaskState(arcId, task.id, 'failed')
-    })
+      const frontier = computeFrontier({ plan, runtime, now: Date.now(), agentConcurrency: config.agentConcurrency })
+      for (const id of frontier.reclaimable) {
+        store.appendEvent(arcId, 'lease.expired', {}, id)
+        store.setTaskState(arcId, id, 'pending')
+      }
+      if (frontier.ready.length === 0) {
+        if (inFlight.size > 0) { await Promise.race(inFlight.values()); continue }
+        if (frontier.reclaimable.length > 0) continue
+        const stuck = plan.tasks.filter((t) => (runtime[t.id]?.state ?? 'pending') === 'pending')
+        if (stuck.length > 0) {
+          log(`DEADLOCK: ${stuck.length} task(s) pending but none runnable:`)
+          for (const item of frontier.blocked) log(`  ${item.id}: ${item.reason}`)
+          for (const task of stuck) store.setTaskState(arcId, task.id, 'blocked')
+        }
+        break
+      }
+      if (frontier.ready.length > 1) {
+        log(`▶ ${frontier.ready.length} tasks in parallel: ${frontier.ready.map((t) => t.id).join(', ')}`)
+      }
+      const landed = store.allTasks(arcId).filter((t) => t.state === 'landed').length
+      notify({ kind: 'progress', arcId,
+        message: `${landed}/${plan.tasks.length} · ${frontier.ready.map((t) => t.id).join(', ')}`,
+        percent: landed / Math.max(1, plan.tasks.length) * 100,
+      }, { command: config.notifyCommand })
+      for (const task of frontier.ready) {
+        const running = runTask(o, task, baselines, integrationBranch, heavy, landing)
+          .catch((error: unknown) => crashed(task, error))
+          .finally(() => { inFlight.delete(task.id) })
+        inFlight.set(task.id, running)
+      }
+      await Promise.race(inFlight.values())
+    }
+  } finally {
+    // Cancellation, observer failure, and a task exception all drain owned
+    // workers before the caller can release the run lease or close SQLite.
+    await Promise.allSettled(inFlight.values())
   }
 
   const landedCount = store.allTasks(arcId).filter((task) => task.state === 'landed').length
   let integrationApproved = true
   if (landedCount === 0) log('nothing landed — skipping integration review')
-  else integrationApproved = await finalReview(o, integrationBranch, baseSha)
-  clearInterval(arcLease)
-  store.releaseArc(arcId)
+  else if (o.signal?.aborted || store.openBlockingOps(arcId).length > 0) integrationApproved = false
+  else {
+    integrationApproved = await verifyFinalState(o, integrationBranch, baselines, heavy)
+    if (integrationApproved) integrationApproved = await finalReview(o, integrationBranch, baseSha)
+  }
   const complete = report(o, integrationBranch, integrationApproved)
   // Delivery is part of being done. Closing the arc before pushing meant a
   // rejected push or a failed `gh pr create` still stored 'done', and `arc run`
@@ -650,7 +683,7 @@ function buildPullRequestBody(
   }
 
   lines.push('', '## Suggested review order')
-  const affected = new Set(findings.flatMap((f) => JSON.parse(String(f.affects ?? '[]')) as string[]))
+  const affected = new Set(findings.flatMap((f) => JSON.parse(String(f.affects_json ?? '[]')) as string[]))
   if (affected.size > 0) {
     lines.push('Files a finding already touched — read these first:')
     for (const file of affected) lines.push(`1. \`${file}\``)
@@ -715,7 +748,7 @@ async function measureBaselines(o: RunOptions, baseSha: string): Promise<Map<str
       }
     }
     for (const g of needed) {
-      const r = await runGate(g, baseTree.path, baseSha, o.signal)
+      const r = await runGate(g, baseTree.path, baseSha, o.signal, { sandboxPolicy: o.config.sandboxPolicy })
       out.set(g.name, r)
       o.store.recordGate({
         arcId: o.plan.arcId, name: g.name, command: g.command, proves: g.proves,
@@ -750,7 +783,10 @@ async function runTask(
   }, LEASE_MS / 3)
 
   try {
-    const baseSha = G.git(config.repo, 'rev-parse', integrationBranch)
+    const previous = store.getTask(arcId, task.id)
+    const baseSha = previous?.worktree && G.gitOk(String(previous.worktree), 'rev-parse', '--git-dir')
+      ? String(previous.base_sha)
+      : G.git(config.repo, 'rev-parse', integrationBranch)
     let wt: G.Worktree
     try {
       wt = G.provisionWorktree(config.repo, store.root, workspaceId(arcId, task.id), baseSha)
@@ -791,6 +827,11 @@ async function runTask(
     // task marked landed while its commits sat abandoned in the worktree.
     // (The self-arc produced exactly this false-landed state.)
     if (outcome === 'noop') {
+      if (!G.isClean(wt.path) || G.untrackedFiles(wt.path).length > 0) {
+        log(`✗ ${task.id}: claimed no-op but left uncommitted changes — preserving the worktree`)
+        store.setTaskState(arcId, task.id, 'failed')
+        return
+      }
       const worktreeHead = G.git(wt.path, 'rev-parse', 'HEAD')
       if (worktreeHead !== wt.baseSha) {
         log(`✗ ${task.id}: claimed no-op, but the worktree holds commits (${worktreeHead.slice(0, 8)} ≠ base ${wt.baseSha.slice(0, 8)}) — work exists, so the no-op claim is false`)
@@ -957,6 +998,7 @@ function capacityBackoffMs(round: number): number {
 }
 
 async function sleepForCapacity(o: RunOptions, taskId: string | null, ms: number): Promise<void> {
+  if (o.signal?.aborted) return
   if (taskId) {
     try { o.store.renewLease(o.plan.arcId, taskId, LEASE_MS) } catch { /* the task heartbeat is the second line */ }
   }
@@ -981,9 +1023,16 @@ async function sleepForCapacity(o: RunOptions, taskId: string | null, ms: number
  *  is receipted as model-drift, then discarded before another attempt starts. */
 async function dispatchStep(o: RunOptions, step: DispatchStepOptions): Promise<DispatchStepResult> {
   const { store, plan, config, log } = o
+  if (step.roleName !== 'implement') step = { ...step, role: { ...step.role, sandbox: 'read-only' } }
   let capacityRound = 0
   for (;;) {
-    const writableCheckpoint = step.role.sandbox === 'workspace-write'
+    const readOnlyCheckpoint = step.role.sandbox === 'read-only'
+      && G.gitOk(step.dispatch.cwd, 'rev-parse', '--git-dir')
+      ? JSON.stringify(captureDirectSnapshot(step.dispatch.cwd)) : null
+    if (step.taskId && step.roleName === 'implement') {
+      store.invalidateCriteria(plan.arcId, step.taskId, 'new implementation attempt')
+    }
+    const writableCheckpoint = step.role.sandbox !== 'read-only'
       ? { head: G.headSha(step.dispatch.cwd), untracked: new Set(G.untrackedFiles(step.dispatch.cwd)) }
       : null
     const attemptId = store.startAttempt({
@@ -999,6 +1048,20 @@ async function dispatchStep(o: RunOptions, step: DispatchStepOptions): Promise<D
         try { store.setTaskWorker(plan.arcId, step.taskId!, pgid) } catch { /* best effort */ }
       } : undefined,
     })
+    if (readOnlyCheckpoint) {
+      let unchanged = false
+      try { unchanged = JSON.stringify(captureDirectSnapshot(step.dispatch.cwd)) === readOnlyCheckpoint } catch { /* removed tree */ }
+      if (!unchanged) {
+        const message = `read-only ${step.roleName} changed its checkout; its output was rejected`
+        result.terminalReason = 'provider-error'
+        result.errorText = message
+        result.parsed = undefined
+        store.appendEvent(plan.arcId, 'safety.read-only-violation', { role: step.roleName }, step.taskId, attemptId)
+        store.addFinding({ arcId: plan.arcId, taskId: step.taskId ?? undefined, attemptId,
+          kind: 'risk', severity: 'high', text: message })
+        log(`✗ ${message}`)
+      }
+    }
     if (step.taskId) {
       try { store.setTaskWorker(plan.arcId, step.taskId, null) } catch { /* best effort */ }
     }
@@ -1061,8 +1124,10 @@ async function dispatchStep(o: RunOptions, step: DispatchStepOptions): Promise<D
     }, step.taskId, attemptId)
     const detail = weather.observed ? `served ${weather.observed}` : weather.errorClass
     log(`  ! ${step.role.cli}/${step.role.model} capacity weather (${detail}) — waiting ${Math.round(delayMs / 1000)}s and retrying ${step.roleName}`)
-    await sleepForCapacity(o, step.taskId, delayMs)
+    // Reserve before yielding, so concurrent waiters cannot each spend the
+    // same remaining budget. Resume sums these same durable reservations.
     state.waitedMs += delayMs
+    await sleepForCapacity(o, step.taskId, delayMs)
     capacityRound++
   }
 }
@@ -1221,7 +1286,7 @@ async function implementLoop(
       store.setTaskHead(arcId, task.id, G.headSha(wt.path), measured)
 
       if (task.footprint.length > 0) {
-        const undeclared = measured.filter((f) => !task.footprint.some((d) => f === d || f.startsWith(d)))
+        const undeclared = measured.filter((f) => !task.footprint.some((d) => pathsOverlap(f, d)))
         if (undeclared.length > 0) {
           store.addFinding({ arcId, taskId: task.id, attemptId, kind: 'risk', severity: 'medium',
             text: `touched ${undeclared.length} file(s) outside declared footprint: ${undeclared.slice(0, 5).join(', ')}`,
@@ -1489,7 +1554,7 @@ function driftedIntoInflight(o: RunOptions, task: PlanTask): string[] {
   const measured = JSON.parse(
     String(o.store.allTasks(o.plan.arcId).find((t) => t.id === task.id)?.footprint_measured ?? '[]'),
   ) as string[]
-  const undeclared = measured.filter((f) => !task.footprint.some((d) => f === d || f.startsWith(`${d}/`) || f === d))
+  const undeclared = measured.filter((f) => !task.footprint.some((d) => pathsOverlap(f, d)))
   if (undeclared.length === 0) return []
   const inflight = o.store.allTasks(o.plan.arcId)
     .filter((t) => t.id !== task.id && ['running', 'reviewing', 'landing'].includes(String(t.state)))
@@ -1497,7 +1562,7 @@ function driftedIntoInflight(o: RunOptions, task: PlanTask): string[] {
   const claimed = new Set(
     o.plan.tasks.filter((t) => inflight.includes(t.id)).flatMap((t) => t.footprint),
   )
-  return undeclared.filter((f) => [...claimed].some((c) => f === c || f.startsWith(`${c}/`) || c.startsWith(`${f}/`)))
+  return undeclared.filter((f) => [...claimed].some((c) => pathsOverlap(f, c)))
 }
 
 function workspaceId(arcId: string, taskId: string): string {
@@ -1554,6 +1619,7 @@ function planCapabilities(o: RunOptions, roleLevel: SandboxLevel, osSandboxed: b
   }
 
   for (const task of o.plan.tasks) {
+    if (o.store.getTask(o.plan.arcId, task.id)?.state !== 'pending') continue
     for (const name of requiredCapabilities(config, task)) {
       const probe = plan.probes.get(name)
       const spec = config.capabilities?.[name]
@@ -1638,18 +1704,19 @@ function capabilityLost(o: RunOptions, failedGateNames: string[]): string | null
  * is reported as unmeasured — never as "no drift".
  */
 function baseContracts(o: RunOptions, baseSha: string): ContractScan {
-  if (!o.baseContractScan) {
+  o.baseContractScans ??= new Map()
+  if (!o.baseContractScans.has(baseSha)) {
     const workspace = `${o.plan.arcId}-contracts`
     G.releaseTaskWorkspace(o.config.repo, o.store.root, workspace)
     try {
       const tree = G.provisionWorktree(o.config.repo, o.store.root, workspace, baseSha)
-      try { o.baseContractScan = scanContracts(tree.path) }
+      try { o.baseContractScans.set(baseSha, scanContracts(tree.path)) }
       finally { G.releaseTaskWorkspace(o.config.repo, o.store.root, workspace) }
     } catch (error) {
-      o.baseContractScan = { supported: false, why: `base tree unavailable: ${(error as Error).message}` }
+      o.baseContractScans.set(baseSha, { supported: false, why: `base tree unavailable: ${(error as Error).message}` })
     }
   }
-  return o.baseContractScan
+  return o.baseContractScans.get(baseSha)!
 }
 
 /** Exported symbols this task changed that it never declared. */
@@ -1688,7 +1755,7 @@ function undeclaredContractCollision(o: RunOptions, task: PlanTask): string[] {
   const finding = o.store.findingsFor(o.plan.arcId).find((f) =>
     f.task_id === task.id && String(f.text).startsWith('changed exported contracts without declaring them'))
   if (!finding) return []
-  const undeclared = JSON.parse(String(finding.affects ?? '[]')) as string[]
+  const undeclared = JSON.parse(String(finding.affects_json ?? '[]')) as string[]
   if (undeclared.length === 0) return []
 
   const inflight = o.store.allTasks(o.plan.arcId)
@@ -1712,8 +1779,8 @@ async function runTaskGates(
     // Heavy gates hold the semaphore: a build is CPU/RAM-bound and several at
     // once wedge the machine regardless of how many agent slots are free.
     const r = g.heavy
-      ? await heavy.run(() => runGate(g, wt.path, wt.baseSha, o.signal))
-      : await runGate(g, wt.path, wt.baseSha, o.signal)
+      ? await heavy.run(() => runGate(g, wt.path, wt.baseSha, o.signal, { sandboxPolicy: o.config.sandboxPolicy }))
+      : await runGate(g, wt.path, wt.baseSha, o.signal, { sandboxPolicy: o.config.sandboxPolicy })
     const base = baselines.get(g.name)
     let ok = g.baselineSubset && base ? isSubsetOfBaseline(r, base) : r.pass
     // A suite that got greener by losing tests is not greener. `result.pass`
@@ -2037,7 +2104,7 @@ async function reviewLoop(
   // files it touched that the plan never predicted.
   const measured = String(store.allTasks(arcId).find((t) => t.id === task.id)?.footprint_measured ?? '[]')
   const drifted = (JSON.parse(measured) as string[])
-    .filter((f) => !task.footprint.some((d) => f === d || f.startsWith(d)))
+    .filter((f) => !task.footprint.some((d) => pathsOverlap(f, d)))
   const priority = [
     ...drifted,
     ...checklist.flatMap((r) => r.files ?? []),
@@ -2275,6 +2342,10 @@ async function landTask(
     log(`  ! ${task.id}: could not stamp task trailers — provenance will be missing from the integration branch`)
   }
 
+  if (o.signal?.aborted) return false
+  // Rebase and commit trailers can change the commit id. Persist the exact
+  // candidate before moving the integration ref so crash recovery can find it.
+  store.setTaskHead(arcId, task.id, G.headSha(wt.path), G.measuredFootprint(wt.path, onto))
   const lr = G.landBranch(config.repo, integrationBranch, wt.branch)
   store.appendEvent(arcId, 'land', lr, task.id)
   if (!lr.ok) {
@@ -2292,6 +2363,60 @@ async function landTask(
  * one task deletes the only writer of a field while three others build readers
  * against it, and no single diff contains both.
  */
+async function verifyFinalState(
+  o: RunOptions, integrationBranch: string, baselines: Map<string, GateResult>, heavy: Semaphore,
+): Promise<boolean> {
+  const { config, store, plan, log } = o
+  const head = G.git(config.repo, 'rev-parse', integrationBranch)
+  const workspace = `${plan.arcId}-verify`
+  G.releaseTaskWorkspace(config.repo, store.root, workspace)
+  const tree = G.provisionWorktree(config.repo, store.root, workspace, head)
+  try {
+    if (config.setupCommand && !await setupWorktree(o, tree)) return false
+    let ok = true
+    for (const gate of config.gates) {
+      const result = await heavy.run(() => runGate(gate, tree.path, head, o.signal, { sandboxPolicy: config.sandboxPolicy }))
+      const baseline = baselines.get(gate.name)
+      const accepted = (gate.baselineSubset && baseline ? isSubsetOfBaseline(result, baseline) : result.pass)
+        && (!baseline || testsVanished(result, baseline) === 0)
+      store.recordGate({ arcId: plan.arcId, name: `final:${gate.name}`, command: gate.command,
+        proves: gate.proves, exitCode: result.exitCode, baseSha: head,
+        verdict: accepted ? 'pass' : 'fail', signature: result.signature, durationMs: result.durationMs,
+        artifactId: store.putArtifact(plan.arcId, 'gate-output', result.output),
+      })
+      log(`final ${describe(result)}`)
+      ok &&= accepted
+    }
+    const landed = new Set(store.allTasks(plan.arcId).filter((t) => t.state === 'landed').map((t) => t.id))
+    for (const task of plan.tasks.filter((t) => landed.has(t.id))) {
+      for (const criterion of task.acceptance) {
+        if (criterion.proofKind !== 'command' || !criterion.proofCommand) continue
+        const result = await runGate({ name: `final-criterion:${task.id}:${criterion.id}`,
+          command: criterion.proofCommand, proves: criterion.text, cwd: '.', timeoutMs: 300_000,
+          heavy: false, baselineSubset: false,
+        }, tree.path, head, o.signal)
+        store.recordGate({ arcId: plan.arcId, taskId: task.id, name: result.name, command: result.command,
+          proves: result.proves, exitCode: result.exitCode, baseSha: head,
+          verdict: result.pass ? 'pass' : 'fail', signature: result.signature, durationMs: result.durationMs,
+          artifactId: store.putArtifact(plan.arcId, 'criterion-proof', result.output),
+        })
+        if (!result.pass) {
+          log(`✗ final criterion ${task.id}/${criterion.id}: FAILED on the integrated tree`)
+          store.invalidateCriteria(plan.arcId, task.id, 'proof failed on final integrated tree', criterion.id)
+          store.addFinding({ arcId: plan.arcId, taskId: task.id, kind: 'integration', severity: 'high',
+            text: `criterion ${criterion.id} failed on final integration ${head}` })
+          ok = false
+        }
+      }
+    }
+    if (!G.isClean(tree.path) || G.headSha(tree.path) !== head) {
+      log('✗ final verification changed tracked files or HEAD — refusing to deliver different code from the code tested')
+      ok = false
+    }
+    return ok && !o.signal?.aborted
+  } finally { G.releaseTaskWorkspace(config.repo, store.root, workspace) }
+}
+
 async function finalReview(o: RunOptions, integrationBranch: string, baseSha: string): Promise<boolean> {
   const { store, config, log } = o
   const arcId = o.plan.arcId
@@ -2422,7 +2547,8 @@ async function reviewIntegrationHead(
   const retained = checkedFindings.filter(({ check }) => check.keep).length
   log(`integration verdict: ${v.verdict} (${retained}/${v.findings.length} finding(s) reproduced or retained)`)
   store.appendEvent(arcId, 'integration.verdict', { verdict: v.verdict, findings: retained })
-  return v.verdict === 'PASS' || v.verdict === 'PASS_WITH_NOTES'
+  const blocking = checkedFindings.some(({ finding, check }) => check.keep && finding.severity !== 'minor')
+  return !blocking && (v.verdict === 'PASS' || v.verdict === 'PASS_WITH_NOTES')
 }
 
 /**
