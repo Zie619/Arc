@@ -173,10 +173,11 @@ interface SupervisedExit {
   error?: string
 }
 
-function supervisorArgs(mode: 'run' | 'resume', planPath: string, configPath?: string): string[] {
+function supervisorArgs(mode: 'run' | 'resume', planPath: string, configPath: string | undefined, arcId: string): string[] {
   const args = [resolve(process.argv[1]!), mode]
   // A TUI-born arc has no plan file; resume reads its plan from the store.
-  if (planPath) args.push(planPath)
+  if (mode === 'resume') args.push('--id', arcId)
+  else if (planPath) args.push(planPath)
   if (configPath) args.push('--config', configPath)
   const repo = flag(process.argv.slice(2), '--repo')
   if (repo) args.push('--repo', resolve(repo))
@@ -184,9 +185,9 @@ function supervisorArgs(mode: 'run' | 'resume', planPath: string, configPath?: s
 }
 
 async function launchSupervisedChild(
-  mode: 'run' | 'resume', planPath: string, configPath?: string,
+  mode: 'run' | 'resume', planPath: string, configPath: string | undefined, arcId: string,
 ): Promise<SupervisedExit> {
-  const nodeArgs = supervisorArgs(mode, planPath, configPath)
+  const nodeArgs = supervisorArgs(mode, planPath, configPath, arcId)
   const hasCaffeinate = process.platform === 'darwin' && spawnSync('which', ['caffeinate'], { stdio: 'ignore' }).status === 0
   const command = hasCaffeinate ? 'caffeinate' : process.execPath
   const args = hasCaffeinate ? ['-dims', process.execPath, ...nodeArgs] : nodeArgs
@@ -226,7 +227,7 @@ async function superviseRun(
   let progressBefore = progressCount()
 
   for (;;) {
-    const result = await launchSupervisedChild(mode, planPath, configPath)
+    const result = await launchSupervisedChild(mode, planPath, configPath, plan.arcId)
     const arc = store.getArc(plan.arcId)
     if (arc?.status === 'done') return 0
     if (arc?.status !== 'running') return result.code ?? 2
@@ -612,7 +613,13 @@ async function main(): Promise<void> {
         // (First dogfood run: crash recovery was impossible without this.)
         let plan: Plan
         let resumePlanPath = ''
-        if (positional[0]) {
+        const requestedId = flag(argv, '--id')
+        if (requestedId) {
+          if (positional[0]) die('choose --id <run-id> or a plan file, not both')
+          const stored = store.getPlan(requestedId)
+          if (!stored) die(`no saved plan for arc "${requestedId}"`)
+          plan = stored!
+        } else if (positional[0]) {
           resumePlanPath = resolve(positional[0])
           plan = loadPlan(resumePlanPath)
         } else if (existsSync(resolve('plan.yaml'))) {
@@ -851,6 +858,10 @@ async function main(): Promise<void> {
         store.close()
         const out = buildBundle('ui.tsx', 'ui.mjs')
         const uiArgs = configPath ? [out, '--config', configPath] : [out]
+        const requestedId = flag(argv, '--id')
+        if (requestedId) uiArgs.push('--id', requestedId)
+        const requestedRepo = flag(argv, '--repo')
+        if (requestedRepo) uiArgs.push('--repo', resolve(requestedRepo))
         const r = spawnSync('node', uiArgs, { stdio: 'inherit', env: process.env, cwd: process.cwd() })
         process.exit(r.status ?? 0)
       }

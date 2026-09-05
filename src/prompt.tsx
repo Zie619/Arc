@@ -1,7 +1,9 @@
-import React, { useEffect, useRef, useState } from 'react'
+import React, { useEffect, useMemo, useRef, useState } from 'react'
 import { Box, Text, useStdin, useStdout } from 'ink'
 import { decode, enableKeyProtocols, disableKeyProtocols, type Key } from './keys.ts'
 import * as B from './buffer.ts'
+import { theme } from './theme.ts'
+import { clip, draftRows, plain, Section, useTerminalSize, windowStart } from './terminal-ui.tsx'
 
 /**
  * The input box.
@@ -67,12 +69,13 @@ export function useRawKeys(onKey: (k: Key) => void, active = true): void {
     return () => {
       stdin.off('data', onData)
       disableKeyProtocols(stdout)
+      setRawMode(false)
     }
   }, [stdin, isRawModeSupported, setRawMode, stdout, active])
 }
 
 export function Prompt({ onSubmit, busy, placeholder, history, onInterrupt, onExit, active = true, onCycleMode, slashCommands, onPasteImage }: PromptProps) {
-  const { stdout } = useStdout()
+  const { width: cols, rows: terminalRows } = useTerminalSize()
   const [buf, setBuf] = useState<B.Buf>(B.empty)
   const [histAt, setHistAt] = useState<number | null>(null)
   const [blink, setBlink] = useState(true)
@@ -91,9 +94,10 @@ export function Prompt({ onSubmit, busy, placeholder, history, onInterrupt, onEx
   useEffect(() => { setMenuAt(0); setMenuDismissed(false) }, [buf.text])
 
   useEffect(() => {
+    if (!active) return
     const t = setInterval(() => setBlink((b) => !b), 530)
     return () => clearInterval(t)
-  }, [])
+  }, [active])
 
   useRawKeys((k) => handle(k), active)
 
@@ -225,56 +229,63 @@ export function Prompt({ onSubmit, busy, placeholder, history, onInterrupt, onEx
     if (k.text) { setBuf((b) => B.insert(b, k.text)); setHistAt(null) }
   }
 
-  const cols = Math.min(Math.max(stdout?.columns || 80, 40), 200)
-  const rule = '─'.repeat(Math.max(0, cols - 2))
-  const lines = buf.text.length === 0 ? [''] : buf.text.split('\n')
-  const pos = B.position(buf)
+  const lines = useMemo(() => draftRows(buf.text, cols - 5), [buf.text, cols])
+  const current = Math.max(0, lines.findLastIndex((row) => row.start <= buf.cursor))
+  const visibleRows = Math.max(2, Math.min(6, Math.floor((terminalRows ?? 32) / 4)))
+  const start = windowStart(current, lines.length, visibleRows)
 
   return (
     <Box flexDirection="column">
-      <Text color="gray">{rule}</Text>
+      <Section title={busy ? 'Queue a follow-up' : 'Message'} hint={lines.length > visibleRows ? `${current + 1}/${lines.length} lines` : '/ commands'} width={cols} />
       <Box flexDirection="column" paddingX={1}>
-        {lines.map((line, i) => {
+        {lines.slice(start, start + visibleRows).map((row, n) => {
+          const i = start + n
+          const line = row.text
           const marker = i === 0 ? '> ' : '  '
-          if (i !== pos.line) {
-            return <Text key={i}><Text color="gray">{marker}</Text>{line}</Text>
+          if (i !== current) {
+            return <Text key={i}><Text color={theme.muted}>{marker}</Text>{plain(line)}</Text>
           }
-          const before = line.slice(0, pos.col)
-          const under = line[pos.col] ?? ' '
-          const after = line.slice(pos.col + 1)
+          const col = buf.cursor - row.start
+          const before = line.slice(0, col)
+          const under = [...line.slice(col)][0] ?? ' '
+          const after = line.slice(col + under.length)
           const showHint = buf.text.length === 0 && placeholder
           return (
             <Text key={i}>
-              <Text color="cyan">{marker}</Text>
-              {before}
+              <Text color={theme.accentBright}>{marker}</Text>
+              {plain(before)}
               <Text inverse={blink}>{under}</Text>
-              {showHint ? <Text color="gray">{placeholder}</Text> : after}
+              {showHint ? <Text color={theme.muted}>{clip(placeholder, cols - 6)}</Text> : plain(after)}
             </Text>
           )
         })}
       </Box>
       {menuOpen && (() => {
-        const leftWidth = Math.max(...menuMatches.map((command) =>
-          `${command.name}${command.args ? ` ${command.args}` : ''}`.length))
+        const leftWidth = Math.min(Math.floor(cols * 0.43), Math.max(...menuMatches.map((command) =>
+          `${command.name}${command.args ? ` ${command.args}` : ''}`.length)))
         const descriptionWidth = Math.max(0, cols - leftWidth - 6)
         const sel = Math.min(menuAt, menuMatches.length - 1)
+        const count = Math.max(3, Math.min(8, (terminalRows ?? 32) - visibleRows - 12))
+        const first = windowStart(sel, menuMatches.length, count)
         return (
           <Box flexDirection="column" paddingX={1}>
-            {menuMatches.slice(0, 8).map((command, i) => {
+            {menuMatches.slice(first, first + count).map((command, n) => {
+              const i = first + n
               const left = `${command.name}${command.args ? ` ${command.args}` : ''}`
               return (
-                <Text key={command.name} color={i === sel ? 'cyan' : 'gray'}>
+                <Text key={command.name} color={i === sel ? theme.accentBright : theme.muted}>
                   {i === sel ? '❯ ' : '  '}
-                  <Text bold>{left.padEnd(leftWidth)}</Text>
+                  <Text bold>{clip(left, leftWidth).padEnd(leftWidth)}</Text>
                   {'  '}
-                  <Text color="gray">{command.description.slice(0, descriptionWidth)}</Text>
+                  <Text color={theme.muted}>{clip(command.description, descriptionWidth)}</Text>
                 </Text>
               )
             })}
+            <Text color={theme.muted}>{clip(`↑↓ choose · tab complete · enter run · ${sel + 1}/${menuMatches.length}`, cols - 2)}</Text>
           </Box>
         )
       })()}
-      <Text color="gray">{rule}</Text>
+      <Text color={theme.accentDim}>{'─'.repeat(cols)}</Text>
     </Box>
   )
 }

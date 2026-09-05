@@ -31,6 +31,6 @@ jobs:
       # rewrites one line in place, which is unreadable in a log and useless
       # after a cancellation.
       - run: pnpm test -- --reporter=basic
-      # Arc grading Arc: 19 scenarios, most of them attacks that must fail.
+      # Arc grading Arc: 20 scenarios, most of them attacks that must fail.
       # Zero tokens, seconds to run, non-zero exit when an invariant slips.
       - run: pnpm bench

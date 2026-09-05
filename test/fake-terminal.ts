@@ -127,7 +127,7 @@ export function fakeTerminal(columns: number, rows = 40) {
     stdin,
     send: (keys: string) => { stdin.write(keys) },
     /** What is painted in the current viewport. */
-    text: () => joined(lines.slice(Math.max(0, lines.length - rows))),
+    text: () => joined(lines.slice(Math.max(0, lines.length - (stream.rows || rows)))),
     /** Normal-screen contents, including lines recoverable with terminal scrollback. */
     scrollback: () => joined(lines),
   }

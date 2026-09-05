@@ -480,6 +480,17 @@ export class Store {
     return r?.arc_id
   }
 
+  /** Keep UI inspection scoped to the conversation the operator is viewing. */
+  latestThreadRunId(threadId: string, buildsOnly = false): string | undefined {
+    const row = this.db.prepare(buildsOnly
+      ? 'SELECT id FROM arc WHERE thread_id = ? ORDER BY created_at DESC LIMIT 1'
+      : `SELECT id FROM (SELECT id, created_at FROM arc WHERE thread_id = ?
+         UNION ALL SELECT arc_id AS id, created_at FROM design WHERE thread_id = ?)
+         ORDER BY created_at DESC LIMIT 1`)
+      .get(...(buildsOnly ? [threadId] : [threadId, threadId])) as { id: string } | undefined
+    return row?.id
+  }
+
   latestArcId(): string | undefined {
     const row = this.db.prepare(`SELECT id FROM arc ORDER BY created_at DESC LIMIT 1`).get() as
       | { id: string }

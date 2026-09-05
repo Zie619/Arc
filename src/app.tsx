@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react'
-import { Box, Static, Text, useApp, useStdout } from 'ink'
+import { Box, Static, Text, useApp } from 'ink'
 import { Prompt, useRawKeys, type SlashCommand } from './prompt.tsx'
 import { saveClipboardImage } from './clipboard.ts'
 import { writeFileSync, readFileSync } from 'node:fs'
@@ -20,6 +20,11 @@ import { describeEvent } from './activity.ts'
 import { inspectCheckoutLock } from './checkout-lock.ts'
 import { git } from './git.ts'
 import { ArcLogo } from './logo.tsx'
+import { Dashboard } from './dashboard.tsx'
+import { LanePicker, Welcome } from './panels.tsx'
+import { clip, Section, useTerminalSize, windowStart } from './terminal-ui.tsx'
+import { buildDigest } from './digest.ts'
+import { explainFailure } from './why.ts'
 import {
   loadSettings, setMode as persistMode, setRole, clearRole, applySettings,
   describeRole, TUNABLE_ROLES, KNOWN_MODELS, EFFORT_LEVELS, type Settings,
@@ -34,7 +39,7 @@ import {
  * are dispatched and what each is doing.
  */
 
-type Mode = 'compose' | 'question' | 'approve' | 'confirm' | 'model'
+type Mode = 'compose' | 'question' | 'approve' | 'confirm' | 'model' | 'lane' | 'dashboard'
 
 export interface AppProps {
   store: Store
@@ -263,7 +268,7 @@ function TurnView({
     return (
       <Box flexDirection="column" paddingX={1} marginBottom={1}>
         {wrap(entry.text, width - 4).map((line, i) => (
-          <Text key={i}><Text color="gray">{i === 0 ? '> ' : '  '}</Text>{line}</Text>
+          <Text key={i}><Text color={theme.muted}>{i === 0 ? '> ' : '  '}</Text>{line}</Text>
         ))}
       </Box>
     )
@@ -279,10 +284,10 @@ function TurnView({
     return (
       <Box flexDirection="column" paddingX={1} marginBottom={1}>
         {wrap(entry.question, width - 6).map((line, i) => (
-          <Text key={i}><Text color="cyan">{i === 0 ? '? ' : '  '}</Text>{line}</Text>
+          <Text key={i}><Text color={theme.accentBright}>{i === 0 ? '? ' : '  '}</Text>{line}</Text>
         ))}
         {wrap(entry.answer, width - 8).map((line, i) => (
-          <Text key={i} color="green">{'  '}{i === 0 ? '→ ' : '  '}{line}</Text>
+          <Text key={i} color={theme.ok}>{'  '}{i === 0 ? '→ ' : '  '}{line}</Text>
         ))}
       </Box>
     )
@@ -293,11 +298,11 @@ function TurnView({
   if (entry.kind === 'product') {
     return (
       <Box flexDirection="column" paddingX={1} marginBottom={1}>
-        <Text color="green">⎿ <Text bold>{entry.taskId}</Text>{entry.noop ? ' produced no code change' : ' produced'}</Text>
+        <Text color={theme.ok}>⎿ <Text bold>{entry.taskId}</Text>{entry.noop ? ' produced no code change' : ' produced'}</Text>
         {entry.noop ? (
-          <Text color="gray">{'  '}{entry.noopReason ?? 'no reason reported'}</Text>
+          <Text color={theme.muted}>{'  '}{entry.noopReason ?? 'no reason reported'}</Text>
         ) : entry.shipped.map((item, i) => (
-          <Text key={`${item.path}-${i}`} color="gray">
+          <Text key={`${item.path}-${i}`} color={theme.muted}>
             {'  '}{item.path} — {item.whatChanged.slice(0, Math.max(1, width - item.path.length - 7))}
           </Text>
         ))}
@@ -310,12 +315,12 @@ function TurnView({
       <Box>
         <Text color={live ? 'yellow' : 'green'}>{live ? spin : '⏺'} </Text>
         <Text bold={live}>{entry.text}</Text>
-        <Text color="gray">
+        <Text color={theme.muted}>
           {live ? `  ${elapsed(now - entry.startedAt)}` : entry.ms ? `  ${elapsed(entry.ms)}` : ''}
         </Text>
       </Box>
       {live && entry.detail.slice(-2).map((line, i) => (
-        <Text key={i} color="gray">{'  ⎿  '}{line.slice(0, width - 8)}</Text>
+        <Text key={i} color={theme.muted}>{'  ⎿  '}{line.slice(0, width - 8)}</Text>
       ))}
     </Box>
   )
@@ -338,8 +343,8 @@ function PlanCard({
       <Box marginTop={1} flexDirection="column">
         {plan.tasks.map((task, i) => (
           <Box key={task.id} flexDirection="column" marginBottom={1}>
-            <Text><Text color="cyan">{i + 1}. </Text>{task.title}</Text>
-            <Text color="gray">
+            <Text><Text color={theme.accentBright}>{i + 1}. </Text>{task.title}</Text>
+            <Text color={theme.muted}>
               {'   '}{task.acceptance.length} check{task.acceptance.length === 1 ? '' : 's'}
               {task.footprint.length ? ` · ${task.footprint.slice(0, 3).join(', ')}` : ''}
             </Text>
@@ -373,6 +378,9 @@ export function QuestionPanel({
 }) {
   const [selected, setSelected] = useState(-1)
   const [answer, setAnswer] = useState('')
+  const { rows } = useTerminalSize()
+  const visibleOptions = Math.max(2, Math.min(5, (rows ?? 32) - 14))
+  const optionStart = windowStart(Math.max(0, selected), question.options.length, visibleOptions)
   useRawKeys((key) => {
     if (key.ctrl && key.name === 'c') { onExit(); return }
     if (key.name === 'escape') { onCancel(); return }
@@ -386,25 +394,27 @@ export function QuestionPanel({
   return (
     <Box flexDirection="column" paddingX={1} paddingY={1}>
       {wrap(question.text, width - 4).map((line, i) => <Text key={i} bold>{line}</Text>)}
-      <Text color="gray">{question.why}</Text>
+      <Text color={theme.muted}>{question.why}</Text>
       <Box marginTop={1} flexDirection="column">
         {wrap(`recommended: ${question.recommendation}`, width - 6).map((line, i) => (
           <Text key={i} color={selected === -1 ? 'cyan' : 'green'}>
             {i === 0 ? (selected === -1 ? '❯ ' : '  ') : '  '}{line}
           </Text>
         ))}
-        {question.options.map((option, i) => (
+        {question.options.slice(optionStart, optionStart + visibleOptions).map((option, n) => {
+          const i = optionStart + n
+          return (
           <Text key={i} color={i === selected ? 'cyan' : undefined}>
             {i === selected ? '❯ ' : '  '}{option}
           </Text>
-        ))}
+        )})}
         <Text color={selected === question.options.length ? 'cyan' : undefined}>
           {selected === question.options.length ? '❯ ' : '  '}
-          {answer || <Text color="gray">something else…</Text>}
-          {selected === question.options.length && <Text color="cyan">▊</Text>}
+          {answer || <Text color={theme.muted}>something else…</Text>}
+          {selected === question.options.length && <Text color={theme.accentBright}>▊</Text>}
         </Text>
       </Box>
-      <Box marginTop={1}><Text color="gray">↑↓ choose · type your own · enter to confirm</Text></Box>
+      <Box marginTop={1}><Text color={theme.muted}>↑↓ choose · type your own · enter to confirm · esc stop</Text></Box>
     </Box>
   )
 }
@@ -427,8 +437,8 @@ export function ConfirmPanel({
   return (
     <Box flexDirection="column" paddingX={1} paddingY={1}>
       {wrap(confirm.title, width - 4).map((line, i) => <Text key={i} bold>{line}</Text>)}
-      {confirm.lines.map((line, i) => <Text key={i} color="gray">{'  '}{line.slice(0, width - 6)}</Text>)}
-      <Box marginTop={1}><Text bold>Proceed? </Text><Text color="gray">enter = yes · n = no</Text></Box>
+      {confirm.lines.flatMap((line) => wrap(line, width - 6)).map((line, i) => <Text key={i} color={theme.muted}>{'  '}{line}</Text>)}
+      <Box marginTop={1}><Text bold>Proceed? </Text><Text color={theme.muted}>enter = yes · n = no</Text></Box>
     </Box>
   )
 }
@@ -453,6 +463,7 @@ export function ModelPickerPanel({
   const [role, setRolePick] = useState<(typeof TUNABLE_ROLES)[number] | null>(null)
   const [model, setModel] = useState('')
   const [custom, setCustom] = useState('')
+  const { rows: terminalRows } = useTerminalSize()
   const settings = loadSettings(root)
 
   const binding = role ? applySettings(config, settings).roles[role] : undefined
@@ -464,6 +475,8 @@ export function ModelPickerPanel({
     : step === 'model' ? modelRows
     : effortRows
   const customSlot = step === 'model' ? rows.length : -1
+  const visibleRows = Math.max(3, Math.min(9, (terminalRows ?? 32) - 10))
+  const firstRow = windowStart(selected, rows.length + (customSlot >= 0 ? 1 : 0), visibleRows)
 
   useRawKeys((key) => {
     if (key.ctrl && key.name === 'c') { onCancel(); return }
@@ -511,28 +524,31 @@ export function ModelPickerPanel({
     : `Model for ${role} (${binding?.cli})`
   return (
     <Box flexDirection="column" paddingX={1} paddingY={1}>
+      <Text color={theme.muted}>Agent settings · role › model › effort</Text>
       <Text bold>{title}</Text>
       <Box marginTop={1} flexDirection="column">
-        {rows.map((row, i) => (
+        {rows.slice(firstRow, firstRow + visibleRows).map((row, n) => {
+          const i = firstRow + n
+          return (
           <Text key={i} color={i === selected ? 'cyan' : undefined}>
             {i === selected ? '❯ ' : '  '}{row.slice(0, width - 6)}
           </Text>
-        ))}
-        {customSlot >= 0 && (
+        )})}
+        {customSlot >= 0 && customSlot < firstRow + visibleRows && (
           <Text color={selected === customSlot ? 'cyan' : undefined}>
             {selected === customSlot ? '❯ ' : '  '}
-            {custom || <Text color="gray">another model id…</Text>}
-            {selected === customSlot && <Text color="cyan">▊</Text>}
+            {custom || <Text color={theme.muted}>another model id…</Text>}
+            {selected === customSlot && <Text color={theme.accentBright}>▊</Text>}
           </Text>
         )}
       </Box>
-      <Box marginTop={1}><Text color="gray">↑↓ choose · enter to confirm · esc to go back</Text></Box>
+      <Box marginTop={1}><Text color={theme.muted}>↑↓ choose · enter to confirm · esc to go back</Text></Box>
     </Box>
   )
 }
 
 export function ApprovalPanel({
-  plan, width, mainBranch, landStrategy = 'pr', onDecision, onCancel, onExit,
+  plan, width: requestedWidth, mainBranch, landStrategy = 'pr', onDecision, onCancel, onExit,
 }: {
   plan: Plan
   width: number
@@ -542,19 +558,51 @@ export function ApprovalPanel({
   onCancel: () => void
   onExit: () => void
 }) {
+  const { rows, width: terminalWidth } = useTerminalSize()
+  const width = Math.min(requestedWidth, terminalWidth)
+  const [selected, setSelected] = useState(0)
+  const [offset, setOffset] = useState(0)
+  const count = Math.min(3, plan.tasks.length)
+  const first = windowStart(selected, plan.tasks.length, count)
+  const task = plan.tasks[selected]
+  const details = task ? [
+    `Task ${task.id} · ${task.title}`,
+    `Depends on: ${task.dependsOn.join(', ') || 'none'}`,
+    `Files: ${task.footprint.join(', ') || 'not declared'}`,
+    `Project checks: ${task.gates.join(', ') || 'none selected'}`,
+    ...task.acceptance.flatMap((c) => [`${c.id}: ${c.text} · requires ${c.requiredTier}`, ...(c.proofCommand ? [`  $ ${c.proofCommand}`] : [`  ${c.proofKind} evidence`])]),
+    `Specification: ${task.spec}`,
+  ].flatMap((l) => wrap(l, width - 4)) : []
+  const detailRows = Math.max(3, Math.min(9, (rows ?? 32) - count - 14))
+  const scroll = Math.min(offset, Math.max(0, details.length - detailRows))
   useRawKeys((key) => {
     if (key.ctrl && key.name === 'c') { onExit(); return }
     if (key.name === 'escape') { onCancel(); return }
     if (key.text?.toLowerCase() === 'n') { onDecision(false); return }
+    if (key.name === 'up') { setSelected((i) => Math.max(0, i - 1)); setOffset(0); return }
+    if (key.name === 'down') { setSelected((i) => Math.min(plan.tasks.length - 1, i + 1)); setOffset(0); return }
+    if (key.name === 'pagedown') { setOffset(Math.min(Math.max(0, details.length - detailRows), scroll + detailRows)); return }
+    if (key.name === 'pageup') { setOffset(Math.max(0, scroll - detailRows)); return }
     if (key.text?.toLowerCase() === 'y' || key.name === 'return') onDecision(true)
   })
 
   return (
     <Box flexDirection="column" paddingY={1}>
-      <PlanCard plan={plan} width={width} />
+      <Section title={`Review the plan · ${plan.tasks.length} tasks`} width={width} />
+      <Box flexDirection="column" paddingX={1}>
+        <Text>{clip(plan.charter.goal, width - 2)}</Text>
+        {plan.tasks.slice(first, first + count).map((t, i) => <Text key={t.id} color={first + i === selected ? theme.accentBright : theme.muted} bold={first + i === selected}>
+          {first + i === selected ? '❯ ' : '  '}{clip(`${first + i + 1}. ${t.title} · ${t.acceptance.length} check${t.acceptance.length === 1 ? '' : 's'}`, width - 4)}
+        </Text>)}
+      </Box>
+      <Section title={`Task ${selected + 1}/${plan.tasks.length} details`} hint={`${scroll + 1}–${Math.min(details.length, scroll + detailRows)}/${details.length}`} width={width} />
+      <Box flexDirection="column" paddingX={1} minHeight={detailRows}>
+        {details.slice(scroll, scroll + detailRows).map((l, i) => <Text key={i} color={i === 0 && scroll === 0 ? theme.accentBright : theme.muted}>{l}</Text>)}
+      </Box>
       <Box paddingX={1} flexDirection="column">
-        <Text color="gray">{deliveryPreview(landStrategy, mainBranch)}</Text>
-        <Box marginTop={1}><Text bold>Build it? </Text><Text color="gray">enter = yes · n = no</Text></Box>
+        <Text color={theme.muted}>{deliveryPreview(landStrategy, mainBranch)}</Text>
+        <Box marginTop={1}><Text bold>Build it? </Text><Text color={theme.muted}>enter = yes · n = no</Text></Box>
+        <Text color={theme.muted}>↑↓ task · pgup/pgdn details · esc cancel</Text>
       </Box>
     </Box>
   )
@@ -566,13 +614,6 @@ function elapsed(ms: number): string {
   const s = Math.round(ms / 1000)
   if (s < 60) return `${s}s`
   return `${Math.floor(s / 60)}m ${String(s % 60).padStart(2, '0')}s`
-}
-
-/** A long path wraps the header into porridge; keep the ends, drop the middle. */
-function middleTruncate(text: string, max: number): string {
-  if (text.length <= max) return text
-  const keep = Math.max(4, Math.floor((max - 1) / 2))
-  return `${text.slice(0, keep)}…${text.slice(-keep)}`
 }
 
 function tilde(p: string): string {
@@ -639,6 +680,11 @@ function modelResult(input: string, store: Store, config: ProjectConfig): SlashR
  */
 export const SLASH_COMMANDS: SlashCommand[] = [
   { name: '/status', description: 'tasks, agents, and proof state' },
+  { name: '/dashboard', args: '[run-id]', description: 'browse live tasks, evidence, and actions' },
+  { name: '/digest', description: 'what happened and what needs you next' },
+  { name: '/resume', args: '[run-id]', description: 'continue a saved deep mission' },
+  { name: '/ops', args: '[resolve <id> <note>]', description: 'list or resolve pending operator actions' },
+  { name: '/why', args: '<task-id>', argsRequired: true, description: 'explain a task failure and its evidence' },
   { name: '/criteria', description: 'every acceptance criterion and its evidence tier' },
   { name: '/findings', description: 'reviewer findings and deviations' },
   { name: '/model', description: 'pick the model and effort for each role (arrows), or /model <role> <model>' },
@@ -648,7 +694,8 @@ export const SLASH_COMMANDS: SlashCommand[] = [
   { name: '/rename', args: '<title>', argsRequired: true, description: 'rename this thread' },
   { name: '/fork', args: '[title]', description: 'branch this thread, keeping its agreement' },
   { name: '/archive', description: 'archive this thread (evidence is kept)' },
-  { name: '/lane', args: 'chat|direct|research|plan|review|deep|auto', argsRequired: true, description: 'lock this thread’s routing, or hand it back' },
+  { name: '/lane', args: '[workflow]', description: 'choose a workflow, or restore automatic routing' },
+  { name: '/queue', args: '[clear]', description: 'inspect or clear follow-up messages' },
   { name: '/steer', args: '<note>', argsRequired: true, description: 'durable guidance for the next agent dispatch' },
   { name: '/transcript', args: '[id-prefix]', description: 'list or read stored agent transcripts' },
   { name: '/usage', description: 'exact provider-reported usage receipts' },
@@ -689,6 +736,29 @@ export function slashResult(
 
   const arcId = currentArcId || store.latestArcId() || store.latestDesignId() || ''
   if (!arcId) return { kind: 'reply', text: 'No arc has started yet.' }
+
+  if (command === '/digest') return { kind: 'reply', text: store.getArc(arcId) ? buildDigest(store, arcId).lines.join('\n') : `Session ${arcId} is in design or a focused workflow. Use /status or /transcript.` }
+  if (command === '/why') {
+    const taskId = input.trim().split(/\s+/)[1]
+    return { kind: 'reply', text: taskId ? explainFailure(store, arcId, taskId).join('\n') : 'Usage: /why <task-id>' }
+  }
+  if (command === '/ops') {
+    const [, action, opId, ...note] = input.trim().split(/\s+/)
+    if (action === 'resolve') {
+      if (!opId || !note.length) return { kind: 'reply', text: 'Usage: /ops resolve <id> <what you completed>' }
+      const matches = store.pendingOps(arcId).filter((op) => String(op.id).startsWith(opId))
+      if (matches.length !== 1) return { kind: 'reply', text: matches.length ? 'That ID matches several operations; use a longer prefix.' : 'No open operation matches that ID in this run.' }
+      store.resolvePendingOp(arcId, String(matches[0]!.id), note.join(' '))
+      return { kind: 'reply', text: `Resolution recorded. /resume ${arcId} continues the mission when you are ready.` }
+    }
+    if (action) return { kind: 'reply', text: 'Usage: /ops or /ops resolve <id> <what you completed>' }
+    const ops = store.pendingOps(arcId)
+    return { kind: 'reply', text: ops.length ? [
+      `Actions for ${arcId}:`,
+      ...ops.map((op) => `${String(op.id).slice(0, 8)} · ${op.blocking ? 'blocking' : 'optional'} · ${op.description}`),
+      'After completing an action: /ops resolve <id> <what you did>',
+    ].join('\n') : `No pending operations for ${arcId}.` }
+  }
 
   if (command === '/transcript') {
     const needle = input.trim().split(/\s+/)[1] ?? ''
@@ -819,25 +889,36 @@ function formatAge(observedAt: Date, now: Date): string {
 
 export function RepoPicker({ candidates, onPick }: { candidates: string[]; onPick: (repo: string) => void }) {
   const { exit } = useApp()
+  const { width, rows } = useTerminalSize()
   const [i, setI] = useState(0)
+  const [query, setQuery] = useState('')
+  const matches = candidates.filter((c) => c.toLowerCase().includes(query.toLowerCase()))
+  const count = Math.max(3, Math.min(10, (rows ?? 30) - 10))
+  const start = windowStart(i, matches.length, count)
   useRawKeys((k) => {
     if (k.ctrl && k.name === 'c') { exit(); return }
+    if (k.name === 'escape') { if (query) { setQuery(''); setI(0) } else exit(); return }
     if (k.name === 'up') setI((n) => Math.max(0, n - 1))
-    if (k.name === 'down') setI((n) => Math.min(candidates.length - 1, n + 1))
-    if (k.name === 'return') onPick(candidates[i]!)
+    if (k.name === 'down') setI((n) => Math.max(0, Math.min(matches.length - 1, n + 1)))
+    if (k.name === 'return' && matches[i]) onPick(matches[i]!)
+    if (k.name === 'backspace') { setQuery((s) => s.slice(0, -1)); setI(0) }
+    if (k.text) { setQuery((s) => s + k.text); setI(0) }
   })
 
   return (
     <Box flexDirection="column" paddingX={1} paddingY={1}>
+      <Text color={theme.accent} bold>ARC · Choose a repository</Text>
       <Text>This folder holds more than one repo. Which one?</Text>
+      <Text color={theme.muted}>Filter: {query || 'type a name or path'}</Text>
       <Box marginTop={1} flexDirection="column">
-        {candidates.map((c, n) => (
-          <Text key={c} color={n === i ? 'cyan' : undefined}>
-            {n === i ? '❯ ' : '  '}{basename(c)}<Text color="gray">   {tilde(c)}</Text>
+        {matches.slice(start, start + count).map((c, n) => (
+          <Text key={c} color={start + n === i ? theme.accentBright : undefined}>
+            {start + n === i ? '❯ ' : '  '}{clip(`${basename(c)}   ${tilde(c)}`, width - 4)}
           </Text>
         ))}
+        {matches.length === 0 && <Text color={theme.warn}>No repositories match. Backspace edits the filter.</Text>}
       </Box>
-      <Box marginTop={1}><Text color="gray">↑↓ to choose · enter to confirm</Text></Box>
+      <Box marginTop={1}><Text color={theme.muted}>↑↓ to choose · enter to confirm · esc back · {matches.length} repos</Text></Box>
     </Box>
   )
 }
@@ -860,9 +941,7 @@ export function App({ store, config, danger, initialBrief, version = '0.2.0' }: 
     })
   }, [store.root])
   const { exit } = useApp()
-  const { stdout } = useStdout()
-  const width = Math.min(Math.max(stdout?.columns || 80, 40), 200)
-  const rows = stdout?.rows && stdout.rows > 0 ? stdout.rows : undefined
+  const { width, rows } = useTerminalSize()
   const [branch] = useState(() => {
     try {
       return git(config.repo, 'rev-parse', '--abbrev-ref', 'HEAD')
@@ -878,6 +957,7 @@ export function App({ store, config, danger, initialBrief, version = '0.2.0' }: 
   const [approve, setApprove] = useState<((ok: boolean) => void) | null>(null)
   const [confirm, setConfirm] = useState<PendingConfirm | null>(null)
   const [arcId, setArcId] = useState('')
+  const [dashboardId, setDashboardId] = useState<string | undefined>()
   const [tick, setTick] = useState(0)
   const [agents, setAgents] = useState<Array<{ role: string; model: string; cli: string; since: number }>>([])
   /** Typed while it was working. Drained in order once it goes idle — the same
@@ -896,8 +976,9 @@ export function App({ store, config, danger, initialBrief, version = '0.2.0' }: 
   // One timer drives the spinner, the elapsed counters, and the live agent list.
   useEffect(() => {
     const t = setInterval(() => {
+      if (!busy.current) return
       setTick((n) => n + 1)
-      if (busy.current && arcId) {
+      if (arcId) {
         try {
           setAgents(store.liveAttempts(arcId).map((a) => ({
             role: String(a.role), model: String(a.requested_model),
@@ -907,7 +988,7 @@ export function App({ store, config, danger, initialBrief, version = '0.2.0' }: 
       } else {
         setAgents([])
       }
-    }, 150)
+    }, 250)
     return () => clearInterval(t)
   }, [store, arcId])
 
@@ -1092,8 +1173,8 @@ export function App({ store, config, danger, initialBrief, version = '0.2.0' }: 
             // The direct lane already shares the attempt ledger through the
             // observer; gate runs were the one thing it dropped, which is what
             // a flake ledger and any cross-lane accounting need most.
-            runGate: async (gate, cwd, baseSha, signal) => {
-              const r = await DEFAULT_DEPENDENCIES.runGate(gate, cwd, baseSha, signal)
+            runGate: async (gate, cwd, baseSha, signal, options) => {
+              const r = await DEFAULT_DEPENDENCIES.runGate(gate, cwd, baseSha, signal, options)
               try {
                 store.recordGate({
                   arcId: id, name: r.name, command: r.command, proves: r.proves,
@@ -1293,12 +1374,13 @@ export function App({ store, config, danger, initialBrief, version = '0.2.0' }: 
             `Delivery failed: ${d.message}`
           say('arc', `Work completed with the required evidence. ${outcome}`)
         } else {
-          say('arc', `Stopped short — not everything could be proved. Work may remain on an integration branch, but no completed delivery was claimed. Run \`arc criteria\` to see what is missing.`)
+          const needs = store.openBlockingOps(id).length
+          say('arc', `Stopped short — not everything could be proved. Work may remain on ${arc?.integration_branch ?? 'an integration branch'}.\n${needs ? `${needs} operation(s) need you: /ops` : 'Inspect the result: /digest · /findings · /criteria'}\n/dashboard opens the saved run; /resume ${id} continues it.`)
         }
       } catch (e) {
         closeSteps()
         if (e instanceof Cancelled || ctrl.signal.aborted) say('arc', 'Stopped. Agents were cancelled. Worktree or branch commits may remain; no completed delivery was claimed.')
-        else say('arc', `Something broke: ${(e as Error).message}`)
+        else say('arc', `Run stopped: ${(e as Error).message}\nUse /status or /transcript to inspect the saved evidence.`)
       } finally {
         busy.current = false
         abort.current = null
@@ -1325,11 +1407,11 @@ export function App({ store, config, danger, initialBrief, version = '0.2.0' }: 
 
   // Drain one queued message per idle tick, in the order they were typed.
   useEffect(() => {
-    if (busy.current || queue.length === 0) return
+    if (busy.current || queue.length === 0 || mode !== 'compose') return
     const [next, ...rest] = queue
     setQueue(rest)
     if (next) submit(next)
-  }, [queue, tick, submit])
+  }, [queue, tick, submit, mode])
 
   const cancel = useCallback(() => {
     if (!abort.current) return
@@ -1368,6 +1450,50 @@ export function App({ store, config, danger, initialBrief, version = '0.2.0' }: 
   const accept = useCallback((text: string) => {
     const trimmed = text.trim()
     setHistory((h) => [...h.filter((x) => x !== text), text].slice(-100))
+    const [name, arg] = trimmed.toLowerCase().split(/\s+/)
+    const recentId = arcId || store.latestThreadRunId(threadId) || ''
+    if (name === '/dashboard') {
+      const requested = trimmed.split(/\s+/)[1]
+      if (requested && !store.getArc(requested) && !store.getDesign(requested)) {
+        localSay('arc', `No saved run "${requested}". /dashboard lists available runs.`); return
+      }
+      setDashboardId(requested || recentId || undefined)
+      setMode('dashboard'); return
+    }
+    if (name === '/queue') {
+      if (arg === 'clear') { setQueue([]); localSay('arc', 'Queued follow-ups cleared. Current work continues.'); return }
+      localSay('arc', arg ? 'Usage: /queue [clear]' : queue.length ? [`${queue.length} queued follow-up(s):`, ...queue.map((q, i) => `${i + 1}. ${q}`), 'Use /queue clear to remove them.'].join('\n') : 'No queued follow-ups.')
+      return
+    }
+    if (name === '/resume') {
+      if (busy.current) { localSay('arc', 'A mission is already running. Use /dashboard to inspect it, or esc to stop it first.'); return }
+      if (M.planOnly) { localSay('arc', 'Plan mode does not execute missions. Change mode with shift+tab before resuming.'); return }
+      const id = trimmed.split(/\s+/)[1] || store.latestThreadRunId(threadId, true)
+      const saved = id ? store.getPlan(id) : undefined
+      if (!id || !saved) { localSay('arc', 'No saved deep mission in this thread. Use /dashboard to find a run, then /resume <run-id>.'); return }
+      if (store.getArc(id)?.status === 'done') { localSay('arc', `${id} is already complete. /dashboard ${id} opens its evidence.`); return }
+      busy.current = true
+      const ctrl = new AbortController()
+      abort.current = ctrl
+      setArcId(id)
+      localSay('you', trimmed)
+      step(`resuming ${id}`)
+      void runArc({ store, plan: saved, config: runtimeConfig, signal: ctrl.signal, resume: true, preflight: true,
+        log: detail, onTaskResult: archiveProduct,
+      }).then(() => { closeSteps(); localSay('arc', [...buildDigest(store, id).lines, '', `/dashboard ${id} opens the evidence.`].join('\n')) })
+        .catch((error) => { closeSteps(); localSay('arc', `Resume stopped: ${(error as Error).message}`) })
+        .finally(() => {
+          busy.current = false; abort.current = null; setArcId(''); setAgents([])
+          if (ctrl.signal.aborted) setQueue([])
+          if (quitAfterCancel.current) exit()
+        })
+      return
+    }
+    if (name === '/lane' && !arg) { setMode('lane'); return }
+    if (busy.current && ['/new', '/thread', '/fork', '/archive'].includes(name ?? '')) {
+      localSay('arc', 'This thread has active work. Switch threads after it finishes, or press esc to stop it. /steer adds guidance to this run.')
+      return
+    }
     // A command that throws must answer in the transcript, never crash the
     // keypress handler and eat the typed line.
     let threadCommand
@@ -1408,7 +1534,7 @@ export function App({ store, config, danger, initialBrief, version = '0.2.0' }: 
     }
     let command
     try {
-      command = slashResult(trimmed, store, arcId, config)
+      command = slashResult(trimmed, store, recentId, config)
     } catch (error) {
       localSay('you', trimmed)
       localSay('arc', (error as Error).message)
@@ -1425,32 +1551,30 @@ export function App({ store, config, danger, initialBrief, version = '0.2.0' }: 
     }
     if (busy.current) setQueue((q) => [...q, text])
     else submit(text)
-  }, [store, arcId, config, localSay, requestExit, submit, service, threadId])
+  }, [store, arcId, config, localSay, requestExit, submit, service, threadId, queue, M.planOnly, runtimeConfig, step, detail, archiveProduct, closeSteps, exit])
 
   // ---- pieces -------------------------------------------------------------
 
   const spin = SPINNER[tick % SPINNER.length]
   const thread = service.threadView(threadId)
-  const workflowStages = thread ? service.workflowFor(threadId).steps.length : 0
 
-  // Three rows beside the three-row mark. It was five, which is taller than
-  // Claude Code's own header and left less room for the thing you came to read.
+  // Permanent project context goes into scrollback; changing run state stays live.
   const Banner = () => (
     <Box paddingX={1} marginBottom={1}>
-      <ArcLogo />
-      <Box flexDirection="column" marginLeft={2}>
-        <Text>
-          <Text bold>arc</Text><Text color="gray"> v{version} · </Text>
-          <Text color={theme.sol}>Sol</Text><Text color="gray"> writes · </Text>
-          <Text color={theme.opus}>Opus</Text><Text color="gray"> reviews</Text>
+      {width >= 65 && <ArcLogo />}
+      <Box flexDirection="column" marginLeft={width >= 65 ? 2 : 0}>
+        <Text wrap="truncate-end">
+          <Text bold>arc</Text><Text color={theme.muted}> v{version} · </Text>
+          <Text color={theme.sol}>Sol</Text><Text color={theme.muted}> writes · </Text>
+          <Text color={theme.opus}>Opus</Text><Text color={theme.muted}> reviews</Text>
         </Text>
-        <Text color="gray">{middleTruncate(tilde(config.repo), Math.max(20, width - 24))}{branch ? ` · ${branch}` : ''}</Text>
+        <Text color={theme.muted}>{clip(`${tilde(config.repo)}${branch ? ` · ${branch}` : ''}`, width - (width >= 65 ? 15 : 2))}</Text>
         {/* Only what CANNOT change: this is printed once and lives in
             scrollback. The thread can change mid-session, so it belongs in the
             live footer — where it already was, and where it was duplicated. */}
         {config.gates.length === 0
-          ? <Text color="yellow">⚠ nothing here can check the work — no test or build script</Text>
-          : <Text color="gray">checks: {config.gates.map((g) => g.name).join(' · ')}</Text>}
+          ? <Text color={theme.warn}>⚠ nothing here can check the work — no test or build script</Text>
+          : <Text color={theme.muted}>{clip(`checks: ${config.gates.map((g) => g.name).join(' · ')}`, width - (width >= 65 ? 15 : 2))}</Text>}
       </Box>
     </Box>
   )
@@ -1473,9 +1597,21 @@ export function App({ store, config, danger, initialBrief, version = '0.2.0' }: 
       height={pinCompose ? Math.max(rows - 1 - BANNER_ROWS, 1) : undefined}
     >
       <Transcript
-        entries={timeline.completed} liveStep={timeline.liveStep} width={width} spin={spin}
+        entries={timeline.completed} liveStep={mode === 'dashboard' ? null : timeline.liveStep} width={width} spin={spin}
         banner={<Banner />}
       />
+      {exitArmed && mode !== 'compose' && <Box paddingX={1}><Text color={theme.bad} bold>press ctrl-c again to stop the agents and quit</Text></Box>}
+
+      {empty && mode === 'compose' && <Welcome width={width} returning={Boolean(store.latestThreadRunId(threadId))} />}
+      {mode === 'dashboard' && <Dashboard store={store} width={width} interactive compact initialArcId={dashboardId}
+        onClose={() => setMode('compose')} onExit={requestExit} />}
+      {mode === 'lane' && <LanePicker current={thread?.laneSource === 'user' ? thread.lane : 'auto'}
+        onCancel={() => setMode('compose')}
+        onChoose={(lane) => {
+          const result = runThreadCommand(`/lane ${lane}`, service, threadId)
+          if (result) localSay('arc', result.text)
+          setMode('compose')
+        }} />}
 
       {mode === 'question' && question && (
         <QuestionPanel
@@ -1550,13 +1686,14 @@ export function App({ store, config, danger, initialBrief, version = '0.2.0' }: 
 
       {mode === 'compose' && (
         <>
-          <AgentList agents={agents} />
+          <AgentList agents={agents} width={width} />
 
           {queue.length > 0 && (
             <Box flexDirection="column" paddingX={1} marginTop={1}>
-              {queue.map((q, i) => (
-                <Text key={i} color="gray">  ⏵ queued: {q.split('\n')[0]!.slice(0, width - 14)}</Text>
+              {queue.slice(0, 2).map((q, i) => (
+                <Text key={i} color={theme.muted}>  ⏵ queued: {q.split('\n')[0]!.slice(0, width - 14)}</Text>
               ))}
+              <Text color={theme.muted}>{queue.length > 2 ? `${queue.length - 2} more · ` : ''}/queue inspect · /queue clear</Text>
             </Box>
           )}
 
@@ -1580,21 +1717,21 @@ export function App({ store, config, danger, initialBrief, version = '0.2.0' }: 
             />
           </Box>
 
-          <Box paddingX={1} justifyContent="space-between">
+          <Box paddingX={1} justifyContent="space-between" flexDirection={width < 65 ? 'column' : 'row'}>
             {exitArmed ? (
-              <Text color="red" bold>press ctrl-c again to stop the agents and quit</Text>
+              <Text color={theme.bad} bold>press ctrl-c again to stop the agents and quit</Text>
             ) : working ? (
               // The busy line needs a width budget just like hint() has: at 78
               // columns the old copy collided with the right-hand status and
               // wrapped the footer (found in the first dogfood run).
-              <Text color="yellow">
+              <Text color={theme.warn}>
                 {spin} working
                 {agents.length ? ` · ${agents.length}${width < 95 ? '' : ` agent${agents.length === 1 ? '' : 's'}`}` : ''}
                 {queue.length ? ` · ${queue.length} queued` : ''}
-                <Text color="gray">{width < 95 ? '  esc stops' : '  esc to stop'}</Text>
+                <Text color={theme.muted}>{width < 95 ? '  esc stops' : '  esc to stop'}</Text>
               </Text>
             ) : (
-              <Text color={theme.faint}>{hint(width)}</Text>
+              <Text color={theme.muted}>{hint(width)}</Text>
             )}
             <Text>
               {width >= 95 && (
@@ -1605,6 +1742,7 @@ export function App({ store, config, danger, initialBrief, version = '0.2.0' }: 
               <Text color={theme.faint}>{width < 95 ? ' · ⇧tab' : ' · ⇧tab · ^c'}</Text>
             </Text>
           </Box>
+          {empty && <Box paddingX={1}><Text color={modeName === 'danger' ? theme.warn : theme.muted}>{clip(`${M.label}: ${M.hint}`, width - 2)}</Text></Box>}
         </>
       )}
     </Box>
@@ -1615,7 +1753,7 @@ export function ThreadStatus({ title, lane, stages }: { title: string; lane: str
   // "planned": the count comes from the lane's declared workflow, which is a
   // description of intent — nothing executes those rows yet.
   return (
-    <Text color="gray">
+    <Text color={theme.muted}>
       {'  '}thread: <Text color={theme.accent}>{title}</Text> · {lane} · {stages} planned stage{stages === 1 ? '' : 's'}
     </Text>
   )
@@ -1630,26 +1768,28 @@ export interface LiveAgent { role: string; model: string; cli: string; since: nu
  * is how you think about them, and shown with what each is doing and for how
  * long.
  */
-export function AgentList({ agents }: { agents: LiveAgent[] }) {
+export function AgentList({ agents, width = 100 }: { agents: LiveAgent[]; width?: number }) {
   if (agents.length === 0) return null
   return (
     <Box flexDirection="column" paddingX={1}>
-      {agents.map((a, i) => (
+      {agents.slice(0, 4).map((a, i) => (
         <Box key={i}>
-          <Text color="gray">{'  ⎿  '}</Text>
-          <Text color={a.cli === 'codex' ? 'green' : 'magenta'}>
-            {(a.cli === 'codex' ? 'Sol' : 'Opus').padEnd(6)}
+          <Text color={theme.muted}>{'  ⎿  '}</Text>
+          <Text color={agentColor(a.cli)}>
+            {agentName(a.cli).padEnd(6)}
           </Text>
           <Text>{a.role.padEnd(12)}</Text>
-          <Text color="gray">{a.model.padEnd(16)}{elapsed(Date.now() - a.since)}</Text>
+          <Text color={theme.muted}>{clip(a.model, Math.max(5, width - 35)).padEnd(Math.min(24, Math.max(5, width - 35)))} {elapsed(Date.now() - a.since)}</Text>
         </Box>
       ))}
+      {agents.length > 4 && <Text color={theme.muted}>  +{agents.length - 4} agents · /dashboard shows every task</Text>}
     </Box>
   )
 }
 
 /** The keys worth mentioning, as many as fit — never overlapping the right side. */
 function hint(width: number): string {
+  if (width < 65) return 'enter send · / commands'
   if (width < 90) return 'enter · shift+enter newline'
   const all = ['enter to send', 'shift+enter for a new line', '↑ for history']
   // The right-hand status now carries the mode name too. Under-reserving here
@@ -1670,8 +1810,9 @@ function wrap(text: string, cols: number): string[] {
   for (const para of String(text).split('\n')) {
     let line = ''
     for (const word of para.split(/\s+/).filter(Boolean)) {
-      if (line.length + word.length + 1 > cols) { out.push(line); line = word }
+      if (line.length + word.length + 1 > cols) { if (line) out.push(line); line = word }
       else line = line ? `${line} ${word}` : word
+      while (line.length > Math.max(1, cols)) { out.push(line.slice(0, Math.max(1, cols))); line = line.slice(Math.max(1, cols)) }
     }
     out.push(line)
   }

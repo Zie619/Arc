@@ -110,7 +110,7 @@ describe('the compose screen', () => {
     await tick()
     const fallbackPromptLine = fallback.text().split('\n').findIndex((line) => line.includes('what do you want done?'))
     expect(fallbackPromptLine).toBeGreaterThanOrEqual(0)
-    expect(fallbackPromptLine).toBeLessThanOrEqual(10)
+    expect(fallbackPromptLine).toBeLessThanOrEqual(12) // compact welcome guidance, no invented terminal height
     fallbackApp.unmount(); store.close()
   })
 
@@ -1181,6 +1181,34 @@ describe('trust modes and lane locks gate the direct lane', () => {
       delete process.env.ARC_FAKE_HANG
       out.send('\x1b')
       await tick()
+      app.unmount(); store.close()
+    }
+  }, 40_000)
+
+  it('keeps active work running while the dashboard is open and clears only queued follow-ups', async () => {
+    queueDir = withQueue([])
+    process.env.ARC_FAKE_HANG = '1'
+    const store = new Store(home)
+    const out = fakeStdout(100)
+    const app = render(<App store={store} config={directConfig()} danger initialBrief="please adjust the helper" />, {
+      stdout: out.stream, stdin: out.stdin, exitOnCtrlC: false, patchConsole: false,
+    })
+    const send = async (line: string) => { out.send(line); await tick(); out.send('\r'); await tick() }
+    try {
+      await until(() => out.text().includes('working'))
+      await send('follow-up waiting')
+      await send('/queue clear')
+      expect(out.scrollback()).toContain('Current work continues')
+      await send('/dashboard')
+      expect(out.text()).toContain('Preparing the mission')
+      out.send('q'); await tick()
+      expect(out.text()).toContain('working')
+      expect(out.text()).not.toContain('queued:')
+      await send('/new another thread')
+      expect(out.scrollback()).toContain('This thread has active work')
+    } finally {
+      delete process.env.ARC_FAKE_HANG
+      out.send('\x1b'); await new Promise((r) => setTimeout(r, 200))
       app.unmount(); store.close()
     }
   }, 40_000)

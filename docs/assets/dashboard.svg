@@ -1,0 +1,38 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1080" height="710" viewBox="0 0 1080 710">
+<title>ARC run dashboard rendered from the real terminal components with example mission data</title>
+<rect width="1080" height="100%" rx="18" fill="#121018"/>
+<rect x="1" y="1" width="1078" height="708" rx="18" fill="none" stroke="#342b46"/>
+<circle cx="28" cy="28" r="5" fill="#fb7185"/><circle cx="46" cy="28" r="5" fill="#fbbf24"/><circle cx="64" cy="28" r="5" fill="#4ade80"/>
+<text x="104" y="33" fill="#a69ab9" font-family="monospace" font-size="13">arc / mission control</text>
+<text x="1052" y="33" text-anchor="end" fill="#a69ab9" font-family="monospace" font-size="12">EXAMPLE DATA · NO MODEL CALLS</text>
+<path d="M1 56H1079" stroke="#342b46"/>
+<g font-family="Menlo,Consolas,monospace" font-size="15"><text x="28" y="94" fill="#c4b5fd" xml:space="preserve"> ARC / checkout-resilience                                                                running · 1/1</text>
+<text x="28" y="114" fill="#aaa3b8" xml:space="preserve"> Make checkout resilient to retries and partial failures.</text>
+<text x="28" y="134" fill="#aaa3b8" xml:space="preserve"> 1/5 landed · 1/5 evidence requirements met</text>
+<text x="28" y="154" fill="#fbbf24" xml:space="preserve"> 1 blocking operation · open Actions with tab</text>
+<text x="28" y="174" fill="#c4b5fd" xml:space="preserve">─ Tasks · 1/5───────────────────────────────────────────────────────────────────────────────────────────</text>
+<text x="28" y="194" fill="#4ade80" xml:space="preserve"> ❯ ✓ landed      idempotency · Make duplicate requests safe</text>
+<text x="28" y="214" fill="#f0abfc" xml:space="preserve">   ◉ reviewing   retry-policy · Review bounded retry behavior</text>
+<text x="28" y="234" fill="#22d3ee" xml:space="preserve">   ● running     transactions · Keep writes atomic on failure</text>
+<text x="28" y="254" fill="#aaa3b8" xml:space="preserve">   ○ pending     integration · Verify the complete checkout flow</text>
+<text x="28" y="274" fill="#fbbf24" xml:space="preserve">   ! quarantined database · Exercise the database failure cases</text>
+<text x="28" y="294" fill="#aaa3b8" xml:space="preserve"></text>
+<text x="28" y="314" fill="#c4b5fd" xml:space="preserve"> [activity]  findings  evidence  actions</text>
+<text x="28" y="334" fill="#aaa3b8" xml:space="preserve"> 12:41:00 idempotency · Changes landed on integration</text>
+<text x="28" y="354" fill="#aaa3b8" xml:space="preserve"> 12:41:00 idempotency · Check typecheck · pass</text>
+<text x="28" y="374" fill="#aaa3b8" xml:space="preserve"> 12:41:00 database · pending op</text>
+<text x="28" y="394" fill="#aaa3b8" xml:space="preserve"> 12:41:00 transactions · attempt start</text>
+<text x="28" y="414" fill="#aaa3b8" xml:space="preserve"> 12:41:00 retry-policy · attempt start</text>
+<text x="28" y="434" fill="#fbbf24" xml:space="preserve"> 12:41:00 database · Task quarantined</text>
+<text x="28" y="454" fill="#aaa3b8" xml:space="preserve"> 12:41:00 integration · Task pending</text>
+<text x="28" y="474" fill="#aaa3b8" xml:space="preserve"> 12:41:00 transactions · Task running</text>
+<text x="28" y="494" fill="#f0abfc" xml:space="preserve"> 12:41:00 retry-policy · Task reviewing</text>
+<text x="28" y="514" fill="#aaa3b8" xml:space="preserve"> 12:41:00 idempotency · Task landed</text>
+<text x="28" y="534" fill="#aaa3b8" xml:space="preserve"></text>
+<text x="28" y="554" fill="#aaa3b8" xml:space="preserve"></text>
+<text x="28" y="574" fill="#aaa3b8" xml:space="preserve"></text>
+<text x="28" y="594" fill="#aaa3b8" xml:space="preserve"></text>
+<text x="28" y="614" fill="#aaa3b8" xml:space="preserve"></text>
+<text x="28" y="634" fill="#c4b5fd" xml:space="preserve">─ Live evidence · q quit────────────────────────────────────────────────────────────────────────────────</text>
+<text x="28" y="654" fill="#aaa3b8" xml:space="preserve"> ↑↓ task · enter open · ←→ run · tab pane · f needs attention</text></g>
+</svg>

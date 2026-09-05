@@ -25,7 +25,7 @@ export const MODES: Mode[] = [
   {
     name: 'ask',
     label: 'asks first',
-    hint: 'answers your questions, shows the plan, waits for you',
+    hint: 'asks questions, shows the plan, waits for approval',
     asksQuestions: true,
     asksApproval: true,
     planOnly: false,
@@ -33,7 +33,7 @@ export const MODES: Mode[] = [
   {
     name: 'auto',
     label: 'auto',
-    hint: 'takes its own recommendations, still shows you the plan',
+    hint: 'takes recommendations; waits for approval to build',
     asksQuestions: false,
     asksApproval: true,
     planOnly: false,
@@ -41,7 +41,7 @@ export const MODES: Mode[] = [
   {
     name: 'danger',
     label: 'danger',
-    hint: 'no stops at all — decides, plans and builds on its own',
+    hint: 'approves decisions and starts builds without asking',
     asksQuestions: false,
     asksApproval: false,
     planOnly: false,

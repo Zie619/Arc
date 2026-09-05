@@ -26,10 +26,15 @@ dependencies, one process, everything auditable — and it stays that way.
 
 ```bash
 pnpm install
-pnpm test        # ~15s, no network, no tokens
+pnpm test        # fake providers; no model calls
 pnpm typecheck
 pnpm docs:check
+pnpm ui:preview  # real terminal components, isolated example data
 ```
+
+Use `pnpm ui:preview --plan` for the approval flow and `pnpm docs:ui` to
+regenerate the README dashboard image after changing its layout. Review the
+rendered frame at ordinary and narrow terminal sizes.
 
 To run the real thing you need the `claude` and `codex` CLIs installed and
 logged in. `node src/cli.ts doctor` probes them without a model call.

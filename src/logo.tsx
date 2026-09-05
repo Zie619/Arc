@@ -12,11 +12,11 @@ export function ArcLogo() {
     <Box flexDirection="column">
       <Text>
         {'  '}<Text color={theme.accent}>▄▄</Text>
-        <Text color="magenta">█</Text>
+        <Text color={theme.opus}>█</Text>
         <Text color={theme.accent}>▄▄</Text>
       </Text>
       <Text>
-        {' '}<Text color="cyan">▟</Text>
+        {' '}<Text color={theme.sol}>▟</Text>
         <Text color={theme.accent}>▀   ▀</Text>
         <Text color={theme.accent}>▙</Text>
       </Text>
